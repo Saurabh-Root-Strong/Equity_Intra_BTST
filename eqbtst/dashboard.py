@@ -76,7 +76,7 @@ def render_price_band():
     sp, c1, c2 = st.columns([6, 1, 1])
     sp.markdown("**Price band (₹)** — filter the list by stock price →")
     c1.number_input("Min ₹", min_value=0.0, value=0.0, step=50.0, key="price_min")
-    c2.number_input("Max ₹", min_value=0.0, value=100000.0, step=50.0, key="price_max")
+    c2.number_input("Max ₹", min_value=0.0, value=900.0, step=50.0, key="price_max")
 
 
 def price_filter(df, col):
