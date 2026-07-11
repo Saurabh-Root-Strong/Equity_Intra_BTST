@@ -323,8 +323,13 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         atr_tf = ds.get("atr_tf", 0.0)
         ltp = s["ltp"]
         cndl = ds.get("candles")
-        bar_time = (cndl["ts"].iloc[-1].strftime("%d-%b %H:%M")
-                    if cndl is not None and len(cndl) else None)
+        _tfmin = {"2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(tf, 60)
+        if cndl is not None and len(cndl):
+            o = cndl["ts"].iloc[-1]
+            close_t = min(o + pd.Timedelta(minutes=_tfmin), o.normalize() + pd.Timedelta("15h30min"))
+            bar_time = f"{o.strftime('%H:%M')}-{close_t.strftime('%H:%M')}"   # candle span (open->close)
+        else:
+            bar_time = None
         # short-side levels on this timeframe (stop ABOVE, targets BELOW)
         s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
         s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
