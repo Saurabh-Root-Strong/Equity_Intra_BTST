@@ -71,6 +71,19 @@ test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", va
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
                                      "prices, junk volume) — for layout/flow testing only.")
+st.sidebar.markdown("**Price band (₹)** — filter by stock price")
+_pc1, _pc2 = st.sidebar.columns(2)
+price_min = _pc1.number_input("Min", min_value=0.0, value=0.0, step=50.0, key="price_min")
+price_max = _pc2.number_input("Max", min_value=0.0, value=100000.0, step=50.0, key="price_max")
+
+
+def price_filter(df, col):
+    """Keep rows whose price column is within the sidebar min/max band."""
+    lo = st.session_state.get("price_min", 0.0)
+    hi = st.session_state.get("price_max", 1e9) or 1e9
+    if df.empty or col not in df.columns:
+        return df
+    return df[(df[col] >= lo) & (df[col] <= hi)]
 st.sidebar.caption(f"EOD archive latest: {last.date()}  •  now {dt.datetime.now():%H:%M}")
 st.sidebar.caption("BTST tab = EOD engine (delivery-confirmed). Intraday tab = live Fyers.")
 
@@ -179,7 +192,7 @@ if tf == "Intraday":
                     "clears the footprint on this timeframe. During a live session this "
                     "fills. For today's delivery-confirmed picks use the BTST tab.")
         else:
-            b = sc["board"]
+            b = price_filter(sc["board"], "ltp")
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
@@ -230,7 +243,7 @@ if tf == "Intraday":
                        "**last-session snapshot** — `day%`, `Nifty today`, `character` are "
                        "STALE, and `vol×` is blank (no volume today). Live values build "
                        "during the session. For actionable picks now, use the **BTST tab**.")
-        bd = lb["board"]
+        bd = price_filter(lb["board"], "ltp")
         counts = bd["action"].value_counts().to_dict()
         scounts = bd["sell"].value_counts().to_dict()
         h1, h2, h3, h4 = st.columns(4)
@@ -326,7 +339,7 @@ if tf == "🎬 Replay (practice)":
         st.info("No data for that date/time (not a trading day, or candles unavailable). "
                 "Try a recent trading day.")
         st.stop()
-    bd = rb["board"]
+    bd = price_filter(rb["board"], "ltp")
     near_close = rtime >= "15:10"
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("As of", f"{rb['date']} {rtime}")
@@ -395,7 +408,7 @@ if not risk_on:
                "are shown as AVOID for transparency.")
 
 # BUY board
-buys = b["buys"]
+buys = price_filter(b["buys"], "close_price")
 st.subheader("🟢 BUY — tonight's long candidates" if risk_on else "🟢 BUY — (suppressed, regime off)")
 if buys.empty:
     st.info("No BUY candidates: " + ("no name cleared the footprint + liquidity."
