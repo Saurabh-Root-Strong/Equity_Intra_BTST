@@ -7,3 +7,4 @@ data/validation/*.parquet
 *.log
 
 data/events/*.csv
+data/replay/*.parquet

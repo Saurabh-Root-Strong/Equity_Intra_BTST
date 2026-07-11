@@ -57,7 +57,9 @@ def _last_date():
 # ── sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("Equity BTST")
 last = _last_date()
-tf = st.sidebar.radio("Timeframe", ["BTST (overnight)", "Intraday", "BTST+1"], index=0)
+tf = st.sidebar.radio("Timeframe",
+                      ["BTST (overnight)", "Intraday", "🎬 Replay (practice)", "BTST+1"],
+                      index=0)
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
 if st.sidebar.button("↻ refresh"):
@@ -98,8 +100,37 @@ TF_COLS = {
 }
 
 
+HELP_INTRADAY = """
+### What am I looking at? How do I use it?
+
+**Purpose:** find NSE-F&O cash stocks showing a *smart-money accumulation footprint*,
+and act on the ONE validated edge — the **overnight BTST long** (buy near close, exit
+next morning, ~+16–19bps net on 8yr data). Long-only. Nothing auto-executes.
+
+**Two lanes — do NOT mix them:**
+| Lane | Signal | Hold | Validated? |
+|---|---|---|---|
+| **Intraday** (1h/2h/15m scan, or SELL tab) | price-action strength/weakness | **square off SAME DAY** | ❌ no proven edge — context only, trade small |
+| **BTST** (🌙 BTST-CARRY box) | full accumulation footprint at the close | **overnight**, exit next AM | ✅ the real edge |
+
+**The day, step by step:**
+1. **09:15–15:00** — watch. BUY tab shows ⏳ **FORMING** names (footprint building). Delivery% (the core leg) only confirms after the close, so nothing is final yet.
+2. **~15:10–15:30** — the FORMING names that still hold the full footprint flip to 🌙 **BTST-CARRY** (top green box). **These are your overnight picks.** Enter LONG near the close.
+3. **Overnight → next 09:15–09:30** — exit into morning strength.
+
+**Where is BTST-CARRY?** BUY tab → the top **🌙 BTST-CARRY** box. Empty until ~15:10 or
+when the market's closed. A name only carries overnight if it's flagged there — never
+just because you bought it intraday earlier.
+
+**Columns:** hover any header. `btst` x/4 = live footprint legs met. `Entry/Stop/T1/T2`
+= ATR risk geometry (trade management), **not** a price forecast. `action=EARNINGS` =
+excluded (reports results during the hold).
+"""
+
 if tf == "Intraday":
     st.title("Live Intraday Board  ·  Fyers")
+    with st.expander("❓ How to use this board — purpose, the two lanes, where BTST-CARRY is"):
+        st.markdown(HELP_INTRADAY)
     tok = live.token_status()
     st.caption(tok["describe"])
     if not tok["usable"]:
@@ -190,15 +221,30 @@ if tf == "Intraday":
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
                                  "🔴 SELL (intraday short — square off same day)"])
         with t_buy:
-            b = bd[bd["action"].isin(["BTST-CARRY", "FORMING"])].sort_values(
-                "btst", ascending=False)
-            if b.empty:
+            carry = bd[bd["action"] == "BTST-CARRY"].sort_values("btst", ascending=False)
+            forming = bd[bd["action"] == "FORMING"].sort_values("btst", ascending=False)
+            # 🌙 BTST-CARRY — its own prominent box: THIS is the overnight signal at ~15:15
+            st.markdown("#### 🌙 BTST-CARRY — hold overnight")
+            if carry.empty:
+                st.caption("None yet. Names appear here in the **15:10–15:30** window when a "
+                           "full footprint holds into the close. **These are the overnight "
+                           "picks** — enter LONG near close, exit next morning.")
+            else:
+                st.success(f"{len(carry)} name(s) ready to carry overnight — act 15:15–15:30, "
+                           "exit next 09:15–09:30.")
+                st.dataframe(carry[buy_cols], use_container_width=True, hide_index=True,
+                             column_config=LIVE_COLS)
+            # ⏳ FORMING — watch list, may flip to CARRY near the close
+            st.markdown("#### ⏳ FORMING — building (watch)")
+            if forming.empty:
                 b = bd.sort_values("clr", ascending=False).head(10)
-                st.caption("No BUY footprint live yet — showing top-10 by close-strength.")
-            st.dataframe(b[buy_cols], use_container_width=True, hide_index=True,
-                         column_config=LIVE_COLS)
-            st.caption("Long accumulation footprint. BTST-CARRY near close = shift to an "
-                       "overnight hold. Entry/Stop/T1/T2 = ATR risk geometry, not a forecast.")
+                st.caption("No footprint building yet — top-10 by close-strength meanwhile:")
+                st.dataframe(b[buy_cols], use_container_width=True, hide_index=True,
+                             column_config=LIVE_COLS)
+            else:
+                st.caption(f"{len(forming)} building — may flip to 🌙 BTST-CARRY near the close.")
+                st.dataframe(forming[buy_cols], use_container_width=True, hide_index=True,
+                             column_config=LIVE_COLS)
         with t_sell:
             st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Holding "
                        "these short OVERNIGHT is proven -EV (net −42bps, win 20% on 8yr — "
@@ -216,6 +262,67 @@ if tf == "Intraday":
                    "timeframe above.")
     _live_panel()
     st.stop()
+if tf == "🎬 Replay (practice)":
+    st.title("🎬 Replay / Practice — the board at any past time")
+    with st.expander("❓ What is this — backtest & practice, causally (no lookahead)"):
+        st.markdown(
+            "Freeze the live board at any **past date + time**. Only data up to that "
+            "minute is used — **no lookahead**, so it's honest practice. At **1pm** you see "
+            "⏳ FORMING names; move the time to **15:15** to see which became 🌙 **BTST-CARRY**. "
+            "This is how you learn the FORMING→CARRY flow before risking money.\n\n"
+            "First load of a date is slow (fetches ~250 names' candles); after that, "
+            "scrubbing the time is instant. Delivery% is still EOD — replay shows the "
+            "price-action state, the BTST tab is the delivery-confirmed truth.")
+    tok = live.token_status()
+    st.caption(tok["describe"])
+    if not tok["usable"]:
+        st.error("Fyers token not usable — re-auth in Tradebot (`python fyers_auth.py`).")
+        st.stop()
+    rc1, rc2 = st.columns([1, 2])
+    rdate = rc1.date_input("Date", value=_last_date().date(), max_value=_last_date().date(),
+                           key="replay_date")
+    rtime = rc2.select_slider("Time (IST)",
+                              options=[f"{h:02d}:{m:02d}" for h in range(9, 16)
+                                       for m in (0, 15, 30, 45)
+                                       if (h, m) >= (9, 15) and (h, m) <= (15, 30)],
+                              value="13:00", key="replay_time")
+
+    @st.cache_data(ttl=3600)
+    def _replay(dstr, t):
+        return live.replay_board(dstr, t)
+
+    with st.spinner(f"Reconstructing the board as of {rdate} {rtime} (first load of a day "
+                    "fetches ~250 names)…"):
+        rb = _replay(pd.Timestamp(rdate).strftime("%Y-%m-%d"), rtime)
+    if not rb["ok"] or rb["board"].empty:
+        st.info("No data for that date/time (not a trading day, or candles unavailable). "
+                "Try a recent trading day.")
+        st.stop()
+    bd = rb["board"]
+    near_close = rtime >= "15:10"
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("As of", f"{rb['date']} {rtime}")
+    m2.metric("Regime", "RISK-ON" if rb["risk_on"] else "RISK-OFF")
+    m3.metric("Nifty so far", f"{rb.get('idx_ret') or 0:+.2f}%")
+    carry_n = int((bd["action"] == "BTST-CARRY").sum())
+    form_n = int((bd["action"] == "FORMING").sum())
+    m4.metric("🌙 CARRY / ⏳ FORMING", f"{carry_n} / {form_n}")
+    if not near_close:
+        st.info(f"It's **{rtime}** — before the 15:10 window, so names show as ⏳ **FORMING** "
+                "(building). Move the slider to **15:15** to see which flip to 🌙 BTST-CARRY.")
+    buy_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vs_vwap%", "rsi7",
+                "rsi14", "tone", "vol×", "RS%", "btst", "entry", "stop", "t1", "t2",
+                "atr%", "action"]
+    st.markdown("#### 🌙 BTST-CARRY / ⏳ FORMING (long footprint at this time)")
+    long_side = bd[bd["action"].isin(["BTST-CARRY", "FORMING"])]
+    if long_side.empty:
+        st.caption("None building at this time — top-10 by close-strength so far:")
+        long_side = bd.sort_values("clr", ascending=False).head(10)
+    st.dataframe(long_side[buy_cols], use_container_width=True, hide_index=True,
+                 column_config={**LIVE_COLS, **TF_COLS})
+    st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
+               "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone are point-in-time.")
+    st.stop()
 if tf == "BTST+1":
     st.title("BTST+1 — proven dead")
     st.error("Holding the position into day 2 is negative every year on 8yr data "
@@ -229,6 +336,17 @@ risk_on = b["risk_on"]
 
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 c1.title("Equity BTST Board")
+with st.expander("❓ What is this tab — the validated overnight edge"):
+    st.markdown(
+        "**This is the confirmed BTST engine** (runs off the last close, after NSE "
+        "publishes delivery%). It ranks the accumulation footprint — strong close + high "
+        "delivery% + delivery-spike + volume surge + up-day + close>VWAP + persistent "
+        "RS-leader — regime-gated (Nifty>50MA), sector-capped, earnings-guarded, liquid "
+        "names only.\n\n**Edge:** ~+16–19bps net/night, long-only, 8yr-validated. **Plan:** "
+        "LONG near the close (15:15–15:30), exit next 09:15–09:30. Paper-first — nothing "
+        "auto-executes.\n\n**Intraday tab** = the live version of this (watch footprints "
+        "form → 🌙 BTST-CARRY at ~15:10). **This tab** = the delivery-confirmed truth after "
+        "the bell.")
 c2.metric("Regime", "RISK-ON" if risk_on else "RISK-OFF",
           "Nifty > 50MA" if risk_on else "Nifty < 50MA")
 c3.metric("Footprint hits", b["n_footprint"])

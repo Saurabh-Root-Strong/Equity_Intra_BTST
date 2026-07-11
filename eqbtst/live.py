@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -83,13 +84,15 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
                     (df["high_price"] - pc).abs(),
                     (df["low_price"] - pc).abs()], axis=1).max(axis=1)
     df["atr14"] = tr.groupby(df["symbol"]).transform(lambda s: s.rolling(14).mean())
+    df["prev_c"] = pc                              # close of the PRIOR trading day
     last = df[df["trade_date"] == date].copy()
     last = last[last["turnover_lacs"] >= config.LIQ_MIN_LACS]
     sectors = data.load_sectors()
     last["sector"] = last["symbol"].map(lambda s: sectors.get(s, f"_{s}"))
-    return last[["symbol", "sector", "close_price", "vol_med20", "atr14",
+    return last[["symbol", "sector", "close_price", "prev_c", "vol_med20", "atr14",
                  "high_price", "low_price"]].rename(
-        columns={"close_price": "ref_close", "high_price": "pdh", "low_price": "pdl"})
+        columns={"close_price": "ref_close", "prev_c": "prev_close",
+                 "high_price": "pdh", "low_price": "pdl"})
 
 
 # ── tier 1: batch quotes scan ──────────────────────────────────────────────────
@@ -221,18 +224,21 @@ def _sell_action(pa: dict, day_ret: float, rs, vsurge) -> str:
     return "—"
 
 
-def _live_action(pa: dict, day_ret: float, rs, vsurge, risk_on: bool) -> str:
+def _live_action(pa: dict, day_ret: float, rs, vsurge, risk_on: bool,
+                 now_time: "dt.time | None" = None) -> str:
     """Honest live label with the intraday→BTST handoff.
 
     BTST-CARRY = near the close, the full footprint is holding → SHIFT this intraday
     name to an overnight BTST hold, because the data says a next-day move is expectable
     (exit next-morning strength; delivery% confirms at the close). FORMING = footprint
     building earlier in the day. NEUTRAL/AVOID otherwise. Long-only.
+
+    now_time lets REPLAY pass the point-in-time clock (else wall-clock).
     """
     if not risk_on:
         return "AVOID"
     ready = btst_readiness(pa, day_ret, rs, vsurge)
-    near_close = dt.datetime.now().time() >= dt.time(15, 10)
+    near_close = (now_time or dt.datetime.now().time()) >= dt.time(15, 10)
     if ready >= 4 and near_close:
         return "BTST-CARRY"          # shift intraday -> overnight
     if ready >= 4:
@@ -319,6 +325,125 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         board = board.sort_values(["action", "bar_clr"], ascending=[True, False])
     return {"ok": True, "status": ts["describe"], "tf": tf, "risk_on": risk_on,
             "idx_ret": idx_ret, "board": board, "n_scanned": len(pre)}
+
+
+_REPLAY_CACHE = Path(__file__).resolve().parent.parent / "data" / "replay"
+
+
+def _fetch_day_candles(date, resolution: str = "15") -> pd.DataFrame:
+    """All liquid-universe intraday candles for a past trading DATE (long format:
+    symbol, ts, ohlcv). Cached to parquet per (date, res) — fetched once, then any
+    replay time slices it instantly. Heavy first call (~250 /history requests)."""
+    d = pd.Timestamp(date).date()
+    cache = _REPLAY_CACHE / f"{d}_{resolution}.parquet"
+    if cache.exists():
+        return pd.read_parquet(cache)
+    uni = liquid_universe(date)
+    frames = []
+    for sym in uni["symbol"]:
+        try:
+            r = requests.get(config.FYERS_HISTORY_URL,
+                             headers={"Authorization": _auth_header(), "version": "3"},
+                             params={"symbol": fy_symbol(sym), "resolution": resolution,
+                                     "date_format": "1", "range_from": d.isoformat(),
+                                     "range_to": d.isoformat(), "cont_flag": "1"}, timeout=15)
+            j = r.json()
+            if j.get("s") != "ok" or not j.get("candles"):
+                continue
+            f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
+            f["ts"] = pd.to_datetime(f["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            f["symbol"] = sym
+            frames.append(f)
+        except Exception:
+            continue
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not out.empty:
+        _REPLAY_CACHE.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(cache, index=False)
+    return out
+
+
+def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
+    """Reconstruct the board AS OF `date` `time_str` (HH:MM), causally — only bars at
+    or before that minute are used (no lookahead). This is the practice/backtest lens:
+    at 1pm you see FORMING; scrub to 15:15 to see which became BTST-CARRY."""
+    ts = token_status()
+    d = pd.Timestamp(date)
+    risk_on = regime.is_risk_on(d)
+    if not ts["usable"]:
+        return {"ok": False, "status": ts["describe"], "risk_on": risk_on, "board": pd.DataFrame()}
+    cut = dt.datetime.strptime(time_str, "%H:%M").time()
+    allc = _fetch_day_candles(date, resolution)
+    if allc.empty:
+        return {"ok": True, "status": ts["describe"], "risk_on": risk_on,
+                "board": pd.DataFrame(), "time": time_str, "date": str(d.date())}
+    uni = liquid_universe(date).set_index("symbol")
+    # index return as of cut (Nifty), causal
+    idx_ret = None
+    try:
+        niff = fetch_intraday_range(config.NIFTY_FYERS, date, resolution)
+        niff = niff[niff["ts"].dt.time <= cut]
+        if len(niff) >= 2:
+            idx_ret = 100 * (niff["close"].iloc[-1] / niff["open"].iloc[0] - 1)
+    except Exception:
+        pass
+    earn = _events_upcoming(d.date())
+    rows = []
+    for sym, g in allc[allc["ts"].dt.time <= cut].groupby("symbol"):
+        if sym not in uni.index or len(g) < 1:
+            continue
+        pc = uni.loc[sym, "prev_close"]              # prior-day close = correct day% baseline
+        pc = float(pc) if pc == pc else float(g["open"].iloc[0])
+        st_ = indicators.live_state(g, pc, uni.loc[sym, "vol_med20"],
+                                    (idx_ret / 100.0) if idx_ret is not None else None)
+        pa = {k: st_[k] for k in ("clr", "body", "upper_wick", "lower_wick", "character")}
+        day_ret, rs = st_["day_ret"], st_.get("rs_vs_index")
+        vsurge = st_["vol_surge"]
+        atr14 = float(uni.loc[sym, "atr14"]) if uni.loc[sym, "atr14"] == uni.loc[sym, "atr14"] else 0.0
+        lv = indicators.levels(st_["ltp"], atr14, day_low=float(g["low"].min()))
+        ready = btst_readiness(pa, day_ret, rs, vsurge)
+        rows.append({
+            "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
+            "day%": day_ret, "clr": pa["clr"], "character": pa["character"],
+            "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"], "rsi7": st_["rsi7"],
+            "rsi14": st_["rsi14"], "tone": st_["tone"],
+            "vol×": round(vsurge, 2) if vsurge == vsurge else None,
+            "RS%": round(rs, 2) if rs is not None else None, "btst": f"{ready}/4",
+            "entry": lv.get("entry"), "stop": lv.get("stop"),
+            "t1": lv.get("t1"), "t2": lv.get("t2"), "atr%": lv.get("atr%"),
+            "action": ("EARNINGS" if sym in earn
+                       else _live_action(pa, day_ret, rs, vsurge, risk_on, now_time=cut)),
+            "sell": _sell_action(pa, day_ret, rs, vsurge),
+        })
+    board = pd.DataFrame(rows)
+    if not board.empty:
+        board = board.sort_values(["action", "btst"], ascending=[True, False])
+    return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "idx_ret": idx_ret,
+            "board": board, "time": time_str, "date": str(d.date()), "n": len(board)}
+
+
+def fetch_intraday_range(sym: str, date, resolution: str = "15") -> pd.DataFrame:
+    """One symbol's candles for a single past date."""
+    d = pd.Timestamp(date).date()
+    r = requests.get(config.FYERS_HISTORY_URL,
+                     headers={"Authorization": _auth_header(), "version": "3"},
+                     params={"symbol": sym, "resolution": resolution, "date_format": "1",
+                             "range_from": d.isoformat(), "range_to": d.isoformat(),
+                             "cont_flag": "1"}, timeout=15)
+    j = r.json()
+    if j.get("s") != "ok" or not j.get("candles"):
+        return pd.DataFrame()
+    f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
+    f["ts"] = pd.to_datetime(f["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    return f
+
+
+def _events_upcoming(d0) -> set:
+    try:
+        from . import events
+        return events.upcoming(d0, horizon_days=3)
+    except Exception:
+        return set()
 
 
 def _tf_action(s: dict, risk_on: bool) -> str:
