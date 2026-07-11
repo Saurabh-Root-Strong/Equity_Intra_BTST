@@ -23,7 +23,7 @@ st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="�
 
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
 LIVE_COLS = {
-    "symbol": st.column_config.TextColumn("symbol", help="NSE F&O stock (cash, no theta)."),
+    "symbol": st.column_config.TextColumn("symbol", help="NSE F&O stock (cash, no theta).", pinned=True),
     "time": st.column_config.TextColumn("time", help="The candle the signal is on, as open→close (e.g. 13:15-15:15 = the 2h candle spanning 13:15 to 15:15). IMPORTANT: an intraday signal only CONFIRMS at the candle's CLOSE — during a live session the current candle is still forming and the signal can repaint until it closes. Live snapshot = scan time; replay = last bar at/before your cut."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
     "ltp": st.column_config.NumberColumn("ltp", help="Live last-traded price (Fyers).", format="%.2f"),
@@ -450,6 +450,7 @@ else:
             "exp_move%", "clr", "delivTr", "delivTd", "vol×", "day%", ">vwap%", "RS10%", "wt%"]
     st.dataframe(show[cols].round(2), use_container_width=True, hide_index=True,
                  column_config={
+                     "symbol": st.column_config.TextColumn("symbol", pinned=True),
                      "delivTr": st.column_config.NumberColumn(
                          "delivTr", help="TRAILING delivery% (3-day avg through yesterday) — "
                          "the LEAK-FREE signal leg, known at the 15:15 close. ≥60 = sustained "
