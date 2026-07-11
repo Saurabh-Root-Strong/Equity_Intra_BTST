@@ -68,6 +68,25 @@ python -m eqbtst.cli backtest --top 5    # walk-forward validation
 Reads the **Daily_Cash_Market** DuckDB EOD archive read-only
 (`data/market_data.duckdb`). Configure the path in `eqbtst/config.py`.
 
+## Self-running paper loop (start your forward track record)
+
+The only thing that proves the edge is alive *going forward* is a live paper record.
+Run one job daily ~20:00 IST (after the DCM EOD sync); nothing auto-executes real orders.
+
+```
+paper_loop.bat              # reconcile yesterday -> emit tonight -> scorecard + edge-health
+register_paper_task.bat     # register it in Windows Task Scheduler (daily 20:00), run once
+```
+
+Then do nothing but watch the record accrue:
+```
+python -m eqbtst.cli scorecard      # P&L, win%, edge-health (⚠ DECAY / ✓ intact)
+```
+
+Deploy real capital ONLY when: (1) edge-health reads ✓ intact / positive, (2) paper
+tracks the backtest, (3) small size. Right now the honest read is a soft regime —
+paper-only, stand aside, wait for it to turn.
+
 ## Discipline (borrowed from the proven Tradebot BTST loop)
 
 - **Rule is LOCKED** — thresholds fixed by the 8yr validation, no in-sample tuning.
