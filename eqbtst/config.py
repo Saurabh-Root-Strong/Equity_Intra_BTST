@@ -76,6 +76,15 @@ MAX_HOLD       = "overnight"   # capture close -> next-morning. NEVER day-2.
 # ran to a multi-% gap-down. Size each name so a ~-8% shock gap is survivable, and
 # cap gross overnight exposure. Equal-weight across the selected names by default.
 
+# --- expected-move band (the ONLY validated forecast product: RANGE, not a target) --
+# Calibrated on the F&O universe (last yr, |move|/ATR percentiles): where price is
+# LIKELY to be, not a prediction of where it goes. ±0.6 ATR contains ~68% of next-day
+# CLOSES; ±1.0 ATR contains ~74% of the full next-day HIGH/LOW range; the overnight
+# (BTST exit) move is small, ~±0.2 ATR at 68%.
+BAND_CLOSE_68 = 0.6   # ± this × ATR = ~68% next-day close band
+BAND_RANGE    = 1.0   # ± this × ATR = ~74% next-day full-range band
+BAND_ON_68    = 0.2   # ± this × ATR = ~68% overnight (close->next open) band
+
 # --- costs (report gross AND net; the binding constraint) ---------------------
 COST_BPS    = 22.0    # realistic retail BTST round-trip (STT + brokerage + slippage)
 

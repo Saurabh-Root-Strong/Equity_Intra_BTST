@@ -39,6 +39,12 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         lambda s: s.shift(1).rolling(config.LOOKBACK).median())
     df["deliv_spike"] = df["deliv_per"] - deliv_med                 # abnormal accumulation
 
+    pc = g["close_price"].shift(1)                                  # daily ATR14 for the band
+    tr = pd.concat([df["high_price"] - df["low_price"],
+                    (df["high_price"] - pc).abs(),
+                    (df["low_price"] - pc).abs()], axis=1).max(axis=1)
+    df["atr14"] = tr.groupby(df["symbol"]).transform(lambda s: s.rolling(14).mean())
+
     return df
 
 

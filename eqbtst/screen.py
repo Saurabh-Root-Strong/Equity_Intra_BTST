@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import config, data, events, features, portfolio, regime
+from . import config, data, events, features, indicators, portfolio, regime
 
 
 def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.DataFrame:
@@ -87,6 +87,10 @@ def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
     if risk_on and not liquid.empty:
         buys = portfolio.select(liquid)
         buys["action"] = "BUY"
+        bands = buys.apply(lambda r: indicators.band(r["close_price"], r.get("atr14", 0)),
+                           axis=1)
+        for col in ("band_lo", "band_hi", "range_lo", "range_hi", "exp_move%"):
+            buys[col] = [b.get(col) for b in bands]
     else:
         buys = liquid.head(0).assign(sector=[], weight=[], action=[])
 

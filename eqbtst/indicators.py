@@ -168,6 +168,22 @@ def structure(candles: pd.DataFrame, lookback: int = 20) -> str:
     return "RANGE"
 
 
+def band(price: float, atr_val: float) -> dict:
+    """Calibrated expected-move BAND — where price is LIKELY to be, not a target.
+    Uses the ATR-multiples calibrated on the F&O universe. Returns the ~68% next-day
+    close band, the ~74% full-range band, and the expected-move %. Empty if no ATR."""
+    from . import config
+    if atr_val <= 0 or price <= 0:
+        return {}
+    b68 = config.BAND_CLOSE_68 * atr_val
+    brg = config.BAND_RANGE * atr_val
+    return {
+        "band_lo": round(price - b68, 2), "band_hi": round(price + b68, 2),   # ~68% next close
+        "range_lo": round(price - brg, 2), "range_hi": round(price + brg, 2),  # ~74% next H/L
+        "exp_move%": round(100 * b68 / price, 2),                              # ±% at ~68%
+    }
+
+
 def live_state(candles: pd.DataFrame, prev_close: float,
                ref_avg_day_vol: float | None = None,
                index_ret: float | None = None) -> dict:

@@ -40,6 +40,8 @@ LIVE_COLS = {
     "t2": st.column_config.NumberColumn("t2", help="Target 2 = +2×ATR. Stretch/runner target.", format="%.2f"),
     "risk%": st.column_config.NumberColumn("risk%", help="Distance to stop as % of price = position risk. Size so a name's stop-out is survivable.", format="%.2f"),
     "atr%": st.column_config.NumberColumn("atr%", help="Daily ATR as % of price = how much this name typically moves. Bigger = wider stops/targets.", format="%.2f"),
+    "band_lo": st.column_config.NumberColumn("band_lo", help="Lower bound of the ~68% expected next-day CLOSE band (close − 0.6×ATR). Where price is LIKELY to be — a calibrated range, not a target.", format="%.1f"),
+    "band_hi": st.column_config.NumberColumn("band_hi", help="Upper bound of the ~68% expected next-day CLOSE band (close + 0.6×ATR).", format="%.1f"),
     "action": st.column_config.TextColumn("action", help="BTST-CARRY = near close the full footprint holds → SHIFT this intraday name to an overnight hold (next-day move expectable; exit next-AM; delivery confirms at close). FORMING = footprint building earlier in the day. NEUTRAL = watch. AVOID = weak close / down / illiquid / regime-off. No SELL — short overnight is proven dead (20% win)."),
 }
 
@@ -215,8 +217,8 @@ if tf == "Intraday":
                   f"{scounts.get('SHORT', 0) + scounts.get('WEAK', 0)}")
 
         buy_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vol×",
-                    "RS%", "btst", "exp_ON", "entry", "stop", "t1", "t2", "risk%",
-                    "atr%", "action"]
+                    "RS%", "btst", "exp_ON", "band_lo", "band_hi", "entry", "stop",
+                    "t1", "t2", "risk%", "atr%", "action"]
         sell_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
@@ -388,12 +390,29 @@ else:
     show["wt%"] = (100 * show["weight"]).round(0)
     show = show.rename(columns={"deliv_per": "deliv%", "deliv_spike": "spike",
                                 "vol_ratio": "vol×", "close_price": "entry≈"})
-    cols = ["action", "symbol", "sector", "entry≈", "clr", "deliv%", "spike",
-            "vol×", "day%", ">vwap%", "RS10%", "score", "wt%"]
-    st.dataframe(show[cols].round(2), use_container_width=True, hide_index=True)
-    st.caption("Plan: LONG near close, equal-weight, exit next-morning strength "
-               "(VWAP reclaim / RSI roll). Size each for a ~-8% shock gap (unhedged "
-               "overnight beta). Exclude any name reporting results tonight (event risk).")
+    show["band (68%)"] = show.apply(
+        lambda r: f"{r['band_lo']:.1f} – {r['band_hi']:.1f}"
+        if pd.notna(r.get("band_lo")) else "—", axis=1)
+    show["range (74%)"] = show.apply(
+        lambda r: f"{r['range_lo']:.1f} – {r['range_hi']:.1f}"
+        if pd.notna(r.get("range_lo")) else "—", axis=1)
+    cols = ["action", "symbol", "sector", "entry≈", "band (68%)", "range (74%)",
+            "exp_move%", "clr", "deliv%", "spike", "vol×", "day%", ">vwap%", "RS10%", "wt%"]
+    st.dataframe(show[cols].round(2), use_container_width=True, hide_index=True,
+                 column_config={
+                     "band (68%)": st.column_config.TextColumn(
+                         "band (68%)", help="Calibrated ~68% expected NEXT-DAY CLOSE range "
+                         "(close ± 0.6×ATR). Where price is LIKELY to be — not a target. "
+                         "The one validated forecast product is RANGE, not direction."),
+                     "range (74%)": st.column_config.TextColumn(
+                         "range (74%)", help="~74% full next-day HIGH/LOW range (close ± 1×ATR). "
+                         "Price likely stays within this the whole next session."),
+                     "exp_move%": st.column_config.NumberColumn(
+                         "exp_move%", help="The 68% band as ±% of price — the expected move size.",
+                         format="%.2f")})
+    st.caption("**band (68%)** = where price likely CLOSES next day · **range (74%)** = where it "
+               "likely stays all next session. Calibrated on the F&O universe — a RANGE, not a "
+               "point forecast. Plan: LONG near close, exit next-morning; size for a ~-8% shock gap.")
 
 # AVOID
 av = b["avoid"]

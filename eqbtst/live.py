@@ -169,6 +169,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "t1": lv.get("t1"), "t2": lv.get("t2"),
             "s_stop": s_stop, "s_t1": s_t1, "s_t2": s_t2,
             "risk%": lv.get("risk%"), "atr%": lv.get("atr%"),
+            "band_lo": indicators.band(float(c), atr14).get("band_lo"),
+            "band_hi": indicators.band(float(c), atr14).get("band_hi"),
             "earnings": "⚠" if sym in earn else "",
             "action": ("EARNINGS" if sym in earn
                        else _live_action(pa, day_ret, rs, vsurge, risk_on)),
