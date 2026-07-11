@@ -96,6 +96,7 @@ TF_COLS = {
     "rsi7": st.column_config.NumberColumn("rsi7", help="Fast RSI (proactive) — turns before RSI14."),
     "rsi14": st.column_config.NumberColumn("rsi14", help="Standard Wilder RSI(14)."),
     "tone": st.column_config.TextColumn("tone", help="Momentum tone: strong / neutral / rolling-over / weak (from fast-RSI slope)."),
+    "structure": st.column_config.TextColumn("structure", help="Market structure on this timeframe (Kaufman efficiency + range logic): TREND_UP/DOWN (efficient directional), RANGE (choppy), CONSOLIDATION (range contracting — coil), BREAKOUT_UP/DOWN (beyond prior range). CONTEXT ONLY — intraday structure has no validated edge; use it to understand the tape, not as a buy/sell signal."),
     "action": st.column_config.TextColumn("action", help="LONG = strong bar + above VWAP + RSI not weak + RS-leader, on this timeframe. AVOID = weak bar / below VWAP / regime-off. Long-only. NOTE: intraday direction has no validated overnight-grade edge — manage strictly by the stop."),
 }
 
@@ -156,7 +157,7 @@ if tf == "Intraday":
     # timeframe dropdown — right above the table, right-aligned
     _, ddcol = st.columns([3, 1])
     scan_tf = ddcol.selectbox("Timeframe → stock list",
-                              ["Live snapshot", "1h", "2h", "15m"], index=0,
+                              ["2h", "1h", "15m", "Live snapshot"], index=0,
                               key="scan_tf",
                               help="Live snapshot = current price-action scan (5s). "
                                    "1h/2h/15m = scan the universe on that bar timeframe.")
@@ -310,9 +311,9 @@ if tf == "🎬 Replay (practice)":
     if not near_close:
         st.info(f"It's **{rtime}** — before the 15:10 window, so names show as ⏳ **FORMING** "
                 "(building). Move the slider to **15:15** to see which flip to 🌙 BTST-CARRY.")
-    buy_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vs_vwap%", "rsi7",
-                "rsi14", "tone", "vol×", "RS%", "btst", "entry", "stop", "t1", "t2",
-                "atr%", "action"]
+    buy_cols = ["symbol", "sector", "ltp", "day%", "structure", "clr", "character",
+                "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "btst", "entry",
+                "stop", "t1", "t2", "atr%", "action"]
     st.markdown("#### 🌙 BTST-CARRY / ⏳ FORMING (long footprint at this time)")
     long_side = bd[bd["action"].isin(["BTST-CARRY", "FORMING"])]
     if long_side.empty:

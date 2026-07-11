@@ -312,10 +312,10 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         s, lv = ds["state"], ds["levels"]
         rows.append({
             "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": s["ltp"],
-            "day%": s["day_ret"], "bar_clr": s["clr"], "character": s["character"],
-            "vs_vwap%": s["vs_vwap"], "above_vwap": s["above_vwap"],
-            "rsi7": s["rsi7"], "rsi14": s["rsi14"], "tone": s["tone"],
-            "RS%": s.get("rs_vs_index"),
+            "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["clr"],
+            "character": s["character"], "vs_vwap%": s["vs_vwap"],
+            "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
+            "tone": s["tone"], "RS%": s.get("rs_vs_index"),
             "entry": lv.get("entry"), "stop": lv.get("stop"),
             "t1": lv.get("t1"), "t2": lv.get("t2"), "atr%": lv.get("atr%"),
             "action": _tf_action(s, risk_on),
@@ -404,9 +404,9 @@ def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
         ready = btst_readiness(pa, day_ret, rs, vsurge)
         rows.append({
             "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
-            "day%": day_ret, "clr": pa["clr"], "character": pa["character"],
-            "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"], "rsi7": st_["rsi7"],
-            "rsi14": st_["rsi14"], "tone": st_["tone"],
+            "day%": day_ret, "structure": st_["structure"], "clr": pa["clr"],
+            "character": pa["character"], "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"],
+            "rsi7": st_["rsi7"], "rsi14": st_["rsi14"], "tone": st_["tone"],
             "vol×": round(vsurge, 2) if vsurge == vsurge else None,
             "RS%": round(rs, 2) if rs is not None else None, "btst": f"{ready}/4",
             "entry": lv.get("entry"), "stop": lv.get("stop"),
@@ -475,6 +475,7 @@ def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
     pc = ref_close if ref_close else float(c["close"].iloc[0])
     state = indicators.live_state(session, pc, ref_avg_vol,
                                   (idx_ret / 100.0) if idx_ret is not None else None)
+    state["structure"] = indicators.structure(c)            # multi-day frame (not 1 session)
     atr_tf = indicators.atr(c, 14)                          # ATR on the chosen timeframe
     lv = indicators.levels(state["ltp"], atr_tf,
                            day_low=float(session["low"].min()),

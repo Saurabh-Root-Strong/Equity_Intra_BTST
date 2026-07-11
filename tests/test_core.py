@@ -105,6 +105,19 @@ def test_indicators():
     assert ls["above_vwap"] and "rsi7" in ls and "rs_vs_index" in ls
 
 
+def test_structure():
+    from eqbtst import indicators as I
+    up = pd.DataFrame({"open": range(1, 25), "high": [x + 0.5 for x in range(1, 25)],
+                       "low": [x - 0.5 for x in range(1, 25)], "close": range(1, 25),
+                       "volume": [10] * 24})
+    assert I.structure(up) in ("BREAKOUT_UP", "TREND_UP")     # efficient up move
+    rng = pd.DataFrame({"open": [10, 11] * 6, "high": [11.5] * 12, "low": [9.5] * 12,
+                        "close": [10, 11] * 6, "volume": [10] * 12})
+    assert I.structure(rng) == "RANGE"                        # choppy, no direction
+    assert I.structure(pd.DataFrame({"open": [1], "high": [1], "low": [1],
+                                     "close": [1], "volume": [1]})) == "n/a"
+
+
 def test_atr_and_levels():
     from eqbtst import indicators as I
     c = pd.DataFrame({"open": [100, 101, 102, 101, 103], "high": [102, 103, 104, 103, 105],

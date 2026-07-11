@@ -136,6 +136,38 @@ def levels(ltp: float, atr_val: float, day_low: float | None = None,
     }
 
 
+def structure(candles: pd.DataFrame, lookback: int = 20) -> str:
+    """Market structure on this timeframe (CONTEXT, not a signal — intraday structure
+    has no validated edge). Kaufman efficiency ratio + range logic:
+      BREAKOUT_UP/DOWN  last close beyond the prior range extreme
+      TREND_UP/DOWN     efficient directional travel (ER >= 0.4)
+      CONSOLIDATION     range contracting (recent range < 0.6x prior)
+      RANGE             choppy, no direction
+    """
+    c = candles["close"].to_numpy(float)
+    if len(c) < 5:
+        return "n/a"
+    seg = c[-lookback:]
+    net = seg[-1] - seg[0]
+    denom = np.abs(np.diff(seg)).sum()
+    er = abs(net) / denom if denom > 0 else 0.0            # Kaufman efficiency ratio
+    hi = candles["high"].to_numpy(float)[-lookback:]
+    lo = candles["low"].to_numpy(float)[-lookback:]
+    last = c[-1]
+    if len(hi) > 1 and last > hi[:-1].max():
+        return "BREAKOUT_UP"
+    if len(lo) > 1 and last < lo[:-1].min():
+        return "BREAKOUT_DOWN"
+    if er >= 0.4:
+        return "TREND_UP" if net > 0 else "TREND_DOWN"
+    if len(hi) >= 6:
+        recent = hi[-3:].max() - lo[-3:].min()
+        prior = hi[:-3].max() - lo[:-3].min()
+        if prior > 0 and recent < 0.6 * prior:
+            return "CONSOLIDATION"
+    return "RANGE"
+
+
 def live_state(candles: pd.DataFrame, prev_close: float,
                ref_avg_day_vol: float | None = None,
                index_ret: float | None = None) -> dict:
@@ -152,7 +184,7 @@ def live_state(candles: pd.DataFrame, prev_close: float,
     st = {
         "ltp": round(c, 2), "day_ret": round(100 * day_ret, 2),
         "vwap": round(vw, 2), "vs_vwap": round(100 * (c / vw - 1), 2),
-        "above_vwap": c >= vw,
+        "above_vwap": c >= vw, "structure": structure(candles),
         "vol_surge": round(volume_surge(candles, ref_avg_day_vol), 2),
         **pa, **rs,
     }
