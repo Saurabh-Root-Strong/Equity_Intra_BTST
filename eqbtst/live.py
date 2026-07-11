@@ -319,15 +319,22 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         if not ds:
             continue
         s, lv = ds["state"], ds["levels"]
+        atr_tf = ds.get("atr_tf", 0.0)
+        ltp = s["ltp"]
+        # short-side levels on this timeframe (stop ABOVE, targets BELOW)
+        s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
+        s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
+        s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
         rows.append({
-            "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": s["ltp"],
+            "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": ltp,
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
             "tone": s["tone"], "RS%": s.get("rs_vs_index"),
             "entry": lv.get("entry"), "stop": lv.get("stop"),
-            "t1": lv.get("t1"), "t2": lv.get("t2"), "atr%": lv.get("atr%"),
-            "action": _tf_action(s, risk_on),
+            "t1": lv.get("t1"), "t2": lv.get("t2"),
+            "s_stop": s_stop, "s_t1": s_t1, "s_t2": s_t2, "atr%": lv.get("atr%"),
+            "action": _tf_action(s, risk_on), "sell": _tf_sell_action(s, risk_on),
         })
     board = pd.DataFrame(rows)
     if not board.empty:
@@ -473,6 +480,19 @@ def _tf_action(s: dict, risk_on: bool) -> str:
     return "NEUTRAL"
 
 
+def _tf_sell_action(s: dict, risk_on: bool) -> str:
+    """SHORT side on a bar timeframe (INTRADAY ONLY, unvalidated): weak bar + below
+    VWAP + RSI weak/rolling + RS-laggard. Square off same day."""
+    weak = (s["clr"] <= (1 - config.CLR_TH) and not s["above_vwap"]
+            and s["tone"] in ("weak", "rolling-over")
+            and (s.get("rs_vs_index") is None or s["rs_vs_index"] < 0))
+    if weak:
+        return "SHORT"
+    if s["clr"] <= 0.4 and not s["above_vwap"]:
+        return "WEAK"
+    return "—"
+
+
 def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
                ref_avg_vol: float | None = None, idx_ret: float | None = None) -> dict:
     """1h/2h chart read for one name: VWAP + proactive RSI + price-action character
@@ -493,4 +513,4 @@ def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
     lv = indicators.levels(state["ltp"], atr_tf,
                            day_low=float(session["low"].min()),
                            day_high=float(session["high"].max()))
-    return {"tf": tf, "state": state, "levels": lv, "candles": c}
+    return {"tf": tf, "state": state, "levels": lv, "atr_tf": atr_tf, "candles": c}

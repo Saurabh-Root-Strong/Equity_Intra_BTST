@@ -179,14 +179,37 @@ if tf == "Intraday":
                     "clears the footprint on this timeframe. During a live session this "
                     "fills. For today's delivery-confirmed picks use the BTST tab.")
         else:
+            b = sc["board"]
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
-            st.dataframe(sc["board"], use_container_width=True, hide_index=True,
-                         column_config={**LIVE_COLS, **TF_COLS})
+            long_cols = ["symbol", "sector", "ltp", "day%", "structure", "bar_clr",
+                         "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
+                         "entry", "stop", "t1", "t2", "atr%", "action"]
+            sell_cols_tf = ["symbol", "sector", "ltp", "day%", "structure", "bar_clr",
+                            "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
+                            "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
+            tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
+            with tb:
+                lo = b[b["action"] == "LONG"]
+                st.dataframe((lo if not lo.empty else b)[long_cols],
+                             use_container_width=True, hide_index=True,
+                             column_config={**LIVE_COLS, **TF_COLS})
+                if lo.empty:
+                    st.caption("No LONG on this timeframe — showing the shortlist.")
+            with ts:
+                st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** "
+                           "Overnight short is proven -EV (win 20%); intraday direction "
+                           "has no validated edge either. Weakness screen, not alpha — "
+                           "trade small, manage by s_stop.")
+                sh = b[b["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
+                if sh.empty:
+                    st.caption("No distribution/weakness names on this timeframe.")
+                else:
+                    st.dataframe(sh[sell_cols_tf], use_container_width=True, hide_index=True,
+                                 column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
             st.caption("Entry/Stop/T1/T2 = ATR risk geometry on this timeframe, NOT a "
-                       "forecast. Intraday direction has no overnight-grade validated "
-                       "edge — trade small, manage by the stop.")
+                       "forecast. Long-only is the validated edge; SHORT is intraday context.")
         st.stop()
 
     # ---- live snapshot (5s price-action scan) — Buy / Sell tabs ---------------
