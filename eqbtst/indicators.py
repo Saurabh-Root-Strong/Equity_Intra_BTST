@@ -122,7 +122,9 @@ def levels(ltp: float, atr_val: float, day_low: float | None = None,
     if atr_val <= 0 or ltp <= 0:
         return {}
     stop_atr = ltp - 1.0 * atr_val
-    stop = max(stop_atr, day_low) if day_low else stop_atr    # structural stop if tighter
+    # structural stop if tighter, but only if the day-low is genuinely below entry
+    # (a name that closed AT its low would give stop == entry = zero risk)
+    stop = max(stop_atr, day_low) if (day_low and day_low < ltp) else stop_atr
     risk = ltp - stop
     t1, t2 = ltp + 1.0 * atr_val, ltp + 2.0 * atr_val
     return {
