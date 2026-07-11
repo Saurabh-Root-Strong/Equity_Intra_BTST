@@ -24,6 +24,7 @@ st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="�
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
 LIVE_COLS = {
     "symbol": st.column_config.TextColumn("symbol", help="NSE F&O stock (cash, no theta)."),
+    "time": st.column_config.TextColumn("time", help="When the signal fired: the timestamp of the last bar on this timeframe (1h/2h/15m = that bar's time; live snapshot = the scan time; replay = the last bar at/before your cut)."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
     "ltp": st.column_config.NumberColumn("ltp", help="Live last-traded price (Fyers).", format="%.2f"),
     "day%": st.column_config.NumberColumn("day%", help="Return vs previous close. The signal wants demand in control (≥ +1%).", format="%.2f"),
@@ -199,10 +200,10 @@ if tf == "Intraday":
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
-            long_cols = ["symbol", "sector", "ltp", "day%", "structure", "bar_clr",
+            long_cols = ["symbol", "time", "sector", "ltp", "day%", "structure", "bar_clr",
                          "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                          "entry", "stop", "t1", "t2", "atr%", "action"]
-            sell_cols_tf = ["symbol", "sector", "ltp", "day%", "structure", "bar_clr",
+            sell_cols_tf = ["symbol", "time", "sector", "ltp", "day%", "structure", "bar_clr",
                             "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                             "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
             tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
@@ -257,10 +258,10 @@ if tf == "Intraday":
         h4.metric("SELL (short/weak)",
                   f"{scounts.get('SHORT', 0) + scounts.get('WEAK', 0)}")
 
-        buy_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vol×",
+        buy_cols = ["symbol", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                     "RS%", "delivTr", "btst", "exp_ON", "band_lo", "band_hi", "entry",
                     "stop", "t1", "t2", "risk%", "atr%", "action"]
-        sell_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vol×",
+        sell_cols = ["symbol", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
                                  "🔴 SELL (intraday short — square off same day)"])
@@ -355,7 +356,7 @@ if tf == "🎬 Replay (practice)":
     if not near_close:
         st.info(f"It's **{rtime}** — before the 15:10 window, so names show as ⏳ **FORMING** "
                 "(building). Move the slider to **15:15** to see which flip to 🌙 BTST-CARRY.")
-    buy_cols = ["symbol", "sector", "ltp", "day%", "structure", "clr", "character",
+    buy_cols = ["symbol", "time", "sector", "ltp", "day%", "structure", "clr", "character",
                 "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "btst", "entry",
                 "stop", "t1", "t2", "atr%", "action"]
     st.markdown("#### 🌙 BTST-CARRY / ⏳ FORMING (long footprint at this time)")

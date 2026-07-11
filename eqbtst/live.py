@@ -164,7 +164,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         s_t1 = round(float(c) - atr14, 2) if atr14 > 0 else None
         s_t2 = round(float(c) - 2 * atr14, 2) if atr14 > 0 else None
         rows.append({
-            "symbol": sym, "sector": ref.loc[sym, "sector"], "ltp": float(c),
+            "symbol": sym, "time": dt.datetime.now().strftime("%H:%M:%S"),
+            "sector": ref.loc[sym, "sector"], "ltp": float(c),
             "day%": round(day_ret, 2), "clr": pa["clr"], "character": pa["character"],
             "body": pa["body"], "vol×": round(vsurge, 2) if vsurge == vsurge else None,
             "RS%": round(rs, 2) if rs is not None else None,
@@ -321,12 +322,15 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         s, lv = ds["state"], ds["levels"]
         atr_tf = ds.get("atr_tf", 0.0)
         ltp = s["ltp"]
+        cndl = ds.get("candles")
+        bar_time = (cndl["ts"].iloc[-1].strftime("%d-%b %H:%M")
+                    if cndl is not None and len(cndl) else None)
         # short-side levels on this timeframe (stop ABOVE, targets BELOW)
         s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
         s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
         s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
         rows.append({
-            "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": ltp,
+            "symbol": sym, "time": bar_time, "sector": uni.loc[sym, "sector"], "ltp": ltp,
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
@@ -419,7 +423,8 @@ def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
         lv = indicators.levels(st_["ltp"], atr14, day_low=float(g["low"].min()))
         ready = btst_readiness(pa, day_ret, rs, vsurge)
         rows.append({
-            "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
+            "symbol": sym, "time": g["ts"].iloc[-1].strftime("%H:%M"),
+            "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
             "day%": day_ret, "structure": st_["structure"], "clr": pa["clr"],
             "character": pa["character"], "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"],
             "rsi7": st_["rsi7"], "rsi14": st_["rsi14"], "tone": st_["tone"],
