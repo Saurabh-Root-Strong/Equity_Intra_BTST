@@ -61,7 +61,7 @@ def _last_date():
 st.sidebar.title("Equity BTST")
 last = _last_date()
 tf = st.sidebar.radio("Timeframe",
-                      ["BTST (overnight)", "Intraday", "🎬 Replay (practice)", "BTST+1"],
+                      ["BTST (overnight)", "Intraday", "🎬 Replay (practice)"],
                       index=0)
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
@@ -328,13 +328,6 @@ if tf == "🎬 Replay (practice)":
     st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
                "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone are point-in-time.")
     st.stop()
-if tf == "BTST+1":
-    st.title("BTST+1 — proven dead")
-    st.error("Holding the position into day 2 is negative every year on 8yr data "
-             "(the overnight gap mean-reverts intraday on day 2). Not offered. "
-             "Capture the overnight gap only.")
-    st.stop()
-
 # ── BTST board ─────────────────────────────────────────────────────────────────
 b = _board(pd.Timestamp(date).strftime("%Y-%m-%d"))
 risk_on = b["risk_on"]
