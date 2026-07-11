@@ -438,7 +438,11 @@ def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
             "delivTr": round(float(uni.loc[sym, "deliv_trail"]), 1)
             if uni.loc[sym, "deliv_trail"] == uni.loc[sym, "deliv_trail"] else None,
             "entry": lv.get("entry"), "stop": lv.get("stop"),
-            "t1": lv.get("t1"), "t2": lv.get("t2"), "atr%": lv.get("atr%"),
+            "t1": lv.get("t1"), "t2": lv.get("t2"),
+            "s_stop": round(st_["ltp"] + atr14, 2) if atr14 > 0 else None,
+            "s_t1": round(st_["ltp"] - atr14, 2) if atr14 > 0 else None,
+            "s_t2": round(st_["ltp"] - 2 * atr14, 2) if atr14 > 0 else None,
+            "atr%": lv.get("atr%"),
             "action": ("EARNINGS" if sym in earn else _live_action(
                 pa, day_ret, rs, vsurge, risk_on, now_time=cut,
                 deliv_trail=float(uni.loc[sym, "deliv_trail"])

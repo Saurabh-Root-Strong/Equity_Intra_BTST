@@ -359,15 +359,28 @@ if tf == "🎬 Replay (practice)":
     buy_cols = ["symbol", "time", "sector", "ltp", "day%", "structure", "clr", "character",
                 "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "btst", "entry",
                 "stop", "t1", "t2", "atr%", "action"]
-    st.markdown("#### 🌙 BTST-CARRY / ⏳ FORMING (long footprint at this time)")
-    long_side = bd[bd["action"].isin(["BTST-CARRY", "FORMING"])]
-    if long_side.empty:
-        st.caption("None building at this time — top-10 by close-strength so far:")
-        long_side = bd.sort_values("clr", ascending=False).head(10)
-    st.dataframe(long_side[buy_cols], use_container_width=True, hide_index=True,
-                 column_config={**LIVE_COLS, **TF_COLS})
-    st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
-               "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone are point-in-time.")
+    sell_cols_r = ["symbol", "time", "sector", "ltp", "day%", "structure", "clr", "character",
+                   "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "entry",
+                   "s_stop", "s_t1", "s_t2", "atr%", "sell"]
+    rt_long, rt_short = st.tabs(["🟢 LONG (BTST-CARRY / FORMING)", "🔴 SHORT (intraday)"])
+    with rt_long:
+        long_side = bd[bd["action"].isin(["BTST-CARRY", "FORMING"])]
+        if long_side.empty:
+            st.caption("None building at this time — top-10 by close-strength so far:")
+            long_side = bd.sort_values("clr", ascending=False).head(10)
+        st.dataframe(long_side[buy_cols], use_container_width=True, hide_index=True,
+                     column_config={**LIVE_COLS, **TF_COLS})
+        st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
+                   "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone point-in-time.")
+    with rt_short:
+        st.warning("⚠ **Intraday short only** (square off same day). Overnight short is "
+                   "proven -EV; intraday direction is unvalidated. Weakness screen, not alpha.")
+        sh = bd[bd["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
+        if sh.empty:
+            st.caption("No distribution/weakness names at this time.")
+        else:
+            st.dataframe(sh[sell_cols_r], use_container_width=True, hide_index=True,
+                         column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
     st.stop()
 # ── BTST board ─────────────────────────────────────────────────────────────────
 b = _board(pd.Timestamp(date).strftime("%Y-%m-%d"))
