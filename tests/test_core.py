@@ -51,10 +51,11 @@ def test_signal_mask_requires_full_stack():
     df.loc[i, "avg_price"] = 102.0          # close 104.5 is ~2.5% above VWAP -> path-persistent
     df.loc[i, "ttl_trd_qnty"] = 5000        # 5x the 1000 baseline
     df.loc[i, "turnover_lacs"] = 3000.0     # >= Rs20cr liquidity floor
-    df.loc[i, "deliv_per"] = 75.0           # high, and >> 40 baseline
-    # give it a few prior up-days so 10d cumulative RS vs a flat index is > 0
+    df.loc[i, "deliv_per"] = 75.0           # today's (post-hoc) delivery
+    # prior days: high delivery (so trailing avg >= 60, the leak-free leg) + up-days for RS
     for k in range(2, 12):
         df.loc[df.index[-k], "close_price"] = 100.3
+        df.loc[df.index[-k], "deliv_per"] = 70.0
     df = features.add_features(df)
     df = features.add_relative_strength(df, _flat_nifty(df))
     assert bool(features.signal_mask(df).iloc[-1]) is True
@@ -67,6 +68,19 @@ def test_signal_mask_requires_full_stack():
     # break RELATIVE STRENGTH (persistent laggard) -> no signal
     df4 = df.copy(); df4.loc[i, "rs_idx_cum"] = -0.05
     assert bool(features.signal_mask(df4).iloc[-1]) is False
+    # break TRAILING DELIVERY (no sustained accumulation) -> no signal
+    df5 = df.copy(); df5.loc[i, "deliv_trail"] = 40.0
+    assert bool(features.signal_mask(df5).iloc[-1]) is False
+
+
+def test_signal_is_leak_free():
+    """No signal leg may use a value unknowable at the 15:15 close. Delivery% lands
+    ~6pm, so the delivery leg must be TRAILING (deliv_trail, through t-1), never
+    today's deliv_per/deliv_spike."""
+    import inspect
+    src = inspect.getsource(features.signal_mask)
+    assert "deliv_trail" in src
+    assert "deliv_per" not in src and "deliv_spike" not in src   # today's delivery = look-ahead
 
 
 def test_sector_cap():
@@ -148,7 +162,8 @@ def test_earnings_guard():
 
 def test_locked_thresholds():
     # tripwire: these are LOCKED by the 8yr validation. A change is a decision, not a typo.
-    assert (config.CLR_TH, config.DELIV_TH, config.VOL_TH, config.RET_TH) == (0.70, 60.0, 2.0, 0.01)
+    assert (config.CLR_TH, config.DELIV_TRAIL_TH, config.VOL_TH, config.RET_TH) == (0.70, 60.0, 2.0, 0.01)
+    assert config.DELIV_TRAIL_WIN == 3            # trailing delivery window (leak-free)
     assert config.CVWAP_TH == 0.005           # path-signature refiner (flips 2025 positive)
     assert (config.RS_LOOKBACK, config.RS_MIN) == (10, 0.0)   # persistent-RS refiner
     assert config.LIQ_MIN_LACS == 2000.0                       # realism/liquidity floor

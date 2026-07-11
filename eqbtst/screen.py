@@ -44,8 +44,8 @@ def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.Dat
         cand["sector"] = []; cand["weight"] = []
     cand["risk_on"] = risk_on
 
-    cols = ["trade_date", "symbol", "sector", "close_price", "clr", "deliv_per",
-            "deliv_spike", "vol_ratio", "ret", "close_vs_vwap", "rs_idx_cum",
+    cols = ["trade_date", "symbol", "sector", "close_price", "clr", "deliv_trail",
+            "deliv_per", "vol_ratio", "ret", "close_vs_vwap", "rs_idx_cum",
             "score", "weight", "risk_on"]
     out = cand[cols].reset_index(drop=True) if not cand.empty else \
         pd.DataFrame(columns=cols)
@@ -119,11 +119,11 @@ def format_screen(out: pd.DataFrame) -> str:
     if out.empty:
         L.append("  No names clear the conviction footprint. Stand aside.")
     else:
-        L.append(f"  {'SYMBOL':<12}{'sector':<20}{'clr':>5}{'deliv%':>7}{'spike':>7}"
+        L.append(f"  {'SYMBOL':<12}{'sector':<20}{'clr':>5}{'delivTr':>8}{'delivTd':>8}"
                  f"{'vol×':>6}{'day%':>7}{'>vwap%':>8}{'RS10%':>7}{'wt':>6}")
         for r in out.itertuples():
-            L.append(f"  {r.symbol:<12}{str(r.sector)[:19]:<20}{r.clr:>5.2f}{r.deliv_per:>7.1f}"
-                     f"{r.deliv_spike:>+7.1f}{r.vol_ratio:>6.1f}{100*r.ret:>+6.1f}%"
+            L.append(f"  {r.symbol:<12}{str(r.sector)[:19]:<20}{r.clr:>5.2f}{r.deliv_trail:>8.1f}"
+                     f"{r.deliv_per:>8.1f}{r.vol_ratio:>6.1f}{100*r.ret:>+6.1f}%"
                      f"{100*r.close_vs_vwap:>+7.2f}%{100*r.rs_idx_cum:>+6.1f}%{r.weight:>6.0%}")
         L.append(f"\n  → LONG near close, equal-weight, exit next-morning strength (VWAP/RSI)."
                  f"\n    Overnight only — NEVER hold into day 2. Long-only (short side proven "

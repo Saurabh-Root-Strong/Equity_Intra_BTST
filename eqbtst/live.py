@@ -85,12 +85,16 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
                     (df["low_price"] - pc).abs()], axis=1).max(axis=1)
     df["atr14"] = tr.groupby(df["symbol"]).transform(lambda s: s.rolling(14).mean())
     df["prev_c"] = pc                              # close of the PRIOR trading day
+    # trailing delivery THROUGH the last completed day (all published) — for a NEXT-
+    # session entry this is leak-free and includes the last EOD row (no shift).
+    df["deliv_trail"] = df.groupby("symbol")["deliv_per"].transform(
+        lambda s: s.rolling(config.DELIV_TRAIL_WIN).mean())
     last = df[df["trade_date"] == date].copy()
     last = last[last["turnover_lacs"] >= config.LIQ_MIN_LACS]
     sectors = data.load_sectors()
     last["sector"] = last["symbol"].map(lambda s: sectors.get(s, f"_{s}"))
     return last[["symbol", "sector", "close_price", "prev_c", "vol_med20", "atr14",
-                 "high_price", "low_price"]].rename(
+                 "deliv_trail", "high_price", "low_price"]].rename(
         columns={"close_price": "ref_close", "prev_c": "prev_close",
                  "high_price": "pdh", "low_price": "pdl"})
 
@@ -154,6 +158,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         lv = indicators.levels(float(c), atr14, day_low=float(l))
         ready = btst_readiness(pa, day_ret, rs, vsurge)
         sready = short_readiness(pa, day_ret, rs, vsurge)
+        dtrail = float(ref.loc[sym, "deliv_trail"]) if ref.loc[sym, "deliv_trail"] == ref.loc[sym, "deliv_trail"] else 0.0
         # short-side levels: stop ABOVE, targets BELOW (mirror of the long geometry)
         s_stop = round(float(c) + atr14, 2) if atr14 > 0 else None
         s_t1 = round(float(c) - atr14, 2) if atr14 > 0 else None
@@ -163,7 +168,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "day%": round(day_ret, 2), "clr": pa["clr"], "character": pa["character"],
             "body": pa["body"], "vol×": round(vsurge, 2) if vsurge == vsurge else None,
             "RS%": round(rs, 2) if rs is not None else None,
-            "btst": f"{ready}/4", "exp_ON": "+0.3–0.4%" if ready >= 4 else "",
+            "btst": f"{ready}/4", "delivTr": round(dtrail, 1),
+            "exp_ON": "+0.3–0.4%" if (ready >= 4 and dtrail >= config.DELIV_TRAIL_TH) else "",
             "short": f"{sready}/4",
             "entry": lv.get("entry"), "stop": lv.get("stop"),
             "t1": lv.get("t1"), "t2": lv.get("t2"),
@@ -173,7 +179,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "band_hi": indicators.band(float(c), atr14).get("band_hi"),
             "earnings": "⚠" if sym in earn else "",
             "action": ("EARNINGS" if sym in earn
-                       else _live_action(pa, day_ret, rs, vsurge, risk_on)),
+                       else _live_action(pa, day_ret, rs, vsurge, risk_on, deliv_trail=dtrail)),
             "sell": _sell_action(pa, day_ret, rs, vsurge),
         })
     board = pd.DataFrame(rows)
@@ -197,7 +203,7 @@ def btst_readiness(pa: dict, day_ret: float, rs, vsurge) -> int:
     n = 0
     n += pa["clr"] >= config.CLR_TH
     n += day_ret >= 100 * config.RET_TH
-    n += (vsurge != vsurge) or (vsurge >= config.VOL_TH)     # NaN volume = unknown, don't penalise
+    n += vsurge == vsurge and vsurge >= config.VOL_TH        # NaN volume = NOT met (no free pass)
     n += (rs is None) or (rs > 0)
     return int(n)
 
@@ -209,7 +215,7 @@ def short_readiness(pa: dict, day_ret: float, rs, vsurge) -> int:
     n = 0
     n += pa["clr"] <= (1 - config.CLR_TH)           # closed in bottom 30% of range
     n += day_ret <= -100 * config.RET_TH
-    n += (vsurge != vsurge) or (vsurge >= config.VOL_TH)
+    n += vsurge == vsurge and vsurge >= config.VOL_TH
     n += (rs is None) or (rs < 0)
     return int(n)
 
@@ -227,24 +233,25 @@ def _sell_action(pa: dict, day_ret: float, rs, vsurge) -> str:
 
 
 def _live_action(pa: dict, day_ret: float, rs, vsurge, risk_on: bool,
-                 now_time: "dt.time | None" = None) -> str:
+                 now_time: "dt.time | None" = None, deliv_trail: float = 0.0) -> str:
     """Honest live label with the intraday→BTST handoff.
 
-    BTST-CARRY = near the close, the full footprint is holding → SHIFT this intraday
-    name to an overnight BTST hold, because the data says a next-day move is expectable
-    (exit next-morning strength; delivery% confirms at the close). FORMING = footprint
-    building earlier in the day. NEUTRAL/AVOID otherwise. Long-only.
+    BTST-CARRY = near the close, the FULL LEAK-FREE footprint holds — the price legs
+    (clr/up/vol/RS) AND trailing delivery ≥ threshold (sustained accumulation, known at
+    the close). Shift this name to an overnight hold. FORMING = the price footprint is
+    building (delivery leg may or may not be there yet). NEUTRAL/AVOID otherwise.
 
     now_time lets REPLAY pass the point-in-time clock (else wall-clock).
     """
     if not risk_on:
         return "AVOID"
     ready = btst_readiness(pa, day_ret, rs, vsurge)
+    deliv_ok = deliv_trail >= config.DELIV_TRAIL_TH
     near_close = (now_time or dt.datetime.now().time()) >= dt.time(15, 10)
-    if ready >= 4 and near_close:
-        return "BTST-CARRY"          # shift intraday -> overnight
+    if ready >= 4 and deliv_ok and near_close:
+        return "BTST-CARRY"          # full leak-free footprint -> shift to overnight
     if ready >= 4:
-        return "FORMING"             # building; may become a carry into the close
+        return "FORMING"             # price footprint building (+/- the delivery leg)
     if pa["clr"] <= 0.33 or day_ret < 0:
         return "AVOID"
     return "NEUTRAL"
@@ -411,10 +418,14 @@ def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
             "rsi7": st_["rsi7"], "rsi14": st_["rsi14"], "tone": st_["tone"],
             "vol×": round(vsurge, 2) if vsurge == vsurge else None,
             "RS%": round(rs, 2) if rs is not None else None, "btst": f"{ready}/4",
+            "delivTr": round(float(uni.loc[sym, "deliv_trail"]), 1)
+            if uni.loc[sym, "deliv_trail"] == uni.loc[sym, "deliv_trail"] else None,
             "entry": lv.get("entry"), "stop": lv.get("stop"),
             "t1": lv.get("t1"), "t2": lv.get("t2"), "atr%": lv.get("atr%"),
-            "action": ("EARNINGS" if sym in earn
-                       else _live_action(pa, day_ret, rs, vsurge, risk_on, now_time=cut)),
+            "action": ("EARNINGS" if sym in earn else _live_action(
+                pa, day_ret, rs, vsurge, risk_on, now_time=cut,
+                deliv_trail=float(uni.loc[sym, "deliv_trail"])
+                if uni.loc[sym, "deliv_trail"] == uni.loc[sym, "deliv_trail"] else 0.0)),
             "sell": _sell_action(pa, day_ret, rs, vsurge),
         })
     board = pd.DataFrame(rows)

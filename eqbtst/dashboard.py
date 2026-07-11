@@ -32,7 +32,8 @@ LIVE_COLS = {
     "body": st.column_config.NumberColumn("body", help="Signed body fraction of range. Positive & large = conviction green candle.", format="%.2f"),
     "vol×": st.column_config.NumberColumn("vol×", help="Volume vs own 20-day median. ≥2× = real participation surge. Blank = no volume yet (pre-open / market closed).", format="%.2f"),
     "RS%": st.column_config.NumberColumn("RS%", help="Relative strength vs Nifty today (stock% − index%). >0 = outperforming the market; persistent RS-leaders carry the overnight edge.", format="%.2f"),
-    "btst": st.column_config.TextColumn("btst", help="BTST-readiness x/4: how many LIVE overnight-footprint legs are met (strong close · up≥1% · vol≥2× · RS-leader). Higher near the close = the day looks like accumulation that historically drifts up overnight → a next-day move is more expectable. VWAP-hold + delivery% are the 2 further confirmations."),
+    "delivTr": st.column_config.NumberColumn("delivTr", help="TRAILING delivery% (3-day avg through yesterday) from the EOD archive — the LEAK-FREE accumulation leg, known live at the close. ≥60 required for BTST-CARRY (a real footprint, not just price-action FORMING).", format="%.1f"),
+    "btst": st.column_config.TextColumn("btst", help="Price-footprint readiness x/4: strong close · up≥1% · vol≥2× · RS-leader (the intraday-knowable legs). BTST-CARRY additionally requires trailing delivery ≥60 (delivTr). FORMING = price legs building, delivery leg may/may not be there."),
     "exp_ON": st.column_config.TextColumn("exp_ON", help="Expected overnight drift IF the footprint holds (full-footprint historical average, gross — NOT a per-name forecast). Exit next-morning strength."),
     "entry": st.column_config.NumberColumn("entry", help="Suggested entry ≈ LTP. RISK GEOMETRY, not a forecast.", format="%.2f"),
     "stop": st.column_config.NumberColumn("stop", help="Protective stop = 1×ATR below (or below day-low if tighter). Defines your risk.", format="%.2f"),
@@ -108,7 +109,7 @@ HELP_INTRADAY = """
 
 **Purpose:** find NSE-F&O cash stocks showing a *smart-money accumulation footprint*,
 and act on the ONE validated edge — the **overnight BTST long** (buy near close, exit
-next morning, ~+16–19bps net on 8yr data). Long-only. Nothing auto-executes.
+next morning, ~+20bps net on 8yr data, LEAK-FREE). Long-only. Nothing auto-executes.
 
 **Two lanes — do NOT mix them:**
 | Lane | Signal | Hold | Validated? |
@@ -121,9 +122,10 @@ next morning, ~+16–19bps net on 8yr data). Long-only. Nothing auto-executes.
 2. **~15:10–15:30** — the FORMING names that still hold the full footprint flip to 🌙 **BTST-CARRY** (top green box). **These are your overnight picks.** Enter LONG near the close.
 3. **Overnight → next 09:15–09:30** — exit into morning strength.
 
-**Where is BTST-CARRY?** BUY tab → the top **🌙 BTST-CARRY** box. Empty until ~15:10 or
-when the market's closed. A name only carries overnight if it's flagged there — never
-just because you bought it intraday earlier.
+**BTST-CARRY** = the full LEAK-FREE footprint holding into the close: price legs (clr/up/
+vol/RS) AND trailing delivery ≥60 (`delivTr`, sustained accumulation, known live). FORMING
+= price legs there but the delivery leg isn't — so it does NOT carry. A name only carries
+overnight if flagged 🌙 BTST-CARRY — never just because you bought it intraday earlier.
 
 **Columns:** hover any header. `btst` x/4 = live footprint legs met. `Entry/Stop/T1/T2`
 = ATR risk geometry (trade management), **not** a price forecast. `action=EARNINGS` =
@@ -217,8 +219,8 @@ if tf == "Intraday":
                   f"{scounts.get('SHORT', 0) + scounts.get('WEAK', 0)}")
 
         buy_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vol×",
-                    "RS%", "btst", "exp_ON", "band_lo", "band_hi", "entry", "stop",
-                    "t1", "t2", "risk%", "atr%", "action"]
+                    "RS%", "delivTr", "btst", "exp_ON", "band_lo", "band_hi", "entry",
+                    "stop", "t1", "t2", "risk%", "atr%", "action"]
         sell_cols = ["symbol", "sector", "ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
@@ -341,19 +343,19 @@ c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 c1.title("Equity BTST Board")
 with st.expander("❓ What is this tab — the validated overnight edge"):
     st.markdown(
-        "**This is the confirmed BTST engine** (runs off the last close, after NSE "
-        "publishes delivery%). It ranks the accumulation footprint — strong close + high "
-        "delivery% + delivery-spike + volume surge + up-day + close>VWAP + persistent "
-        "RS-leader — regime-gated (Nifty>50MA), sector-capped, earnings-guarded, liquid "
-        "names only.\n\n**Edge:** ~+16–19bps net/night, long-only, 8yr-validated. **Plan:** "
-        "LONG near the close (15:15–15:30), exit next 09:15–09:30. Paper-first — nothing "
-        "auto-executes.\n\n**Intraday tab** = the live version of this (watch footprints "
-        "form → 🌙 BTST-CARRY at ~15:10). **This tab** = the delivery-confirmed truth after "
-        "the bell.")
+        "**LEAK-FREE accumulation footprint**, every leg knowable at the 15:15 close: "
+        "strong close + **trailing** delivery% (3-day avg through *yesterday* — NSE publishes "
+        "today's only at ~6pm, so the signal uses the prior days) + volume surge + up-day + "
+        "close>VWAP + persistent RS-leader. Regime-gated (Nifty>50MA), sector-capped, "
+        "earnings-guarded, liquid names only.\n\n**Edge (leak-free, 8yr):** ~+20bps net/night "
+        "gross of a soft 2025 (−3bps that year); long-only. **`delivTd`** (today's delivery) "
+        "is a POST-HOC quality check, NOT a signal input.\n\n**Plan:** LONG near the close, "
+        "exit next 09:15–09:30. Paper-first.\n\n**Intraday tab** = the live version (watch "
+        "footprints form → 🌙 BTST-CARRY at ~15:10).")
 c2.metric("Regime", "RISK-ON" if risk_on else "RISK-OFF",
           "Nifty > 50MA" if risk_on else "Nifty < 50MA")
 c3.metric("Footprint hits", b["n_footprint"])
-c4.metric("Deployable edge", "≈ +16–19 bps", "net/night, liquid, long-only")
+c4.metric("Deployable edge", "≈ +20 bps", "leak-free net/night, long-only")
 
 st.caption(f"As of close **{pd.Timestamp(date).date()}** • BTST long-only • "
            "act ~15:15–15:30, exit next-morning strength • paper-first, nothing auto-executes.")
@@ -388,7 +390,7 @@ else:
     show[">vwap%"] = (100 * show["close_vs_vwap"]).round(2)
     show["RS10%"] = (100 * show["rs_idx_cum"]).round(1)
     show["wt%"] = (100 * show["weight"]).round(0)
-    show = show.rename(columns={"deliv_per": "deliv%", "deliv_spike": "spike",
+    show = show.rename(columns={"deliv_trail": "delivTr", "deliv_per": "delivTd",
                                 "vol_ratio": "vol×", "close_price": "entry≈"})
     show["band (68%)"] = show.apply(
         lambda r: f"{r['band_lo']:.1f} – {r['band_hi']:.1f}"
@@ -397,9 +399,17 @@ else:
         lambda r: f"{r['range_lo']:.1f} – {r['range_hi']:.1f}"
         if pd.notna(r.get("range_lo")) else "—", axis=1)
     cols = ["action", "symbol", "sector", "entry≈", "band (68%)", "range (74%)",
-            "exp_move%", "clr", "deliv%", "spike", "vol×", "day%", ">vwap%", "RS10%", "wt%"]
+            "exp_move%", "clr", "delivTr", "delivTd", "vol×", "day%", ">vwap%", "RS10%", "wt%"]
     st.dataframe(show[cols].round(2), use_container_width=True, hide_index=True,
                  column_config={
+                     "delivTr": st.column_config.NumberColumn(
+                         "delivTr", help="TRAILING delivery% (3-day avg through yesterday) — "
+                         "the LEAK-FREE signal leg, known at the 15:15 close. ≥60 = sustained "
+                         "accumulation.", format="%.1f"),
+                     "delivTd": st.column_config.NumberColumn(
+                         "delivTd", help="TODAY's delivery% — POST-HOC confirmation only (NSE "
+                         "publishes it ~6pm, AFTER entry). A quality check on what you bought, "
+                         "NOT a signal input.", format="%.1f"),
                      "band (68%)": st.column_config.TextColumn(
                          "band (68%)", help="Calibrated ~68% expected NEXT-DAY CLOSE range "
                          "(close ± 0.6×ATR). Where price is LIKELY to be — not a target. "

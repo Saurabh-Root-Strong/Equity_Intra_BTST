@@ -37,7 +37,10 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     deliv_med = g["deliv_per"].transform(
         lambda s: s.shift(1).rolling(config.LOOKBACK).median())
-    df["deliv_spike"] = df["deliv_per"] - deliv_med                 # abnormal accumulation
+    df["deliv_spike"] = df["deliv_per"] - deliv_med                 # today's spike (post-hoc)
+    # TRAILING delivery (through t-1) — the LEAK-FREE accumulation leg, known at 15:15
+    df["deliv_trail"] = g["deliv_per"].transform(
+        lambda s: s.shift(1).rolling(config.DELIV_TRAIL_WIN).mean())
 
     pc = g["close_price"].shift(1)                                  # daily ATR14 for the band
     tr = pd.concat([df["high_price"] - df["low_price"],
@@ -81,8 +84,7 @@ def signal_mask(df: pd.DataFrame, require_liquidity: bool = True) -> pd.Series:
     """
     m = (
         (df["clr"] >= config.CLR_TH)
-        & (df["deliv_per"] >= config.DELIV_TH)
-        & (df["deliv_spike"] >= config.DELIV_SPIKE)
+        & (df["deliv_trail"] >= config.DELIV_TRAIL_TH)     # LEAK-FREE: trailing delivery (t-1)
         & (df["vol_ratio"] >= config.VOL_TH)
         & (df["ret"] >= config.RET_TH)
         & (df["close_vs_vwap"] >= config.CVWAP_TH)
@@ -99,8 +101,7 @@ def conviction_score(df: pd.DataFrame) -> pd.Series:
     so it is scale-free across the universe; computed per trade_date by the caller
     when a single night is passed, or globally for backtest ranking."""
     r = df["clr"].rank(pct=True)
-    r = r + df["deliv_per"].rank(pct=True)
-    r = r + df["deliv_spike"].clip(lower=0).rank(pct=True)
+    r = r + df["deliv_trail"].rank(pct=True)         # leak-free trailing delivery
     r = r + df["vol_ratio"].clip(upper=6).rank(pct=True)
     r = r + df["ret"].clip(lower=0).rank(pct=True)
     if "rs_idx_cum" in df.columns:              # prefer the strongest persistent leaders

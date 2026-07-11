@@ -29,11 +29,18 @@ FYERS_QUOTES_URL = "https://api-t1.fyers.in/data/quotes"
 NIFTY_FYERS = "NSE:NIFTY50-INDEX"      # live index for the regime / relative strength
 
 # --- LOCKED conviction signal (the accumulation footprint) --------------------
-CLR_TH      = 0.70    # close in top 30% of day range  -> strong close
-DELIV_TH    = 60.0    # delivery % of traded volume     -> real ownership taken
-DELIV_SPIKE = 10.0    # delivery% minus own 20d median   -> ABNORMAL accumulation
-VOL_TH      = 2.0     # volume vs own 20d median          -> participation surge
-RET_TH      = 0.01    # up at least +1% on the day        -> demand in control
+# LEAK-FREE by construction: every leg is knowable at the 15:15 close. Today's OHLC/
+# volume are known at the close; delivery% is NOT (NSE publishes it ~6pm), so the
+# delivery leg uses the TRAILING average through t-1 — real accumulation persists
+# across days, and trailing delivery nets the same edge without the look-ahead.
+CLR_TH        = 0.70   # close in top 30% of day range   -> strong close
+DELIV_TRAIL_TH = 60.0  # trailing N-day AVG delivery% (through t-1) -> sustained accumulation
+DELIV_TRAIL_WIN = 3    # trailing window for the delivery average (days, all published by t-1)
+VOL_TH        = 2.0    # volume vs own 20d median          -> participation surge
+RET_TH        = 0.01   # up at least +1% on the day        -> demand in control
+# today's delivery% (DELIV_TH) is a POST-HOC confirmation only — it lands ~6pm, after
+# entry — so it is shown as a quality check in the EOD tab, never a signal input.
+DELIV_TH    = 60.0     # today's delivery% threshold, for the post-hoc confirmation badge
 CVWAP_TH    = 0.005   # close >=0.5% above session VWAP (avg_price) -> PATH-persistent
 RS_LOOKBACK = 10      # window for cumulative relative strength (trading days)
 RS_MIN      = 0.0     # require 10d cumulative RS vs Nifty > 0 -> PERSISTENT leader
