@@ -100,6 +100,99 @@ def test_sector_cap():
     assert abs(book["weight"].sum() - 1.0) < 1e-6
 
 
+def test_size_multiplier_scales_book():
+    """The self-calibrated multiplier governs GROSS exposure: weights sum to it,
+    0 = stand aside (empty book), never levers above 1.0. Closes the improving loop."""
+    from eqbtst import portfolio, data
+    orig = data.load_sectors
+    data.load_sectors = lambda: {"A": "IT", "B": "Pharma", "C": "Auto"}
+    try:
+        cand = pd.DataFrame({"symbol": ["A", "B", "C"], "score": [3, 2, 1]})
+        full = portfolio.select(cand, size_mult=1.0)
+        half = portfolio.select(cand, size_mult=0.5)
+        aside = portfolio.select(cand, size_mult=0.0)
+        over = portfolio.select(cand, size_mult=1.8)
+    finally:
+        data.load_sectors = orig
+    assert abs(full["weight"].sum() - 1.0) < 1e-3           # ~equal-weight (4dp rounding)
+    assert abs(half["weight"].sum() - 0.5) < 1e-3           # gross scales with the multiplier
+    assert aside.empty and aside.attrs["gross_exposure"] == 0.0   # 0 -> stand aside
+    assert abs(over["weight"].sum() - 1.0) < 1e-3           # never levers above full backtest
+
+
+def test_volume_pace_is_time_normalised():
+    """The raw cum-volume/median-daily ratio is TIME-BIASED (only ~4% of a day's volume
+    has traded by 09:15), so a genuine 2x day could never clear the 2.0 gate before the
+    close. volume_pace divides by the elapsed-volume fraction so 2.0 means the same at
+    any hour — AND at/after 15:25 it must EQUAL the raw ratio, or the 8yr backtest (which
+    used the full-day ratio) would be invalidated."""
+    from eqbtst import indicators as I
+
+    # profile is monotonic and terminal at 1.0
+    assert I.day_fraction("09:15") < I.day_fraction("11:00") < I.day_fraction("14:00") < 1.0
+    assert I.day_fraction("15:25") == 1.0 and I.day_fraction("15:30") == 1.0
+
+    med = 1000.0                                  # 20d median DAILY volume
+    for t, frac in [("09:30", I.day_fraction("09:30")), ("12:00", I.day_fraction("12:00"))]:
+        cum = 2.0 * frac * med                    # a name exactly ON PACE for a 2x day
+        c = pd.DataFrame({"open": [10], "high": [11], "low": [9], "close": [10],
+                          "volume": [cum], "ts": [pd.Timestamp(f"2026-01-01 {t}")]})
+        assert I.volume_surge(c, med) < 2.0                       # raw would FAIL the gate
+        assert abs(I.volume_pace(c, med, t) - 2.0) < 1e-6         # pace reads 2.0 ✓
+
+    # CLOSE-DECISION INTEGRITY: at 15:25 pace == raw (backtest untouched)
+    c = pd.DataFrame({"open": [10], "high": [11], "low": [9], "close": [10],
+                      "volume": [2500.0], "ts": [pd.Timestamp("2026-01-01 15:25")]})
+    assert I.volume_pace(c, med, "15:25") == I.volume_surge(c, med) == 2.5
+
+
+def test_vol_pace_clock_is_explicit_not_bar_ts():
+    """REGRESSION GUARD. 'now' for the volume-pace normalisation must be the real clock,
+    NEVER inferred from the last bar's timestamp — a bar's ts is its OPEN, so a 4h frame
+    at a 15:15 cut would report 13:15 and inflate the pace ~1.5x (a fabricated volume
+    surge, and a FALSE BTST-CARRY). Pace must be identical across timeframes at the same
+    clock time."""
+    from eqbtst import indicators as I
+
+    coarse = pd.DataFrame({                      # a 4h frame: last bar OPENS 13:15
+        "open": [100, 101], "high": [102, 103], "low": [99, 100], "close": [101, 102],
+        "volume": [500, 500],
+        "ts": [pd.Timestamp("2026-01-01 09:15"), pd.Timestamp("2026-01-01 13:15")]})
+    fine = pd.DataFrame({                        # a 15m frame at the same 15:15 cut
+        "open": [100, 101], "high": [102, 103], "low": [99, 100], "close": [101, 102],
+        "volume": [500, 500],
+        "ts": [pd.Timestamp("2026-01-01 15:00"), pd.Timestamp("2026-01-01 15:15")]})
+
+    a = I.live_state(coarse, 100, ref_avg_day_vol=1000, now_hhmm="15:15")["vol_pace"]
+    b = I.live_state(fine, 100, ref_avg_day_vol=1000, now_hhmm="15:15")["vol_pace"]
+    assert a == b                                    # tf-invariant at the same clock
+    assert abs(a - 1.0 / I.day_fraction("15:15")) < 0.01     # divides by the CUT's fraction
+    # and the buggy behaviour (dividing by the 13:15 bar-open) must NOT recur
+    assert a < 1.5 * (1.0 / I.day_fraction("15:15"))
+
+
+def test_archive_staleness_guard():
+    """If the nightly EOD sync is stale, the archive's ref_close is the WRONG session's
+    close — and prev_close / vol_med20 / ATR / deliv_trail are all wrong with it, silently
+    corrupting every signal. Cross-checking against the broker's live prev_close catches
+    this with no trading calendar (holiday-proof). A handful of corporate actions must NOT
+    trip it; a bulk disagreement must."""
+    from eqbtst import live
+    ref = pd.DataFrame({"ref_close": [100.0] * 30}, index=[f"S{i}" for i in range(30)])
+
+    fresh = {f"NSE:S{i}-EQ": {"prev_close_price": 100.0} for i in range(30)}
+    assert live.archive_health(ref, fresh)["stale"] is False
+
+    stale = {f"NSE:S{i}-EQ": {"prev_close_price": 103.0} for i in range(30)}
+    assert live.archive_health(ref, stale)["stale"] is True          # whole board disagrees
+
+    corp = {f"NSE:S{i}-EQ": {"prev_close_price": (50.0 if i >= 28 else 100.0)}
+            for i in range(30)}                                       # 2 splits/bonuses
+    assert live.archive_health(ref, corp)["stale"] is False          # must not false-trip
+
+    assert live.archive_health(ref, {})["stale"] is False            # no quotes -> no claim
+
+
 def test_long_only_locked():
     assert config.LONG_ONLY is True                  # short side proven dead (win 20%)
 
@@ -168,3 +261,38 @@ def test_locked_thresholds():
     assert (config.RS_LOOKBACK, config.RS_MIN) == (10, 0.0)   # persistent-RS refiner
     assert config.LIQ_MIN_LACS == 2000.0                       # realism/liquidity floor
     assert config.MAX_HOLD == "overnight"     # never day-2
+
+
+def test_calibrate_shrinks_and_only_cuts():
+    """Self-calibration learns the KNOB: posterior shrinks toward the backtest prior,
+    the size multiplier only CUTS below 1.0, a confidently-negative record -> 0, and
+    a noisy sub-window never falsely zeroes a healthy edge."""
+    import numpy as np
+    import pandas as pd
+    from eqbtst import calibrate, ledger
+
+    mu0, tau = 20.0, 20.0
+    # posterior is a proper convex blend of prior and data mean
+    post, sd = calibrate._posterior(mu0, tau, m=40.0, s=115.0, n=50)
+    assert mu0 < post < 40.0                     # strictly between prior and data
+    assert sd < tau                              # evidence tightened the estimate
+    assert calibrate._posterior(mu0, tau, 999.0, 115.0, 0)[0] == mu0   # n=0 -> prior unchanged
+
+    def _mult(df):
+        st = {"open": df.iloc[:0], "closed": df, "summary": {}}
+        orig = ledger.state
+        ledger.state = lambda path=None, _s=st: _s
+        try:
+            return calibrate.calibrate(persist=False)
+        finally:
+            ledger.state = orig
+
+    def _synth(n, mean, seed):
+        p = np.random.default_rng(seed).normal(mean, 115.0, n)
+        return pd.DataFrame({"date": pd.date_range("2026-01-01", periods=n, freq="D"),
+                             "symbol": "X", "entry_px": 100.0, "exit_px": 100.0,
+                             "net_bps": p, "status": "CLOSED"})
+
+    assert _mult(_synth(80, -30.0, 1))["size_multiplier"] == 0.0     # clearly negative -> stand aside
+    assert _mult(_synth(300, 26.0, 2))["size_multiplier"] > 0.0      # healthy large sample not falsely killed
+    assert _mult(_synth(3, 20.0, 3))["size_multiplier"] == calibrate._SIZE_FLOOR   # tiny n -> floor

@@ -8,3 +8,7 @@ data/validation/*.parquet
 
 data/events/*.csv
 data/replay/*.parquet
+
+# generated runtime state (self-calibration + live first-seen tracking)
+data/validation/*.json
+data/live_state/

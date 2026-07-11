@@ -23,6 +23,7 @@ import datetime as dt
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -117,6 +118,63 @@ def _fetch_quotes(fy_syms: list[str]) -> dict:
     return out
 
 
+_LIVE_STATE = Path(__file__).resolve().parent.parent / "data" / "live_state"
+
+
+def mark_first_seen(day, symbols) -> dict:
+    """First-seen tracker for the LIVE snapshot (which has no intraday bars to compute a
+    causal 'entered'). Stamps the wall-clock HH:MM each symbol FIRST appeared in a
+    tradeable tab, persisted per trading day so it survives dashboard reloads. Reads
+    'when OUR scanner first saw it qualify' — accurate for a board running from the open,
+    later if you start the dashboard mid-session. Returns {symbol: 'HH:MM'}."""
+    import json
+    f = _LIVE_STATE / f"seen_{pd.Timestamp(day).date()}.json"
+    seen = {}
+    if f.exists():
+        try:
+            seen = json.loads(f.read_text())
+        except Exception:
+            seen = {}
+    now = dt.datetime.now().strftime("%H:%M")
+    changed = False
+    for s in symbols:
+        if s not in seen:
+            seen[s] = now
+            changed = True
+    if changed:
+        _LIVE_STATE.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(seen))
+    return seen
+
+
+def archive_health(ref: pd.DataFrame, quotes: dict, tol: float = 0.005) -> dict:
+    """Is the EOD archive actually the LAST session? Cross-checks the archive's ref_close
+    against the BROKER's live prev_close — the same number by definition (both are the
+    previous session's close). If they disagree in bulk, the nightly DCM sync is STALE or
+    misaligned, which means ref_close / vol_med20 / atr14 / deliv_trail are ALL from the
+    wrong session and every signal below them is silently corrupted.
+
+    Holiday-proof by construction: no trading calendar needed — it tests the thing that
+    actually matters (does our baseline equal the broker's baseline?)."""
+    n = mism = 0
+    for fys, v in quotes.items():
+        sym = fys.replace("NSE:", "").replace("-EQ", "")
+        if sym not in ref.index:
+            continue
+        bpc = v.get("prev_close_price")
+        apc = ref.loc[sym, "ref_close"]
+        if not bpc or apc != apc or float(apc) <= 0:
+            continue
+        n += 1
+        if abs(float(bpc) / float(apc) - 1.0) > tol:
+            mism += 1
+    pct = (mism / n) if n else 0.0
+    return {"checked": n, "mismatch": mism, "pct": round(100 * pct, 1),
+            # a few names can differ (corporate actions); a BULK disagreement means the
+            # archive is a different session entirely.
+            "stale": bool(n >= 20 and pct > 0.20)}
+
+
 def quotes_board(date: pd.Timestamp | None = None) -> dict:
     """Live price-action scan of the liquid universe. Returns status + a DataFrame
     with a live action per name. No VWAP/RSI here (that is deep_state)."""
@@ -153,7 +211,15 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         rs = day_ret - idx_ret if idx_ret is not None else None
         vol = v.get("volume") or 0
         med = ref.loc[sym, "vol_med20"]
-        vsurge = (vol / float(med)) if (vol and med and med == med) else float("nan")
+        # TIME-NORMALISED volume PACE. The raw cum_vol/median_daily is mechanically tiny
+        # in the morning (~4% of the day has traded at 09:15), so a genuine 2x-volume day
+        # would read 0.27 at 09:30 and fail the 2.0 gate. Dividing by the elapsed volume
+        # fraction makes 2.0 mean "on pace for a 2x day" at ANY hour. At/after 15:25 the
+        # fraction is 1.0 -> identical to the raw ratio, so the validated close decision
+        # (and the 8yr backtest, which used the full-day ratio) is untouched.
+        _raw = (vol / float(med)) if (vol and med and med == med) else float("nan")
+        _frac = indicators.day_fraction()
+        vsurge = (_raw / _frac) if (_raw == _raw and _frac > 0) else float("nan")
         atr14 = float(ref.loc[sym, "atr14"]) if ref.loc[sym, "atr14"] == ref.loc[sym, "atr14"] else 0.0
         lv = indicators.levels(float(c), atr14, day_low=float(l))
         ready = btst_readiness(pa, day_ret, rs, vsurge)
@@ -185,8 +251,14 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         })
     board = pd.DataFrame(rows)
     if not board.empty:
+        # first-seen 'entered' — stamp the moment a name first shows in a tradeable tab
+        qual = board[board["action"].isin(["BTST-CARRY", "FORMING"])
+                     | board["sell"].isin(["SHORT", "WEAK"])]["symbol"].tolist()
+        seen = mark_first_seen(d0, qual)
+        board["entered"] = board["symbol"].map(seen)
         board = board.sort_values(["action", "clr"], ascending=[True, False])
-    return {"ok": True, "status": ts["describe"], "risk_on": risk_on,
+    health = archive_health(ref, q)          # is our EOD baseline the broker's baseline?
+    return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "archive": health,
             "idx_ret": idx_ret, "board": board, "n": len(board),
             "market_open": market_open()}
 
@@ -259,15 +331,19 @@ def _live_action(pa: dict, day_ret: float, rs, vsurge, risk_on: bool,
 
 
 # ── tier 2: per-symbol deep state (VWAP + RSI) ─────────────────────────────────
-_RES = {"1h": "60", "2h": "120", "15m": "15", "5m": "5"}
+_RES = {"4h": "240", "2h": "120", "1h": "60", "15m": "15", "5m": "5"}
+# lookback days per tf — coarse bars = fewer/day, need more days for ATR14/RSI14/structure(20).
+# 4h ≈ 1.5 bars/day → 30d ≈ 45 bars; 2h ≈ 3/day → fine at 15d; intraday minutes plenty at 10d.
+_LOOKBACK = {"4h": 30, "2h": 15}
 
 
-def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int = 10) -> pd.DataFrame:
-    """Candles for one symbol at timeframe tf ('1h','2h','15m','5m') via /history.
-    Pulls a few days so ATR14/RSI14 have enough bars on the hourly frames."""
+def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -> pd.DataFrame:
+    """Candles for one symbol at timeframe tf ('4h','2h','1h','15m','5m') via /history.
+    Pulls a few days so ATR14/RSI14 have enough bars on the coarse (hourly+) frames."""
     res = _RES.get(tf, "60")
+    lb = lookback_days if lookback_days is not None else _LOOKBACK.get(tf, 10)
     d_to = dt.date.today()
-    d_from = d_to - dt.timedelta(days=lookback_days)
+    d_from = d_to - dt.timedelta(days=lb)
     r = requests.get(config.FYERS_HISTORY_URL,
                      headers={"Authorization": _auth_header(), "version": "3"},
                      params={"symbol": fy_symbol(sym), "resolution": res,
@@ -279,6 +355,46 @@ def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int = 10) -> pd.Data
     df = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
     return df
+
+
+_TRIG_CACHE: dict = {}          # (symbol, date) -> ("HH:MM"|None, checked_5min_bucket)
+
+
+def _bucket5(now: dt.datetime | None = None) -> str:
+    """The current 5-minute bar bucket — no new intraday information can arrive within
+    one, so a miss need not be re-fetched until the bucket turns."""
+    n = now or dt.datetime.now()
+    return f"{n.hour:02d}:{(n.minute // 5) * 5:02d}"
+
+
+def _trigger_time(sym: str, ref_close: float, ref_avg_vol: float | None = None) -> str | None:
+    """WHEN the trade actually triggered — the wall-clock minute the footprint first
+    fired TODAY, at 5-MINUTE resolution, regardless of the timeframe the user picked.
+
+    This must NOT be derived from the selected tf's candles: a 4h bar only exists at
+    09:15 and 13:15, so a 4h frame could never report a 12:30 trigger. The timeframe
+    decides the structure/RSI/levels lens; the trigger is a clock event. Once a symbol
+    has fired today the answer is immutable, so it is cached (no repeat /history call)."""
+    today = dt.date.today()
+    key = (sym, today)
+    bucket = _bucket5()
+    hit = _TRIG_CACHE.get(key)
+    if hit is not None:
+        val, checked = hit
+        if val is not None:                 # already fired today -> immutable, never re-fetch
+            return val
+        if checked == bucket:               # a MISS is also cached, until the 5m bar turns —
+            return None                     # otherwise every refresh re-pulls 25 histories
+    try:
+        fine = fetch_intraday(sym, tf="5m", lookback_days=2)
+        if fine.empty:
+            return None
+        fine = fine[fine["ts"].dt.date == fine["ts"].dt.date.max()]     # today's 5m bars
+        t = _first_formed(fine, ref_close, ref_avg_vol)
+    except Exception:
+        return None
+    _TRIG_CACHE[key] = (t, bucket)
+    return t
 
 
 def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
@@ -309,13 +425,16 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         day = 100 * (float(c) / float(pc) - 1)
         clr = (float(c) - float(l)) / (float(h) - float(l))
         if day >= 100 * config.RET_TH and clr >= 0.5:
-            pre.append((sym, day, clr))
+            pre.append((sym, day, clr, float(pc)))     # carry the LIVE prev_close forward
     pre.sort(key=lambda x: (x[2], x[1]), reverse=True)
     pre = pre[:max_names]
 
     rows = []
-    for sym, day, _ in pre:
-        ds = deep_state(sym, tf=tf, ref_close=float(uni.loc[sym, "ref_close"]),
+    for sym, day, _, live_pc in pre:
+        # prev_close MUST be the broker's live prev_close (authoritative), not the EOD
+        # archive's ref_close: if the nightly archive sync is stale, ref_close is the
+        # WRONG session's close and every day%/trigger below it is silently corrupted.
+        ds = deep_state(sym, tf=tf, ref_close=live_pc,
                         ref_avg_vol=None, idx_ret=idx_ret)
         if not ds:
             continue
@@ -323,19 +442,32 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         atr_tf = ds.get("atr_tf", 0.0)
         ltp = s["ltp"]
         cndl = ds.get("candles")
-        _tfmin = {"2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(tf, 60)
+        _tfmin = {"4h": 240, "2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(tf, 60)
+        bar_time = None
         if cndl is not None and len(cndl):
             o = cndl["ts"].iloc[-1]
             close_t = min(o + pd.Timedelta(minutes=_tfmin), o.normalize() + pd.Timedelta("15h30min"))
             bar_time = f"{o.strftime('%H:%M')}-{close_t.strftime('%H:%M')}"   # candle span (open->close)
-        else:
-            bar_time = None
+        # TRIGGER TIME — the wall-clock minute the footprint first fired, at 5-MIN
+        # resolution, INDEPENDENT of the selected timeframe. Must not come from the tf
+        # bars: a 4h bar only exists at 09:15/13:15, so it could never report a 12:30
+        # trigger. The timeframe governs the structure/RSI/levels read, NOT the clock.
+        entered = _trigger_time(sym, live_pc, uni.loc[sym, "vol_med20"])
+        # is the current tf bar still FORMING? (a mid-candle trigger can repaint)
+        forming = None
+        if cndl is not None and len(cndl):
+            _o = cndl["ts"].iloc[-1]
+            _close_t = min(_o + pd.Timedelta(minutes=_tfmin),
+                           _o.normalize() + pd.Timedelta("15h30min"))
+            forming = dt.datetime.now() < _close_t.to_pydatetime()
         # short-side levels on this timeframe (stop ABOVE, targets BELOW)
         s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
         s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
         s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
         rows.append({
-            "symbol": sym, "time": bar_time, "sector": uni.loc[sym, "sector"], "ltp": ltp,
+            "symbol": sym, "entered": entered, "time": bar_time,
+            "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
+            "sector": uni.loc[sym, "sector"], "ltp": ltp,
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
@@ -388,16 +520,107 @@ def _fetch_day_candles(date, resolution: str = "15") -> pd.DataFrame:
     return out
 
 
-def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
+def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
+    """Multi-day tf candles ENDING at `date` (long format symbol,ts,ohlcv), for the
+    coarse-tf structure/RSI read in replay — a single day has too few 2h/4h bars.
+    Cached per (date, tf). Heavy first call (~250 /history requests), like the day fetch."""
+    d = pd.Timestamp(date).date()
+    res = _RES.get(tf, "60")
+    cache = _REPLAY_CACHE / f"{d}_tfhist_{tf}.parquet"
+    if cache.exists():
+        return pd.read_parquet(cache)
+    d_from = (d - dt.timedelta(days=lookback_days)).isoformat()
+    uni = liquid_universe(date)
+    frames = []
+    for sym in uni["symbol"]:
+        try:
+            r = requests.get(config.FYERS_HISTORY_URL,
+                             headers={"Authorization": _auth_header(), "version": "3"},
+                             params={"symbol": fy_symbol(sym), "resolution": res,
+                                     "date_format": "1", "range_from": d_from,
+                                     "range_to": d.isoformat(), "cont_flag": "1"}, timeout=15)
+            j = r.json()
+            if j.get("s") != "ok" or not j.get("candles"):
+                continue
+            f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
+            f["ts"] = pd.to_datetime(f["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            f["symbol"] = sym
+            frames.append(f)
+        except Exception:
+            continue
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not out.empty:
+        _REPLAY_CACHE.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(cache, index=False)
+    return out
+
+
+_REPLAY_TF = {"15m": None, "1h": "60min", "2h": "120min", "4h": "240min"}
+
+
+def _resample_ohlcv(df: pd.DataFrame, freq: str | None) -> pd.DataFrame:
+    """Resample one symbol's intraday OHLCV (ts sorted) to a coarser bar `freq`,
+    aligned to the 09:15 session open. None -> unchanged (native fine bars)."""
+    if not freq or df.empty:
+        return df
+    r = (df.set_index("ts").groupby(pd.Grouper(freq=freq, origin="start_day", offset="9h15min"))
+         .agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
+              close=("close", "last"), volume=("volume", "sum")).dropna().reset_index())
+    return r
+
+
+def _first_formed(gf: pd.DataFrame, prev_close: float,
+                  ref_avg_vol: float | None = None) -> str | None:
+    """The HH:MM the accumulation footprint FIRST formed, causally, from the fine
+    intraday bars (≤ cut). Legs, all live-computable and evaluated at EVERY bar:
+      up ≥ RET_TH on the day · running close-in-range ≥ CLR_TH · above running session
+      VWAP · volume ON PACE for ≥ VOL_TH× a normal day (time-normalised).
+
+    The volume leg needs `ref_avg_vol` (20d median daily volume). It matters: without
+    it, a name 'forms' at 09:20 on one 5-min bar of tape. With it, the name must ALSO be
+    genuinely participating — which is what the validated footprint means. Time-normalised
+    so 2.0 means 'on pace for a 2x day' at any hour, not '2x already traded' (impossible
+    before the close). None if it never formed by the cut."""
+    if gf is None or len(gf) == 0 or not prev_close:
+        return None
+    d = gf.sort_values("ts")
+    h, l, c = d["high"].to_numpy(float), d["low"].to_numpy(float), d["close"].to_numpy(float)
+    v = d["volume"].to_numpy(float)
+    tp = (h + l + c) / 3.0
+    cv = np.cumsum(v)
+    vwap = np.where(cv > 0, np.cumsum(tp * v) / np.where(cv > 0, cv, 1), c)   # running session VWAP
+    run_hi = np.maximum.accumulate(h)
+    run_lo = np.minimum.accumulate(l)
+    rng = run_hi - run_lo
+    clr = np.where(rng > 0, (c - run_lo) / np.where(rng > 0, rng, 1), 0.5)     # running close-in-range
+    day_ret = c / prev_close - 1.0
+    formed = (day_ret >= config.RET_TH) & (clr >= config.CLR_TH) & (c >= vwap)
+    if ref_avg_vol and ref_avg_vol > 0:                 # volume-on-pace leg (time-normalised)
+        # cumulative volume through bar i covers up to that bar's CLOSE, so the elapsed-
+        # volume fraction must be read at the bar's close, not its open (ts). Using the
+        # open overstates pace on the first bars (~1.6x at 09:15) = false early triggers.
+        ts = d["ts"]
+        dur = (ts.iloc[1] - ts.iloc[0]) if len(ts) > 1 else pd.Timedelta(minutes=5)
+        frac = np.array([indicators.day_fraction((t + dur).strftime("%H:%M")) for t in ts])
+        pace = np.where(frac > 0, (cv / float(ref_avg_vol)) / np.where(frac > 0, frac, 1), 0.0)
+        formed = formed & (pace >= config.VOL_TH)
+    idx = np.argmax(formed) if formed.any() else -1
+    return d["ts"].iloc[idx].strftime("%H:%M") if idx >= 0 else None
+
+
+def replay_board(date, time_str: str = "13:00", tf: str = "15m",
+                 resolution: str = "15") -> dict:
     """Reconstruct the board AS OF `date` `time_str` (HH:MM), causally — only bars at
     or before that minute are used (no lookahead). This is the practice/backtest lens:
-    at 1pm you see FORMING; scrub to 15:15 to see which became BTST-CARRY."""
+    at 1pm you see FORMING; scrub to 15:15 to see which became BTST-CARRY. `tf` sets the
+    candle timeframe (15m native, or 1h/2h/4h resampled) that VWAP/RSI/structure read."""
     ts = token_status()
     d = pd.Timestamp(date)
     risk_on = regime.is_risk_on(d)
     if not ts["usable"]:
         return {"ok": False, "status": ts["describe"], "risk_on": risk_on, "board": pd.DataFrame()}
     cut = dt.datetime.strptime(time_str, "%H:%M").time()
+    freq = _REPLAY_TF.get(tf)                       # None for 15m (native fine bars)
     allc = _fetch_day_candles(date, resolution)
     if allc.empty:
         return {"ok": True, "status": ts["describe"], "risk_on": risk_on,
@@ -413,22 +636,44 @@ def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
     except Exception:
         pass
     earn = _events_upcoming(d.date())
+    # coarse tf: multi-day causal frame for a stable structure/RSI read (a single day
+    # has too few 2h/4h bars). Grouped by symbol for O(1) lookup in the loop.
+    cut_dt = dt.datetime.combine(d.date(), cut)
+    tfh = None
+    if freq is not None:
+        _h = _fetch_tf_history(date, tf)
+        if not _h.empty:
+            _h = _h[_h["ts"] <= cut_dt]                # causal: nothing after the cut minute
+            tfh = {s: gg for s, gg in _h.groupby("symbol")}
     rows = []
     for sym, g in allc[allc["ts"].dt.time <= cut].groupby("symbol"):
         if sym not in uni.index or len(g) < 1:
             continue
+        gf = g                                       # fine bars — for the causal "entered" time
+        g = _resample_ohlcv(g, freq)                 # coarsen to chosen tf (15m = native)
+        if g.empty:
+            continue
         pc = uni.loc[sym, "prev_close"]              # prior-day close = correct day% baseline
         pc = float(pc) if pc == pc else float(g["open"].iloc[0])
         st_ = indicators.live_state(g, pc, uni.loc[sym, "vol_med20"],
-                                    (idx_ret / 100.0) if idx_ret is not None else None)
+                                    (idx_ret / 100.0) if idx_ret is not None else None,
+                                    now_hhmm=time_str)   # CAUSAL clock = the replay cut
+        # coarse tf: recompute structure + RSI on the multi-day causal frame (single-day
+        # 2h/4h has too few bars). VWAP/clr/character stay session-based (from g).
+        if tfh is not None and sym in tfh and len(tfh[sym]) >= 5:
+            h = tfh[sym]
+            st_["structure"] = indicators.structure(h)
+            rst = indicators.rsi_state(h["close"].to_numpy(float))
+            st_["rsi7"], st_["rsi14"], st_["tone"] = rst["rsi7"], rst["rsi14"], rst["tone"]
         pa = {k: st_[k] for k in ("clr", "body", "upper_wick", "lower_wick", "character")}
         day_ret, rs = st_["day_ret"], st_.get("rs_vs_index")
-        vsurge = st_["vol_surge"]
+        vsurge = st_["vol_pace"]        # time-normalised (causal: 'now' = last bar ≤ cut)
         atr14 = float(uni.loc[sym, "atr14"]) if uni.loc[sym, "atr14"] == uni.loc[sym, "atr14"] else 0.0
         lv = indicators.levels(st_["ltp"], atr14, day_low=float(g["low"].min()))
         ready = btst_readiness(pa, day_ret, rs, vsurge)
         rows.append({
             "symbol": sym, "time": g["ts"].iloc[-1].strftime("%H:%M"),
+            "entered": _first_formed(gf, pc, uni.loc[sym, "vol_med20"]),   # causal form time
             "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
             "day%": day_ret, "structure": st_["structure"], "clr": pa["clr"],
             "character": pa["character"], "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"],
@@ -453,7 +698,7 @@ def replay_board(date, time_str: str = "13:00", resolution: str = "15") -> dict:
     if not board.empty:
         board = board.sort_values(["action", "btst"], ascending=[True, False])
     return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "idx_ret": idx_ret,
-            "board": board, "time": time_str, "date": str(d.date()), "n": len(board)}
+            "board": board, "time": time_str, "tf": tf, "date": str(d.date()), "n": len(board)}
 
 
 def fetch_intraday_range(sym: str, date, resolution: str = "15") -> pd.DataFrame:

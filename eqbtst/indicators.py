@@ -89,13 +89,54 @@ def price_action(o: float, h: float, l: float, c: float) -> dict:
 
 
 def volume_surge(candles: pd.DataFrame, ref_avg_day_vol: float | None = None) -> float:
-    """Ratio of cumulative session volume so far vs a reference average daily
-    volume (from the EOD archive). >1 = participating above normal. None ref ->
-    NaN (unknown until the EOD baseline is joined)."""
+    """RAW ratio of cumulative session volume so far vs a reference average daily
+    volume (from the EOD archive). NOTE: this is TIME-BIASED intraday — at 10am only
+    ~22% of a day's volume has traded, so a genuine 2x-volume day reads ~0.44 here.
+    Correct at the CLOSE (what the 8yr backtest used); use volume_pace() intraday."""
     vol = float(candles["volume"].sum())
     if not ref_avg_day_vol or ref_avg_day_vol <= 0:
         return float("nan")
     return vol / ref_avg_day_vol
+
+
+def day_fraction(now_hhmm: str | None = None) -> float:
+    """Median fraction of a day's volume completed by `now` (config.VOL_PROFILE).
+    Before the open -> the first bucket; after 15:25 -> 1.0. Interpolates by taking
+    the latest bucket at or before `now`."""
+    from . import config
+    import datetime as _dt
+    prof = config.VOL_PROFILE
+    if now_hhmm is None:
+        now_hhmm = _dt.datetime.now().strftime("%H:%M")
+    keys = sorted(prof)
+    if now_hhmm < keys[0]:
+        return prof[keys[0]]
+    if now_hhmm >= keys[-1]:
+        return 1.0
+    lo = keys[0]
+    for k in keys:                      # latest bucket at or before now
+        if k <= now_hhmm:
+            lo = k
+        else:
+            break
+    return prof[lo]
+
+
+def volume_pace(candles: pd.DataFrame, ref_avg_day_vol: float | None = None,
+                now_hhmm: str | None = None) -> float:
+    """TIME-NORMALISED volume surge — 'is this name ON PACE for an N× volume day?'
+
+    raw = cum_session_vol / median_daily_vol is mechanically small in the morning
+    (only ~4% of the day has traded at 09:15), so the same 2.0 gate means a 2x day at
+    the close but a ~7x-pace outlier at 10am. Dividing by the elapsed volume fraction
+    makes the number mean the SAME THING at any hour: a true 2x-volume day reads 2.0
+    all day. At/after 15:25 the fraction is 1.0, so this EQUALS the raw ratio — the
+    validated close decision (and the 8yr backtest) is mathematically untouched."""
+    raw = volume_surge(candles, ref_avg_day_vol)
+    if raw != raw:                                   # NaN -> unknown, stays unknown
+        return float("nan")
+    frac = day_fraction(now_hhmm)
+    return raw / frac if frac > 0 else float("nan")
 
 
 def atr(candles: pd.DataFrame, period: int = 14) -> float:
@@ -188,9 +229,16 @@ def band(price: float, atr_val: float) -> dict:
 
 def live_state(candles: pd.DataFrame, prev_close: float,
                ref_avg_day_vol: float | None = None,
-               index_ret: float | None = None) -> dict:
+               index_ret: float | None = None,
+               now_hhmm: str | None = None) -> dict:
     """Full live indicator + price-action state for one stock from its intraday
-    candles. index_ret (Nifty % today) -> live relative strength."""
+    candles. index_ret (Nifty % today) -> live relative strength.
+
+    `now_hhmm` is the CLOCK time the state is computed at — it drives the volume-pace
+    normalisation. It MUST be passed explicitly and must NOT be inferred from the last
+    bar's timestamp: a bar's ts is its OPEN, so a 4h frame at a 15:15 cut would report
+    13:15 and inflate the pace by ~1.5x (a false volume surge). Replay passes its cut;
+    live defaults to the wall clock."""
     o = float(candles["open"].iloc[0])
     h = float(candles["high"].max())
     l = float(candles["low"].min())
@@ -199,11 +247,17 @@ def live_state(candles: pd.DataFrame, prev_close: float,
     pa = price_action(o, h, l, c)
     rs = rsi_state(candles["close"].to_numpy(float))
     day_ret = c / prev_close - 1 if prev_close else 0.0
+    # 'now' for the volume-pace normalisation. Explicit only — NEVER the last bar's ts
+    # (that is the bar's OPEN; on a 4h frame it lags the real clock by hours).
+    if now_hhmm is None:
+        import datetime as _dt
+        now_hhmm = _dt.datetime.now().strftime("%H:%M")
     st = {
         "ltp": round(c, 2), "day_ret": round(100 * day_ret, 2),
         "vwap": round(vw, 2), "vs_vwap": round(100 * (c / vw - 1), 2),
         "above_vwap": c >= vw, "structure": structure(candles),
-        "vol_surge": round(volume_surge(candles, ref_avg_day_vol), 2),
+        "vol_surge": round(volume_surge(candles, ref_avg_day_vol), 2),      # raw (time-biased)
+        "vol_pace": round(volume_pace(candles, ref_avg_day_vol, now_hhmm), 2),  # time-normalised
         **pa, **rs,
     }
     if index_ret is not None:

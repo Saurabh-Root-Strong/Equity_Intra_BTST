@@ -6,6 +6,7 @@ cli.py — command entrypoint.
     python -m eqbtst.cli emit                   screen + paper-log the longs
     python -m eqbtst.cli reconcile              fill yesterday's exits (next-open)
     python -m eqbtst.cli scorecard              paper P&L + edge-health
+    python -m eqbtst.cli calibrate              self-calibrate net-edge/cost/size (learns knob)
     python -m eqbtst.cli backtest               walk-forward validation (gated, net)
     python -m eqbtst.cli backtest --ungated     show why the gate is mandatory
 """
@@ -19,7 +20,7 @@ import pandas as pd
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from . import backtest, ledger, screen
+from . import backtest, calibrate, ledger, screen
 
 
 def main(argv=None):
@@ -30,6 +31,7 @@ def main(argv=None):
     e = sub.add_parser("emit"); e.add_argument("--date", default=None)
     sub.add_parser("reconcile")
     sub.add_parser("scorecard")
+    sub.add_parser("calibrate")
     b = sub.add_parser("backtest")
     b.add_argument("--ungated", action="store_true"); b.add_argument("--top", type=int, default=None)
     b.add_argument("--start", default="2018-01-01")
@@ -44,6 +46,8 @@ def main(argv=None):
         ledger.reconcile()
     elif a.cmd == "scorecard":
         ledger.scorecard()
+    elif a.cmd == "calibrate":
+        print(calibrate.format_calibration(calibrate.calibrate()))
     elif a.cmd == "backtest":
         gated = not a.ungated
         tbl = backtest.run(start=a.start, gated=gated, top_n=a.top)

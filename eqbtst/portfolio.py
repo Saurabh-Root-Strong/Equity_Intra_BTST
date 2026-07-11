@@ -15,12 +15,21 @@ import pandas as pd
 from . import config, data
 
 
-def select(cand: pd.DataFrame) -> pd.DataFrame:
+def select(cand: pd.DataFrame, size_mult: float = 1.0) -> pd.DataFrame:
     """Rank-respecting greedy selection with a per-sector cap, then top-N, then
     equal weights. `cand` must be sorted best-first (highest score) and carry a
-    `symbol` column. Returns the book with `sector` and `weight` columns added."""
-    if cand.empty:
-        return cand.assign(sector=[], weight=[])
+    `symbol` column. Returns the book with `sector` and `weight` columns added.
+
+    `size_mult` (from the self-calibrator, [0..1]) scales GROSS exposure: weights sum
+    to `size_mult`, the rest is cash. This is where the self-improving loop lands — a
+    decayed/underperforming edge throttles size, and 0 = STAND ASIDE (empty book). The
+    signal is unchanged; only how much of it we deploy. Default 1.0 = full backtest size."""
+    if cand.empty or size_mult <= 0:                 # no candidates, or calibrator says stand aside
+        out = cand.iloc[0:0].copy()
+        out["sector"] = pd.Series(dtype=object)
+        out["weight"] = pd.Series(dtype=float)
+        out.attrs["gross_exposure"] = 0.0
+        return out
     sectors = data.load_sectors()
     cand = cand.copy()
     cand["sector"] = cand["symbol"].map(lambda s: sectors.get(s, f"_{s}"))
@@ -36,5 +45,7 @@ def select(cand: pd.DataFrame) -> pd.DataFrame:
         picked.append(r.Index)
 
     book = cand.loc[picked].copy()
-    book["weight"] = round(1.0 / len(book), 4) if len(book) else 0.0   # equal-weight
+    gross = min(float(size_mult), 1.0)               # never lever above full backtest size
+    book["weight"] = round(gross / len(book), 4) if len(book) else 0.0   # equal-weight × gross
+    book.attrs["gross_exposure"] = round(gross, 2)
     return book

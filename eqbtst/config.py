@@ -103,3 +103,33 @@ FNO_INSTRUMENTS = ("FUTSTK", "OPTSTK")
 # --- paper ledger (Phase 1 is PAPER ONLY — nothing auto-executes) -------------
 LEDGER = Path(__file__).resolve().parent.parent / "data" / "validation" / "paper_ledger.parquet"
 SIM_LEDGER = Path(__file__).resolve().parent.parent / "data" / "validation" / "sim_ledger.parquet"
+
+
+# --- intraday volume PACE profile (time-of-day normalisation) ---------------
+# Median cumulative %% of a day's volume completed by each 5-min mark (120 F&O stocks x 2yr).
+# Used to TIME-NORMALIZE the intraday volume surge: cum_vol/med_daily is meaningless at
+# 10am (only ~22%% of the day has traded), so a genuine 2x-volume day would read 0.44 and
+# fail the 2.0 gate. Dividing by this fraction gives PACE: a true 2x day reads 2.0 at any
+# hour. At 15:25 the fraction is 1.0, so the CLOSE decision is mathematically unchanged
+# (the 8yr backtest used the full-day ratio -- that integrity is preserved).
+VOL_PROFILE = {
+    "09:15": 0.0424, "09:20": 0.0674, "09:25": 0.0874, "09:30": 0.1073,
+    "09:35": 0.1232, "09:40": 0.1383, "09:45": 0.1546, "09:50": 0.1695,
+    "09:55": 0.1827, "10:00": 0.1960, "10:05": 0.2104, "10:10": 0.2216,
+    "10:15": 0.2340, "10:20": 0.2464, "10:25": 0.2586, "10:30": 0.2696,
+    "10:35": 0.2813, "10:40": 0.2935, "10:45": 0.3047, "10:50": 0.3175,
+    "10:55": 0.3289, "11:00": 0.3413, "11:05": 0.3519, "11:10": 0.3609,
+    "11:15": 0.3707, "11:20": 0.3812, "11:25": 0.3899, "11:30": 0.4004,
+    "11:35": 0.4121, "11:40": 0.4228, "11:45": 0.4328, "11:50": 0.4428,
+    "11:55": 0.4521, "12:00": 0.4648, "12:05": 0.4739, "12:10": 0.4842,
+    "12:15": 0.4954, "12:20": 0.5052, "12:25": 0.5165, "12:30": 0.5269,
+    "12:35": 0.5365, "12:40": 0.5454, "12:45": 0.5553, "12:50": 0.5642,
+    "12:55": 0.5740, "13:00": 0.5853, "13:05": 0.5948, "13:10": 0.6050,
+    "13:15": 0.6134, "13:20": 0.6230, "13:25": 0.6335, "13:30": 0.6413,
+    "13:35": 0.6512, "13:40": 0.6604, "13:45": 0.6715, "13:50": 0.6812,
+    "13:55": 0.6911, "14:00": 0.7022, "14:05": 0.7110, "14:10": 0.7234,
+    "14:15": 0.7340, "14:20": 0.7450, "14:25": 0.7563, "14:30": 0.7684,
+    "14:35": 0.7815, "14:40": 0.7944, "14:45": 0.8083, "14:50": 0.8215,
+    "14:55": 0.8367, "15:00": 0.8608, "15:05": 0.8853, "15:10": 0.9115,
+    "15:15": 0.9436, "15:20": 0.9742, "15:25": 1.0000,
+}

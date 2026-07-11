@@ -13,7 +13,22 @@ import pandas as pd
 from . import config, data, events, features, indicators, portfolio, regime
 
 
-def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.DataFrame:
+def _size_mult(size_mult: float | None) -> float:
+    """Resolve the gross-exposure multiplier. Explicit value wins; else read the last
+    persisted self-calibration (cheap JSON, no backtest); else 1.0 (full backtest size).
+    Lazy import breaks the screen<-ledger<-calibrate cycle."""
+    if size_mult is not None:
+        return size_mult
+    try:
+        from . import calibrate
+        st = calibrate.load_state()
+        return st["size_multiplier"] if st else 1.0
+    except Exception:
+        return 1.0
+
+
+def screen(date: pd.Timestamp | None = None, top_n: int | None = None,
+           size_mult: float | None = None) -> pd.DataFrame:
     """Return the ranked LONG candidates for `date`'s close (default: latest EOD).
 
     Columns: symbol, close_price, clr, deliv_per, deliv_spike, vol_ratio, ret,
@@ -36,10 +51,11 @@ def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.Dat
     if not cand.empty:
         earn = events.upcoming(date.date(), horizon_days=3)   # earnings guard (graceful)
         cand = cand[~cand["symbol"].isin(earn)]
+    mult = _size_mult(size_mult)
     if not cand.empty:
         cand["score"] = features.conviction_score(cand)
         cand = cand.sort_values("score", ascending=False)
-        cand = portfolio.select(cand)          # sector cap + top-N + equal weights
+        cand = portfolio.select(cand, size_mult=mult)   # sector cap + top-N + calibrated size
     else:
         cand["sector"] = []; cand["weight"] = []
     cand["risk_on"] = risk_on
@@ -51,10 +67,12 @@ def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.Dat
         pd.DataFrame(columns=cols)
     out.attrs["risk_on"] = risk_on
     out.attrs["date"] = date
+    out.attrs["size_mult"] = round(mult, 2)
     return out
 
 
-def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
+def board(date: pd.Timestamp | None = None, top_n: int | None = None,
+          size_mult: float | None = None) -> dict:
     """Full decision board for the dashboard: BUY list (selected, sized), AVOID
     list (footprint-passers rejected only by liquidity or the regime gate, with a
     reason), and the regime flag. Long-only — there is no SELL entry; SELL means
@@ -84,8 +102,9 @@ def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
     earners = liquid[liquid["symbol"].isin(earn)].copy()
     liquid = liquid[~liquid["symbol"].isin(earn)]
 
+    mult = _size_mult(size_mult)
     if risk_on and not liquid.empty:
-        buys = portfolio.select(liquid)
+        buys = portfolio.select(liquid, size_mult=mult)
         buys["action"] = "BUY"
         bands = buys.apply(lambda r: indicators.band(r["close_price"], r.get("atr14", 0)),
                            axis=1)
@@ -104,20 +123,25 @@ def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
     avoid = pd.concat(avoids, ignore_index=True) if avoids else core.head(0).assign(reason=[])
 
     return {"date": date, "risk_on": risk_on, "buys": buys, "avoid": avoid,
-            "n_footprint": len(core), "guard": guard, "n_earnings": len(earners)}
+            "n_footprint": len(core), "guard": guard, "n_earnings": len(earners),
+            "size_mult": round(mult, 2)}
 
 
 def format_screen(out: pd.DataFrame) -> str:
     date = out.attrs.get("date")
     risk_on = out.attrs.get("risk_on", False)
+    mult = out.attrs.get("size_mult", 1.0)
     L = ["=" * 78,
          f"  ACCUMULATION SCREEN — close {pd.Timestamp(date).date()}   "
-         f"regime: {'RISK-ON (Nifty>50MA) — full size' if risk_on else 'RISK-OFF — STAND ASIDE / watch only'}",
+         f"regime: {'RISK-ON (Nifty>50MA)' if risk_on else 'RISK-OFF — STAND ASIDE / watch only'}"
+         f"   size×{mult:.2f} (self-calibrated)",
          "=" * 78]
     if not risk_on:
         L.append("  Gate is OFF. The edge is net-negative outside a Nifty uptrend. No new longs.")
+    if mult <= 0:
+        L.append("  Self-calibrator = STAND ASIDE (edge decayed / negative on the live ledger).")
     if out.empty:
-        L.append("  No names clear the conviction footprint. Stand aside.")
+        L.append("  No names clear the conviction footprint (or size=0). Stand aside.")
     else:
         L.append(f"  {'SYMBOL':<12}{'sector':<20}{'clr':>5}{'delivTr':>8}{'delivTd':>8}"
                  f"{'vol×':>6}{'day%':>7}{'>vwap%':>8}{'RS10%':>7}{'wt':>6}")

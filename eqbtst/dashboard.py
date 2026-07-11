@@ -21,9 +21,17 @@ from eqbtst import config, data, ledger, live, screen
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
 
+
+def _cols(df, cols):
+    """Only the columns that actually exist — tolerates a stale cache / older board
+    that predates a new column (e.g. 'entered'), so a missing column never crashes."""
+    return [c for c in cols if c in df.columns]
+
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
 LIVE_COLS = {
     "symbol": st.column_config.TextColumn("symbol", help="NSE F&O stock (cash, no theta).", pinned=True),
+    "bar": st.column_config.TextColumn("bar", help="Is the CURRENT candle on your selected timeframe still forming? ⏳ forming = the bar has NOT closed yet, so clr/structure/RSI can still CHANGE — the signal can REPAINT and may look different at the bar's close (on 4h that's 13:15 or 15:30). ✓ closed = the bar is done; that read is final. A trigger fired mid-candle is provisional until the bar closes."),
+    "entered": st.column_config.TextColumn("entered", help="WHEN THE TRADE TRIGGERED — the wall-clock time (5-min resolution) the footprint FIRST fired today, INDEPENDENT of the timeframe you picked. If it fires at 12:30 while the 4h candle (09:15→13:15) is still forming, this reads 12:30 — not 09:15 or 13:15. The timeframe governs the structure/RSI/levels lens; the trigger is a clock event. (Qualification time, NOT the candle/scan timestamp.) Replay & the timeframe scans compute it CAUSALLY — the HH:MM the footprint first FORMED (up ≥1% AND closing the running session in the top of its range AND above session VWAP). The Live 5s snapshot has no intraday bars, so there it is FIRST-SEEN — the wall-clock time our scanner first saw the name qualify (accurate if the board ran from the open; later if you started the dashboard mid-session). Earlier + still holding = footprint persisted = higher conviction; just entered near the close = fresher/less proven. Blank = not currently qualifying."),
     "time": st.column_config.TextColumn("time", help="The candle the signal is on, as open→close (e.g. 13:15-15:15 = the 2h candle spanning 13:15 to 15:15). IMPORTANT: an intraday signal only CONFIRMS at the candle's CLOSE — during a live session the current candle is still forming and the signal can repaint until it closes. Live snapshot = scan time; replay = last bar at/before your cut."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
     "ltp": st.column_config.NumberColumn("ltp", help="Live last-traded price (Fyers).", format="%.2f"),
@@ -31,7 +39,7 @@ LIVE_COLS = {
     "clr": st.column_config.NumberColumn("clr", help="Close Location in Range = (close−low)/(high−low). ≥0.70 = closing strong, buyers held into the bar. Core of the accumulation footprint.", format="%.2f"),
     "character": st.column_config.TextColumn("character", help="Candle shape: marubozu_bull (strong body, best), hammer (demand rejected lows), shooting_star (supply capped highs, avoid), doji (indecision), strong/weak_close."),
     "body": st.column_config.NumberColumn("body", help="Signed body fraction of range. Positive & large = conviction green candle.", format="%.2f"),
-    "vol×": st.column_config.NumberColumn("vol×", help="Volume vs own 20-day median. ≥2× = real participation surge. Blank = no volume yet (pre-open / market closed).", format="%.2f"),
+    "vol×": st.column_config.NumberColumn("vol×", help="Volume PACE vs own 20-day median daily volume — TIME-NORMALISED: 'is this name on pace for an N× volume day?'. ≥2× = real participation surge. This matters: raw cumulative-volume/median is mechanically tiny in the morning (only ~4% of a day's volume has traded by 09:15, ~35% by 11:00), so a genuine 2× day would read 0.27 at 09:30 and fail the 2.0 gate — the volume leg could never pass before ~15:00. Dividing by the elapsed-volume fraction makes 2.0 mean the same thing at any hour. At/after 15:25 the fraction is 1.0, so this EQUALS the raw ratio — the validated close decision (and the 8yr backtest) is unchanged. Blank = no volume yet (pre-open / market closed).", format="%.2f"),
     "RS%": st.column_config.NumberColumn("RS%", help="Relative strength vs Nifty today (stock% − index%). >0 = outperforming the market; persistent RS-leaders carry the overnight edge.", format="%.2f"),
     "delivTr": st.column_config.NumberColumn("delivTr", help="TRAILING delivery% (3-day avg through yesterday) from the EOD archive — the LEAK-FREE accumulation leg, known live at the close. ≥60 required for BTST-CARRY (a real footprint, not just price-action FORMING).", format="%.1f"),
     "btst": st.column_config.TextColumn("btst", help="Price-footprint readiness x/4: strong close · up≥1% · vol≥2× · RS-leader (the intraday-knowable legs). BTST-CARRY additionally requires trailing delivery ≥60 (delivTr). FORMING = price legs building, delivery leg may/may not be there."),
@@ -72,6 +80,37 @@ test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", va
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
                                      "prices, junk volume) — for layout/flow testing only.")
+
+# ── self-calibration panel (learns the KNOB, signal stays LOCKED) ───────────────
+try:
+    from eqbtst import calibrate as _cal
+
+    @st.cache_data(ttl=3600)
+    def _calib_now():                    # cache: never block the sidebar on a full backtest
+        return _cal.calibrate()
+
+    _cs = _cal.load_state()
+    if _cs is None:                      # never run in the nightly loop yet — compute once, cached
+        _cs = _calib_now()
+    with st.sidebar.expander("🎛️ Self-calibration (size knob)", expanded=True):
+        _mult = _cs["size_multiplier"]
+        _emoji = "🟢" if _mult >= 0.8 else ("🟡" if _mult > 0 else "🔴")
+        st.metric("Size multiplier", f"{_emoji} {_mult:.2f}",
+                  help="Learned from the paper/live ledger, Bayesian-shrunk to the backtest "
+                       "prior. Only CUTS below 1.0 when live underperforms; never levers above "
+                       "backtest. 0 = stand aside (edge negative or decayed). The SIGNAL is "
+                       "locked — this tunes SIZE only.")
+        st.caption(f"posterior net-edge **{_cs['posterior_net_bps']:+.1f}bps** "
+                   f"(±{_cs['posterior_sd_bps']:.0f}) · prior {_cs['prior']['mu0']:+.1f} · "
+                   f"n={_cs['n_closed']} · {_cs['trust']}")
+        st.caption(f"effective cost {_cs['cost']['effective_cost_bps']:.0f}bps "
+                   f"({_cs['cost']['note']})")
+        if _cs["decayed"]:
+            st.warning("⚠ DECAY — edge underperforming; size forced to 0.")
+except Exception as _e:
+    st.sidebar.caption(f"calibration unavailable: {_e}")
+
+
 def render_price_band():
     """Compact price-band filter row, right-aligned above the table."""
     sp, c1, c2 = st.columns([6, 1, 1])
@@ -178,10 +217,12 @@ if tf == "Intraday":
     # timeframe dropdown — right above the table, right-aligned
     _, ddcol = st.columns([3, 1])
     scan_tf = ddcol.selectbox("Timeframe → stock list",
-                              ["2h", "1h", "15m", "Live snapshot"], index=0,
+                              ["4h", "2h", "1h", "15m", "Live snapshot"], index=1,
                               key="scan_tf",
                               help="Live snapshot = current price-action scan (5s). "
-                                   "1h/2h/15m = scan the universe on that bar timeframe.")
+                                   "4h/2h/1h/15m = scan the universe on that bar timeframe. "
+                                   "NSE session is 6h15m, so a 4h bar = 9:15-13:15 then a "
+                                   "partial 13:15-15:30.")
 
     # ---- timeframe-driven stock list (1h / 2h / 15m bars) ----------------------
     if scan_tf != "Live snapshot":
@@ -200,16 +241,17 @@ if tf == "Intraday":
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
-            long_cols = ["symbol", "time", "sector", "ltp", "day%", "structure", "bar_clr",
-                         "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
+            long_cols = ["symbol", "entered", "time", "bar", "sector", "ltp", "day%", "structure",
+                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                          "entry", "stop", "t1", "t2", "atr%", "action"]
-            sell_cols_tf = ["symbol", "time", "sector", "ltp", "day%", "structure", "bar_clr",
-                            "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
+            sell_cols_tf = ["symbol", "entered", "time", "bar", "sector", "ltp", "day%", "structure",
+                            "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                             "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
             tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
             with tb:
                 lo = b[b["action"] == "LONG"]
-                st.dataframe((lo if not lo.empty else b)[long_cols],
+                _lo = lo if not lo.empty else b
+                st.dataframe(_lo[_cols(_lo, long_cols)],
                              use_container_width=True, hide_index=True,
                              column_config={**LIVE_COLS, **TF_COLS})
                 if lo.empty:
@@ -223,7 +265,7 @@ if tf == "Intraday":
                 if sh.empty:
                     st.caption("No distribution/weakness names on this timeframe.")
                 else:
-                    st.dataframe(sh[sell_cols_tf], use_container_width=True, hide_index=True,
+                    st.dataframe(sh[_cols(sh, sell_cols_tf)], use_container_width=True, hide_index=True,
                                  column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
             st.caption("Entry/Stop/T1/T2 = ATR risk geometry on this timeframe, NOT a "
                        "forecast. Long-only is the validated edge; SHORT is intraday context.")
@@ -247,6 +289,18 @@ if tf == "Intraday":
                        "**last-session snapshot** — `day%`, `Nifty today`, `character` are "
                        "STALE, and `vol×` is blank (no volume today). Live values build "
                        "during the session. For actionable picks now, use the **BTST tab**.")
+        # ARCHIVE-STALENESS GUARD — if our EOD baseline is not the broker's baseline, then
+        # prev_close / vol_med20 / atr14 / deliv_trail are from the WRONG session and every
+        # signal below is corrupted. This must be impossible to miss.
+        _ah = lb.get("archive") or {}
+        if _ah.get("stale"):
+            st.error(
+                f"🛑 **STALE EOD ARCHIVE — DO NOT TRADE THIS BOARD.** "
+                f"{_ah['mismatch']}/{_ah['checked']} names ({_ah['pct']}%) disagree with the "
+                "broker's previous close. The nightly DCM sync has not run for the last "
+                "session, so `prev_close`, `vol×` baseline, `ATR` and `delivTr` are all from "
+                "the WRONG day — every signal here is corrupted. Run the DCM EOD sync, then "
+                "hit ↻ refresh.")
         bd = price_filter(lb["board"], "ltp")
         counts = bd["action"].value_counts().to_dict()
         scounts = bd["sell"].value_counts().to_dict()
@@ -258,10 +312,10 @@ if tf == "Intraday":
         h4.metric("SELL (short/weak)",
                   f"{scounts.get('SHORT', 0) + scounts.get('WEAK', 0)}")
 
-        buy_cols = ["symbol", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
+        buy_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                     "RS%", "delivTr", "btst", "exp_ON", "band_lo", "band_hi", "entry",
                     "stop", "t1", "t2", "risk%", "atr%", "action"]
-        sell_cols = ["symbol", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
+        sell_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
                                  "🔴 SELL (intraday short — square off same day)"])
@@ -277,18 +331,18 @@ if tf == "Intraday":
             else:
                 st.success(f"{len(carry)} name(s) ready to carry overnight — act 15:15–15:30, "
                            "exit next 09:15–09:30.")
-                st.dataframe(carry[buy_cols], use_container_width=True, hide_index=True,
+                st.dataframe(carry[_cols(carry, buy_cols)], use_container_width=True, hide_index=True,
                              column_config=LIVE_COLS)
             # ⏳ FORMING — watch list, may flip to CARRY near the close
             st.markdown("#### ⏳ FORMING — building (watch)")
             if forming.empty:
                 b = bd.sort_values("clr", ascending=False).head(10)
                 st.caption("No footprint building yet — top-10 by close-strength meanwhile:")
-                st.dataframe(b[buy_cols], use_container_width=True, hide_index=True,
+                st.dataframe(b[_cols(b, buy_cols)], use_container_width=True, hide_index=True,
                              column_config=LIVE_COLS)
             else:
                 st.caption(f"{len(forming)} building — may flip to 🌙 BTST-CARRY near the close.")
-                st.dataframe(forming[buy_cols], use_container_width=True, hide_index=True,
+                st.dataframe(forming[_cols(forming, buy_cols)], use_container_width=True, hide_index=True,
                              column_config=LIVE_COLS)
         with t_sell:
             st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Holding "
@@ -300,7 +354,7 @@ if tf == "Intraday":
             if s.empty:
                 st.caption("No distribution/weakness names live right now.")
             else:
-                st.dataframe(s[sell_cols], use_container_width=True, hide_index=True,
+                st.dataframe(s[_cols(s, sell_cols)], use_container_width=True, hide_index=True,
                              column_config={**LIVE_COLS, **SELL_COLS})
         st.caption(f"updated {dt.datetime.now():%H:%M:%S} • hover any header for what+why. "
                    "VWAP · RSI7/14 · tone appear in the table when you pick a 1h/2h/15m "
@@ -323,7 +377,7 @@ if tf == "🎬 Replay (practice)":
     if not tok["usable"]:
         st.error("Fyers token not usable — re-auth in Tradebot (`python fyers_auth.py`).")
         st.stop()
-    rc1, rc2 = st.columns([1, 2])
+    rc1, rc2, rc3 = st.columns([1, 2, 1])
     rdate = rc1.date_input("Date", value=_last_date().date(), max_value=_last_date().date(),
                            key="replay_date")
     rtime = rc2.select_slider("Time (IST)",
@@ -331,14 +385,19 @@ if tf == "🎬 Replay (practice)":
                                        for m in (0, 15, 30, 45)
                                        if (h, m) >= (9, 15) and (h, m) <= (15, 30)],
                               value="13:00", key="replay_time")
+    rtf = rc3.selectbox("Timeframe", ["15m", "1h", "2h", "4h"], index=0, key="replay_tf",
+                        help="Candle timeframe the VWAP/RSI/structure read is computed on. "
+                             "15m = native fine bars; 1h/2h/4h resample the causal bars up "
+                             "to your cut. Coarse tf = fewer bars early in the day (structure "
+                             "may read n/a until enough bars form).")
 
     @st.cache_data(ttl=3600)
-    def _replay(dstr, t):
-        return live.replay_board(dstr, t)
+    def _replay(dstr, t, tf_):
+        return live.replay_board(dstr, t, tf=tf_)
 
-    with st.spinner(f"Reconstructing the board as of {rdate} {rtime} (first load of a day "
+    with st.spinner(f"Reconstructing the board as of {rdate} {rtime} ({rtf}; first load of a day "
                     "fetches ~250 names)…"):
-        rb = _replay(pd.Timestamp(rdate).strftime("%Y-%m-%d"), rtime)
+        rb = _replay(pd.Timestamp(rdate).strftime("%Y-%m-%d"), rtime, rtf)
     if not rb["ok"] or rb["board"].empty:
         st.info("No data for that date/time (not a trading day, or candles unavailable). "
                 "Try a recent trading day.")
@@ -356,10 +415,10 @@ if tf == "🎬 Replay (practice)":
     if not near_close:
         st.info(f"It's **{rtime}** — before the 15:10 window, so names show as ⏳ **FORMING** "
                 "(building). Move the slider to **15:15** to see which flip to 🌙 BTST-CARRY.")
-    buy_cols = ["symbol", "time", "sector", "ltp", "day%", "structure", "clr", "character",
+    buy_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "structure", "clr", "character",
                 "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "btst", "entry",
                 "stop", "t1", "t2", "atr%", "action"]
-    sell_cols_r = ["symbol", "time", "sector", "ltp", "day%", "structure", "clr", "character",
+    sell_cols_r = ["symbol", "entered", "time", "sector", "ltp", "day%", "structure", "clr", "character",
                    "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "entry",
                    "s_stop", "s_t1", "s_t2", "atr%", "sell"]
     rt_long, rt_short = st.tabs(["🟢 LONG (BTST-CARRY / FORMING)", "🔴 SHORT (intraday)"])
@@ -368,7 +427,7 @@ if tf == "🎬 Replay (practice)":
         if long_side.empty:
             st.caption("None building at this time — top-10 by close-strength so far:")
             long_side = bd.sort_values("clr", ascending=False).head(10)
-        st.dataframe(long_side[buy_cols], use_container_width=True, hide_index=True,
+        st.dataframe(long_side[_cols(long_side, buy_cols)], use_container_width=True, hide_index=True,
                      column_config={**LIVE_COLS, **TF_COLS})
         st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
                    "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone point-in-time.")

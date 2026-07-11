@@ -13,4 +13,5 @@ echo ==================== %date% %time% ==================== >> paper_loop.log
 python -m eqbtst.cli reconcile >> paper_loop.log 2>&1
 python -m eqbtst.cli emit       >> paper_loop.log 2>&1
 python -m eqbtst.cli scorecard  >> paper_loop.log 2>&1
+python -m eqbtst.cli calibrate  >> paper_loop.log 2>&1
 echo (paper loop done) >> paper_loop.log
