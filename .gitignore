@@ -5,3 +5,5 @@ venv/
 .venv/
 data/validation/*.parquet
 *.log
+
+data/events/*.csv

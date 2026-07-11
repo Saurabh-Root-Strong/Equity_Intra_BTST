@@ -118,6 +118,21 @@ def test_atr_and_levels():
     assert I.levels(100, 0) == {}               # no ATR -> no levels (no fabrication)
 
 
+def test_earnings_guard():
+    """upcoming() excludes names reporting within the hold window; empty calendar
+    degrades gracefully to an empty set (no crash, no silent pass claim)."""
+    import datetime as dt
+    import pandas as pd
+    from eqbtst import events
+    ev = pd.DataFrame({"symbol": ["AAA", "BBB", "CCC"],
+                       "date": [dt.date(2026, 7, 12), dt.date(2026, 7, 20), dt.date(2026, 7, 10)],
+                       "purpose": ["Financial Results"] * 3})
+    up = events.upcoming(dt.date(2026, 7, 10), horizon_days=3, events=ev)
+    assert up == {"AAA"}                    # 12th is in (10, 13]; 20th too far; 10th not > asof
+    assert events.upcoming(dt.date(2026, 7, 10), events=pd.DataFrame(
+        columns=["symbol", "date", "purpose"])) == set()
+
+
 def test_locked_thresholds():
     # tripwire: these are LOCKED by the 8yr validation. A change is a decision, not a typo.
     assert (config.CLR_TH, config.DELIV_TH, config.VOL_TH, config.RET_TH) == (0.70, 60.0, 2.0, 0.01)

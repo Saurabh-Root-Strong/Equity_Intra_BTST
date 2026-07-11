@@ -126,6 +126,10 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
     # live Nifty return for relative strength
     nifty = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
     idx_ret = _chp(nifty)
+    # earnings guard: names reporting during the overnight hold can't be a BTST carry
+    from . import events
+    d0 = (pd.Timestamp(date) if date is not None else data.last_trading_date()).date()
+    earn = events.upcoming(d0, horizon_days=3)
 
     rows = []
     ref = uni.set_index("symbol")
@@ -162,7 +166,9 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "t1": lv.get("t1"), "t2": lv.get("t2"),
             "s_stop": s_stop, "s_t1": s_t1, "s_t2": s_t2,
             "risk%": lv.get("risk%"), "atr%": lv.get("atr%"),
-            "action": _live_action(pa, day_ret, rs, vsurge, risk_on),
+            "earnings": "⚠" if sym in earn else "",
+            "action": ("EARNINGS" if sym in earn
+                       else _live_action(pa, day_ret, rs, vsurge, risk_on)),
             "sell": _sell_action(pa, day_ret, rs, vsurge),
         })
     board = pd.DataFrame(rows)

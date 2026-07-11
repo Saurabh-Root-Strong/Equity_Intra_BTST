@@ -237,6 +237,19 @@ c4.metric("Deployable edge", "≈ +16–19 bps", "net/night, liquid, long-only")
 st.caption(f"As of close **{pd.Timestamp(date).date()}** • BTST long-only • "
            "act ~15:15–15:30, exit next-morning strength • paper-first, nothing auto-executes.")
 
+# earnings guard status
+g = b.get("guard", {})
+if not g.get("available"):
+    st.warning("⚠ **Earnings guard OFF** — NSE event calendar unreachable. A BUY name could "
+               "be reporting results tonight (an earnings gap, not the edge). **Verify each "
+               "pick manually** before acting.")
+elif b.get("n_earnings"):
+    st.success(f"✅ Earnings guard ON (NSE calendar {g.get('asof')}, {g.get('n')} events) — "
+               f"excluded {b['n_earnings']} footprint name(s) reporting during the hold.")
+else:
+    st.caption(f"✅ Earnings guard ON (NSE calendar {g.get('asof')}) — no BUY name reports "
+               "during the hold.")
+
 if not risk_on:
     st.warning("Regime RISK-OFF (Nifty below its 50-day MA). The edge is net-negative "
                "outside a Nifty uptrend — **no new longs tonight.** Footprint names below "

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import config, data, features, portfolio, regime
+from . import config, data, events, features, portfolio, regime
 
 
 def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.DataFrame:
@@ -33,6 +33,9 @@ def screen(date: pd.Timestamp | None = None, top_n: int | None = None) -> pd.Dat
     risk_on = regime.is_risk_on(date)
 
     cand = day[features.signal_mask(day)].copy()
+    if not cand.empty:
+        earn = events.upcoming(date.date(), horizon_days=3)   # earnings guard (graceful)
+        cand = cand[~cand["symbol"].isin(earn)]
     if not cand.empty:
         cand["score"] = features.conviction_score(cand)
         cand = cand.sort_values("score", ascending=False)
@@ -74,6 +77,13 @@ def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
     liquid = core[core["turnover_lacs"] >= config.LIQ_MIN_LACS]
     thin = core[core["turnover_lacs"] < config.LIQ_MIN_LACS].copy()
 
+    # EARNINGS GUARD: a name reporting results during the overnight hold gaps on the
+    # earnings, not the accumulation. Exclude it from BUY. Degrades gracefully.
+    guard = events.guard_status()
+    earn = events.upcoming(date.date(), horizon_days=3) if guard["available"] else set()
+    earners = liquid[liquid["symbol"].isin(earn)].copy()
+    liquid = liquid[~liquid["symbol"].isin(earn)]
+
     if risk_on and not liquid.empty:
         buys = portfolio.select(liquid)
         buys["action"] = "BUY"
@@ -81,6 +91,8 @@ def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
         buys = liquid.head(0).assign(sector=[], weight=[], action=[])
 
     avoids = []
+    if not earners.empty:
+        e = earners.copy(); e["reason"] = "EARNINGS — results during the hold"; avoids.append(e)
     if not thin.empty:
         t = thin.copy(); t["reason"] = "illiquid (<₹20cr turnover)"; avoids.append(t)
     if not risk_on and not liquid.empty:
@@ -88,7 +100,7 @@ def board(date: pd.Timestamp | None = None, top_n: int | None = None) -> dict:
     avoid = pd.concat(avoids, ignore_index=True) if avoids else core.head(0).assign(reason=[])
 
     return {"date": date, "risk_on": risk_on, "buys": buys, "avoid": avoid,
-            "n_footprint": len(core)}
+            "n_footprint": len(core), "guard": guard, "n_earnings": len(earners)}
 
 
 def format_screen(out: pd.DataFrame) -> str:
