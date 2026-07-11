@@ -379,7 +379,8 @@ if tf == "🎬 Replay (practice)":
         if sh.empty:
             st.caption("No distribution/weakness names at this time.")
         else:
-            st.dataframe(sh[sell_cols_r], use_container_width=True, hide_index=True,
+            _c = [c for c in sell_cols_r if c in sh.columns]
+            st.dataframe(sh[_c], use_container_width=True, hide_index=True,
                          column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
     st.stop()
 # ── BTST board ─────────────────────────────────────────────────────────────────
