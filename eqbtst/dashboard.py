@@ -71,10 +71,12 @@ test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", va
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
                                      "prices, junk volume) — for layout/flow testing only.")
-st.sidebar.markdown("**Price band (₹)** — filter by stock price")
-_pc1, _pc2 = st.sidebar.columns(2)
-price_min = _pc1.number_input("Min", min_value=0.0, value=0.0, step=50.0, key="price_min")
-price_max = _pc2.number_input("Max", min_value=0.0, value=100000.0, step=50.0, key="price_max")
+def render_price_band():
+    """Compact price-band filter row, right-aligned above the table."""
+    sp, c1, c2 = st.columns([6, 1, 1])
+    sp.markdown("**Price band (₹)** — filter the list by stock price →")
+    c1.number_input("Min ₹", min_value=0.0, value=0.0, step=50.0, key="price_min")
+    c2.number_input("Max ₹", min_value=0.0, value=100000.0, step=50.0, key="price_max")
 
 
 def price_filter(df, col):
@@ -171,6 +173,7 @@ if tf == "Intraday":
         st.warning("🧪 **TEST MODE** — market is closed; data below is UNRELIABLE off-hours "
                    "Fyers (indicative prices, junk volume). Layout/flow testing only.")
 
+    render_price_band()
     # timeframe dropdown — right above the table, right-aligned
     _, ddcol = st.columns([3, 1])
     scan_tf = ddcol.selectbox("Timeframe → stock list",
@@ -339,6 +342,7 @@ if tf == "🎬 Replay (practice)":
         st.info("No data for that date/time (not a trading day, or candles unavailable). "
                 "Try a recent trading day.")
         st.stop()
+    render_price_band()
     bd = price_filter(rb["board"], "ltp")
     near_close = rtime >= "15:10"
     m1, m2, m3, m4 = st.columns(4)
@@ -408,6 +412,7 @@ if not risk_on:
                "are shown as AVOID for transparency.")
 
 # BUY board
+render_price_band()
 buys = price_filter(b["buys"], "close_price")
 st.subheader("🟢 BUY — tonight's long candidates" if risk_on else "🟢 BUY — (suppressed, regime off)")
 if buys.empty:
