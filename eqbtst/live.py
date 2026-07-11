@@ -767,7 +767,15 @@ def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
     pc = ref_close if ref_close else float(c["close"].iloc[0])
     state = indicators.live_state(session, pc, ref_avg_vol,
                                   (idx_ret / 100.0) if idx_ret is not None else None)
-    state["structure"] = indicators.structure(c)            # multi-day frame (not 1 session)
+    # STRUCTURE and RSI must read the MULTI-DAY tf frame, not one session. A single day
+    # holds ~7 bars at 1h, 4 at 2h, 2 at 4h — fewer than RSI's period, so rsi() would fall
+    # back to its 50.0 default, tone would read "neutral", and the "RSI not weak" leg of
+    # _tf_action would silently ALWAYS PASS (a vacuous filter) on every coarse timeframe.
+    # A 4h RSI means an RSI of 4h bars — which necessarily chains across days.
+    state["structure"] = indicators.structure(c)
+    _rs = indicators.rsi_state(c["close"].to_numpy(float))
+    state["rsi7"], state["rsi14"] = _rs["rsi7"], _rs["rsi14"]
+    state["slope"], state["tone"] = _rs["slope"], _rs["tone"]
     atr_tf = indicators.atr(c, 14)                          # ATR on the chosen timeframe
     lv = indicators.levels(state["ltp"], atr_tf,
                            day_low=float(session["low"].min()),
