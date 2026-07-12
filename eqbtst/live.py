@@ -197,6 +197,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
     earn = events.upcoming(d0, horizon_days=3)
 
     rows = []
+    _live_pc: dict = {}                    # symbol -> broker prev_close, for the trigger fetch
     ref = uni.set_index("symbol")
     for fys, v in q.items():
         sym = fy.get(fys)
@@ -207,6 +208,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         if None in (o, h, l, c) or not pc:
             continue
         pa = indicators.price_action(float(o), float(h), float(l), float(c))
+        _live_pc[sym] = float(pc)          # broker prev_close (authoritative, stale-proof)
         day_ret = 100 * (float(c) / float(pc) - 1)
         rs = day_ret - idx_ret if idx_ret is not None else None
         vol = v.get("volume") or 0
@@ -254,8 +256,22 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         # first-seen 'entered' — stamp the moment a name first shows in a tradeable tab
         qual = board[board["action"].isin(["BTST-CARRY", "FORMING"])
                      | board["sell"].isin(["SHORT", "WEAK"])]["symbol"].tolist()
+        # EXACT trigger time for the qualifying names. The 5s quote has no bars, so a
+        # first-seen stamp would read "when this dashboard started" — open the laptop at
+        # 13:00 and a name that actually fired at 10:40 would wrongly show 13:00. The
+        # qualifying set is small (a handful), so fetch each one's 5-min history and
+        # compute the TRUE causal trigger; it is cached per 5-min bucket, and a fired
+        # trigger is immutable. first-seen remains the fallback if the fetch fails.
         seen = mark_first_seen(d0, qual)
-        board["entered"] = board["symbol"].map(seen)
+        exact = {}
+        for s_ in qual:
+            try:
+                t_ = _trigger_time(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
+            except Exception:
+                t_ = None
+            if t_:
+                exact[s_] = t_
+        board["entered"] = board["symbol"].map(lambda s_: exact.get(s_) or seen.get(s_))
         board = board.sort_values(["action", "clr"], ascending=[True, False])
     health = archive_health(ref, q)          # is our EOD baseline the broker's baseline?
     return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "archive": health,
