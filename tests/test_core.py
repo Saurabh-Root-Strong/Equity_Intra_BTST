@@ -193,6 +193,44 @@ def test_archive_staleness_guard():
     assert live.archive_health(ref, {})["stale"] is False            # no quotes -> no claim
 
 
+def test_live_signal_equals_backtested_signal():
+    """THE most important invariant in the project. The LIVE board's BTST-CARRY must fire
+    on exactly the footprint features.signal_mask() was validated on for 8 years — or the
+    board suggests names the backtest never blessed, and the edge you trade is not the edge
+    you measured.
+
+    This caught a real divergence: the live path was missing the PATH-SIGNATURE leg
+    (close_vs_vwap, worth +26->+30bps and flips 2025 positive) and was using TODAY's RS
+    burst instead of the RS_LOOKBACK-day PERSISTENT cumulative (+30 vs +19bps).
+    """
+    from eqbtst import live
+
+    # every leg combination around each threshold — no live-only or backtest-only fires
+    rows = []
+    for clr in (0.69, 0.70, 0.85):
+        for ret in (0.009, 0.010, 0.03):
+            for vr in (1.9, 2.0, 3.0):
+                for rsc in (-0.01, 0.0, 0.05):
+                    for cv in (0.004, 0.005, 0.02):
+                        rows.append((clr, ret, vr, rsc, cv))
+    df = pd.DataFrame(rows, columns=["clr", "ret", "vol_ratio", "rs_idx_cum", "close_vs_vwap"])
+    df["deliv_trail"] = 70.0                 # delivery + liquidity held constant & passing
+    df["turnover_lacs"] = 5000.0
+
+    truth = features.signal_mask(df).to_numpy()
+    ready = np.array([live.btst_readiness({"clr": c}, 100 * r, rc, vr, cv)
+                      for c, r, vr, rc, cv in zip(df.clr, df.ret, df.vol_ratio,
+                                                  df.rs_idx_cum, df.close_vs_vwap)])
+    live_sig = (ready >= live.BTST_LEGS) & (df.deliv_trail >= config.DELIV_TRAIL_TH).to_numpy() \
+        & (df.turnover_lacs >= config.LIQ_MIN_LACS).to_numpy()
+
+    assert (truth == live_sig).all(), "LIVE signal has diverged from the BACKTESTED signal"
+    assert truth.sum() > 0 and live_sig.sum() > 0          # the test actually exercises fires
+
+    # a missing session-VWAP must NOT be a free pass on the path-signature leg
+    assert live.btst_readiness({"clr": 0.9}, 3.0, 0.05, 3.0, cvwap=None) < live.BTST_LEGS
+
+
 def test_long_only_locked():
     assert config.LONG_ONLY is True                  # short side proven dead (win 20%)
 

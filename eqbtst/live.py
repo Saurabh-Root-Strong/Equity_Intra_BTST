@@ -90,12 +90,31 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
     # session entry this is leak-free and includes the last EOD row (no shift).
     df["deliv_trail"] = df.groupby("symbol")["deliv_per"].transform(
         lambda s: s.rolling(config.DELIV_TRAIL_WIN).mean())
+    # PERSISTENT relative strength — the validated leg is the RS_LOOKBACK-day CUMULATIVE
+    # RS vs the index (a sustained leader), NOT a single day's burst. The live board can
+    # only see today's RS, so carry the completed part here: the sum of daily (stock −
+    # index) returns over the last RS_LOOKBACK-1 sessions THROUGH this archive row. The
+    # caller adds today's live RS to it to reconstruct the full 10-day cumulative.
+    nf = data.load_nifty(start=start, end=date.strftime("%Y-%m-%d")).sort_values("trade_date")
+    nf["idx_ret"] = nf["close_val"].pct_change()
+    df = df.merge(nf[["trade_date", "idx_ret"]], on="trade_date", how="left")
+    df = df.sort_values(["symbol", "trade_date"])
+    df["rs_d"] = (df["close_price"] / df.groupby("symbol")["close_price"].shift(1) - 1) - df["idx_ret"]
+    _w = config.RS_LOOKBACK - 1
+    g2 = df.groupby("symbol", group_keys=False)["rs_d"]
+    df["rs_cum9"] = g2.transform(lambda s: s.rolling(_w).sum())          # through this row
+    df["rs_cum9_prior"] = g2.transform(lambda s: s.shift(1).rolling(_w).sum())  # excl. this row
+    # delivery through the PRIOR row too — replay's "today" IS this row, and today's
+    # delivery is not published until ~6pm, so replay must not read it.
+    df["deliv_trail_prior"] = df.groupby("symbol")["deliv_per"].transform(
+        lambda s: s.shift(1).rolling(config.DELIV_TRAIL_WIN).mean())
     last = df[df["trade_date"] == date].copy()
     last = last[last["turnover_lacs"] >= config.LIQ_MIN_LACS]
     sectors = data.load_sectors()
     last["sector"] = last["symbol"].map(lambda s: sectors.get(s, f"_{s}"))
     return last[["symbol", "sector", "close_price", "prev_c", "vol_med20", "atr14",
-                 "deliv_trail", "high_price", "low_price"]].rename(
+                 "deliv_trail", "deliv_trail_prior", "rs_cum9", "rs_cum9_prior",
+                 "high_price", "low_price"]].rename(
         columns={"close_price": "ref_close", "prev_c": "prev_close",
                  "high_price": "pdh", "low_price": "pdl"})
 
@@ -198,6 +217,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
 
     rows = []
     _live_pc: dict = {}                    # symbol -> broker prev_close, for the trigger fetch
+    _pending: dict = {}                    # symbol -> legs, for the session-VWAP (cvwap) pass
     ref = uni.set_index("symbol")
     for fys, v in q.items():
         sym = fy.get(fys)
@@ -224,21 +244,30 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         vsurge = (_raw / _frac) if (_raw == _raw and _frac > 0) else float("nan")
         atr14 = float(ref.loc[sym, "atr14"]) if ref.loc[sym, "atr14"] == ref.loc[sym, "atr14"] else 0.0
         lv = indicators.levels(float(c), atr14, day_low=float(l))
-        ready = btst_readiness(pa, day_ret, rs, vsurge)
+        # PERSISTENT RS = the completed RS_LOOKBACK-1 sessions (archive) + today's live RS.
+        # The validated leg is the sustained leader, not a one-day burst.
+        _c9 = ref.loc[sym, "rs_cum9"]
+        rs_cum = (float(_c9) + (rs / 100.0)) if (_c9 == _c9 and rs is not None) else None
+        # cvwap (path signature) needs today's session VWAP, which a 5s quote lacks. It is
+        # fetched below for the shortlist only; None here => that leg is NOT met.
+        ready = btst_readiness(pa, day_ret, rs_cum, vsurge, cvwap=None)
         sready = short_readiness(pa, day_ret, rs, vsurge)
         dtrail = float(ref.loc[sym, "deliv_trail"]) if ref.loc[sym, "deliv_trail"] == ref.loc[sym, "deliv_trail"] else 0.0
         # short-side levels: stop ABOVE, targets BELOW (mirror of the long geometry)
         s_stop = round(float(c) + atr14, 2) if atr14 > 0 else None
         s_t1 = round(float(c) - atr14, 2) if atr14 > 0 else None
         s_t2 = round(float(c) - 2 * atr14, 2) if atr14 > 0 else None
+        _pending[sym] = (pa, day_ret, rs_cum, vsurge, dtrail, float(c))   # for the cvwap pass
         rows.append({
             "symbol": sym, "time": dt.datetime.now().strftime("%H:%M:%S"),
             "sector": ref.loc[sym, "sector"], "ltp": float(c),
             "day%": round(day_ret, 2), "clr": pa["clr"], "character": pa["character"],
             "body": pa["body"], "vol×": round(vsurge, 2) if vsurge == vsurge else None,
             "RS%": round(rs, 2) if rs is not None else None,
-            "btst": f"{ready}/4", "delivTr": round(dtrail, 1),
-            "exp_ON": "+0.3–0.4%" if (ready >= 4 and dtrail >= config.DELIV_TRAIL_TH) else "",
+            "rsCum%": round(100 * rs_cum, 2) if rs_cum is not None else None,
+            "cvwap%": None,                      # filled for the shortlist below
+            "btst": f"{ready}/{BTST_LEGS}", "delivTr": round(dtrail, 1),
+            "exp_ON": "",
             "short": f"{sready}/4",
             "entry": lv.get("entry"), "stop": lv.get("stop"),
             "t1": lv.get("t1"), "t2": lv.get("t2"),
@@ -248,30 +277,42 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "band_hi": indicators.band(float(c), atr14).get("band_hi"),
             "earnings": "⚠" if sym in earn else "",
             "action": ("EARNINGS" if sym in earn
-                       else _live_action(pa, day_ret, rs, vsurge, risk_on, deliv_trail=dtrail)),
+                       else _live_action(pa, day_ret, rs_cum, vsurge, risk_on,
+                                         deliv_trail=dtrail, cvwap=None)),
             "sell": _sell_action(pa, day_ret, rs, vsurge),
         })
     board = pd.DataFrame(rows)
     if not board.empty:
-        # first-seen 'entered' — stamp the moment a name first shows in a tradeable tab
+        # ── SHORTLIST PASS: session VWAP -> the PATH-SIGNATURE leg (cvwap) ──────────
+        # A 5s quote carries no VWAP, but cvwap is part of the VALIDATED signal_mask —
+        # without it the live board is not the backtested edge. Only names already
+        # holding the other legs can possibly become BTST-CARRY, so fetch 5-min bars for
+        # that handful (cached per 5-min bucket) and finalise their action. This also
+        # gives their EXACT trigger time: first-seen would read "when this dashboard
+        # started", so opening the laptop at 13:00 would mislabel a 10:40 trigger.
+        shortlist = board[board["action"].isin(["BTST-CARRY", "FORMING"])]["symbol"].tolist()
+        cvwaps, trigs = {}, {}
+        for s_ in shortlist:
+            pa_, day_, rsc_, vs_, dt_, ltp_ = _pending[s_]
+            ex = _session_extras(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
+            vw_ = ex.get("vwap")
+            cv_ = ((ltp_ - vw_) / vw_) if (vw_ and vw_ > 0) else None
+            cvwaps[s_] = cv_
+            if ex.get("trigger"):
+                trigs[s_] = ex["trigger"]
+            rdy_ = btst_readiness(pa_, day_, rsc_, vs_, cv_)
+            act_ = ("EARNINGS" if s_ in earn else
+                    _live_action(pa_, day_, rsc_, vs_, risk_on, deliv_trail=dt_, cvwap=cv_))
+            m_ = board["symbol"] == s_
+            board.loc[m_, "cvwap%"] = round(100 * cv_, 2) if cv_ is not None else None
+            board.loc[m_, "btst"] = f"{rdy_}/{BTST_LEGS}"
+            board.loc[m_, "action"] = act_
+            board.loc[m_, "exp_ON"] = ("+0.3–0.4%" if act_ == "BTST-CARRY" else "")
+        # 'entered' — exact trigger where we fetched it, first-seen as the fallback
         qual = board[board["action"].isin(["BTST-CARRY", "FORMING"])
                      | board["sell"].isin(["SHORT", "WEAK"])]["symbol"].tolist()
-        # EXACT trigger time for the qualifying names. The 5s quote has no bars, so a
-        # first-seen stamp would read "when this dashboard started" — open the laptop at
-        # 13:00 and a name that actually fired at 10:40 would wrongly show 13:00. The
-        # qualifying set is small (a handful), so fetch each one's 5-min history and
-        # compute the TRUE causal trigger; it is cached per 5-min bucket, and a fired
-        # trigger is immutable. first-seen remains the fallback if the fetch fails.
         seen = mark_first_seen(d0, qual)
-        exact = {}
-        for s_ in qual:
-            try:
-                t_ = _trigger_time(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
-            except Exception:
-                t_ = None
-            if t_:
-                exact[s_] = t_
-        board["entered"] = board["symbol"].map(lambda s_: exact.get(s_) or seen.get(s_))
+        board["entered"] = board["symbol"].map(lambda s_: trigs.get(s_) or seen.get(s_))
         board = board.sort_values(["action", "clr"], ascending=[True, False])
     health = archive_health(ref, q)          # is our EOD baseline the broker's baseline?
     return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "archive": health,
@@ -283,17 +324,32 @@ def _chp(v: dict):
     return float(v["chp"]) if v and v.get("chp") is not None else None
 
 
-def btst_readiness(pa: dict, day_ret: float, rs, vsurge) -> int:
-    """How many of the LIVE overnight-footprint legs are met (0-4): strong close,
-    up ≥1%, volume surge ≥2×, relative-strength leader. The higher this is near the
-    close, the more the day's action looks like the accumulation that historically
-    drifts UP overnight — i.e. the more a next-day move is expectable. (VWAP-hold and
-    delivery% are the 2 further confirmations: deep-chart view + the EOD close.)"""
+BTST_LEGS = 5          # the live footprint must have EXACTLY the backtested legs
+
+
+def btst_readiness(pa: dict, day_ret: float, rs_cum, vsurge, cvwap=None) -> int:
+    """How many of the LIVE overnight-footprint legs are met (0-5). These MUST be the
+    same legs features.signal_mask() was validated on for 8 years, or the board would
+    suggest names the backtest never blessed:
+
+        clr ≥ CLR_TH            strong close (buyers held into the bell)
+        day_ret ≥ RET_TH        up on the day (demand in control)
+        vol pace ≥ VOL_TH       real participation (time-normalised)
+        rs_cum > RS_MIN         PERSISTENT leader — the RS_LOOKBACK-day CUMULATIVE RS,
+                                NOT a one-day burst (burst-only decays +30 -> +19bps)
+        cvwap ≥ CVWAP_TH        PATH SIGNATURE — closed well above session VWAP, i.e.
+                                trended-and-held, not spiked-and-faded (+26 -> +30bps,
+                                and it flips 2025 from -11.6 to +6.2)
+
+    Delivery (deliv_trail) and the regime gate are applied by the caller. cvwap=None
+    means the session VWAP has not been fetched yet -> that leg is NOT met (no free pass).
+    """
     n = 0
     n += pa["clr"] >= config.CLR_TH
     n += day_ret >= 100 * config.RET_TH
     n += vsurge == vsurge and vsurge >= config.VOL_TH        # NaN volume = NOT met (no free pass)
-    n += (rs is None) or (rs > 0)
+    n += (rs_cum is not None) and (rs_cum > config.RS_MIN)   # persistent, not today's burst
+    n += (cvwap is not None) and (cvwap == cvwap) and (cvwap >= config.CVWAP_TH)
     return int(n)
 
 
@@ -321,8 +377,9 @@ def _sell_action(pa: dict, day_ret: float, rs, vsurge) -> str:
     return "—"
 
 
-def _live_action(pa: dict, day_ret: float, rs, vsurge, risk_on: bool,
-                 now_time: "dt.time | None" = None, deliv_trail: float = 0.0) -> str:
+def _live_action(pa: dict, day_ret: float, rs_cum, vsurge, risk_on: bool,
+                 now_time: "dt.time | None" = None, deliv_trail: float = 0.0,
+                 cvwap: float | None = None) -> str:
     """Honest live label with the intraday→BTST handoff.
 
     BTST-CARRY = near the close, the FULL LEAK-FREE footprint holds — the price legs
@@ -334,13 +391,16 @@ def _live_action(pa: dict, day_ret: float, rs, vsurge, risk_on: bool,
     """
     if not risk_on:
         return "AVOID"
-    ready = btst_readiness(pa, day_ret, rs, vsurge)
+    ready = btst_readiness(pa, day_ret, rs_cum, vsurge, cvwap)
     deliv_ok = deliv_trail >= config.DELIV_TRAIL_TH
     near_close = (now_time or dt.datetime.now().time()) >= dt.time(15, 10)
-    if ready >= 4 and deliv_ok and near_close:
-        return "BTST-CARRY"          # full leak-free footprint -> shift to overnight
-    if ready >= 4:
-        return "FORMING"             # price footprint building (+/- the delivery leg)
+    # BTST-CARRY must be the EXACT validated footprint: all BTST_LEGS price legs (incl.
+    # path-signature + persistent RS) AND trailing delivery AND the regime gate AND the
+    # close window. Anything looser would suggest names the 8yr backtest never blessed.
+    if ready >= BTST_LEGS and deliv_ok and near_close:
+        return "BTST-CARRY"
+    if ready >= BTST_LEGS - 1:
+        return "FORMING"             # one leg short (often delivery or VWAP-path) — watch
     if pa["clr"] <= 0.33 or day_ret < 0:
         return "AVOID"
     return "NEUTRAL"
@@ -373,7 +433,7 @@ def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -
     return df
 
 
-_TRIG_CACHE: dict = {}          # (symbol, date) -> ("HH:MM"|None, checked_5min_bucket)
+_SESS_CACHE: dict = {}          # (symbol, date) -> ({trigger, vwap}, checked_5min_bucket)
 
 
 def _bucket5(now: dt.datetime | None = None) -> str:
@@ -383,34 +443,42 @@ def _bucket5(now: dt.datetime | None = None) -> str:
     return f"{n.hour:02d}:{(n.minute // 5) * 5:02d}"
 
 
-def _trigger_time(sym: str, ref_close: float, ref_avg_vol: float | None = None) -> str | None:
-    """WHEN the trade actually triggered — the wall-clock minute the footprint first
-    fired TODAY, at 5-MINUTE resolution, regardless of the timeframe the user picked.
+def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None) -> dict:
+    """Today's session facts that a 5-second QUOTE cannot give us, from the 5-min bars:
 
-    This must NOT be derived from the selected tf's candles: a 4h bar only exists at
-    09:15 and 13:15, so a 4h frame could never report a 12:30 trigger. The timeframe
-    decides the structure/RSI/levels lens; the trigger is a clock event. Once a symbol
-    has fired today the answer is immutable, so it is cached (no repeat /history call)."""
+      trigger : WHEN the footprint first fired (5-min resolution, timeframe-independent —
+                a 4h frame only has 09:15/13:15 bars and could never say 12:30).
+      vwap    : today's session VWAP — needed for the PATH-SIGNATURE leg (close well
+                above VWAP = trended-and-held, vs spiked-and-faded). This leg is in the
+                validated signal_mask; without it the live board is not the backtest.
+
+    Cached per 5-min bucket (no new information arrives inside a bar). A fired trigger is
+    immutable and is carried forward even as VWAP keeps moving."""
     today = dt.date.today()
     key = (sym, today)
     bucket = _bucket5()
-    hit = _TRIG_CACHE.get(key)
-    if hit is not None:
-        val, checked = hit
-        if val is not None:                 # already fired today -> immutable, never re-fetch
-            return val
-        if checked == bucket:               # a MISS is also cached, until the 5m bar turns —
-            return None                     # otherwise every refresh re-pulls 25 histories
+    hit = _SESS_CACHE.get(key)
+    if hit is not None and hit[1] == bucket:
+        return hit[0]
+    prev = hit[0] if hit else {}
     try:
         fine = fetch_intraday(sym, tf="5m", lookback_days=2)
         if fine.empty:
-            return None
+            return prev or {"trigger": None, "vwap": None}
         fine = fine[fine["ts"].dt.date == fine["ts"].dt.date.max()]     # today's 5m bars
-        t = _first_formed(fine, ref_close, ref_avg_vol)
+        trig = _first_formed(fine, ref_close, ref_avg_vol)
+        if prev.get("trigger"):             # once fired today, the trigger is immutable
+            trig = prev["trigger"]
+        out = {"trigger": trig, "vwap": indicators.vwap(fine)}
     except Exception:
-        return None
-    _TRIG_CACHE[key] = (t, bucket)
-    return t
+        return prev or {"trigger": None, "vwap": None}
+    _SESS_CACHE[key] = (out, bucket)
+    return out
+
+
+def _trigger_time(sym: str, ref_close: float, ref_avg_vol: float | None = None) -> str | None:
+    """Just the trigger minute (see _session_extras)."""
+    return _session_extras(sym, ref_close, ref_avg_vol).get("trigger")
 
 
 def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
@@ -686,18 +754,28 @@ def replay_board(date, time_str: str = "13:00", tf: str = "15m",
         vsurge = st_["vol_pace"]        # time-normalised (causal: 'now' = last bar ≤ cut)
         atr14 = float(uni.loc[sym, "atr14"]) if uni.loc[sym, "atr14"] == uni.loc[sym, "atr14"] else 0.0
         lv = indicators.levels(st_["ltp"], atr14, day_low=float(g["low"].min()))
-        ready = btst_readiness(pa, day_ret, rs, vsurge)
+        # replay's "today" IS this archive row, so the delivery and RS baselines must come
+        # from the PRIOR row — today's delivery is not published until ~6pm, and today's RS
+        # is added live below. (Using the through-row values would be lookahead.)
+        _dtr = uni.loc[sym, "deliv_trail_prior"]
+        dtrail = float(_dtr) if _dtr == _dtr else 0.0
+        _c9 = uni.loc[sym, "rs_cum9_prior"]
+        rs_cum = (float(_c9) + (rs / 100.0)) if (_c9 == _c9 and rs is not None) else None
+        cvwap = st_["vs_vwap"] / 100.0          # PATH SIGNATURE — close vs session VWAP
+        ready = btst_readiness(pa, day_ret, rs_cum, vsurge, cvwap)
         rows.append({
             "symbol": sym, "time": g["ts"].iloc[-1].strftime("%H:%M"),
             "entered": _first_formed(gf, pc, uni.loc[sym, "vol_med20"]),   # causal form time
             "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
             "day%": day_ret, "structure": st_["structure"], "clr": pa["clr"],
             "character": pa["character"], "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"],
+            "cvwap%": round(100 * cvwap, 2),
             "rsi7": st_["rsi7"], "rsi14": st_["rsi14"], "tone": st_["tone"],
             "vol×": round(vsurge, 2) if vsurge == vsurge else None,
-            "RS%": round(rs, 2) if rs is not None else None, "btst": f"{ready}/4",
-            "delivTr": round(float(uni.loc[sym, "deliv_trail"]), 1)
-            if uni.loc[sym, "deliv_trail"] == uni.loc[sym, "deliv_trail"] else None,
+            "RS%": round(rs, 2) if rs is not None else None,
+            "rsCum%": round(100 * rs_cum, 2) if rs_cum is not None else None,
+            "btst": f"{ready}/{BTST_LEGS}",
+            "delivTr": round(dtrail, 1) if dtrail else None,
             "entry": lv.get("entry"), "stop": lv.get("stop"),
             "t1": lv.get("t1"), "t2": lv.get("t2"),
             "s_stop": round(st_["ltp"] + atr14, 2) if atr14 > 0 else None,
@@ -705,9 +783,8 @@ def replay_board(date, time_str: str = "13:00", tf: str = "15m",
             "s_t2": round(st_["ltp"] - 2 * atr14, 2) if atr14 > 0 else None,
             "atr%": lv.get("atr%"),
             "action": ("EARNINGS" if sym in earn else _live_action(
-                pa, day_ret, rs, vsurge, risk_on, now_time=cut,
-                deliv_trail=float(uni.loc[sym, "deliv_trail"])
-                if uni.loc[sym, "deliv_trail"] == uni.loc[sym, "deliv_trail"] else 0.0)),
+                pa, day_ret, rs_cum, vsurge, risk_on, now_time=cut,
+                deliv_trail=dtrail, cvwap=cvwap)),
             "sell": _sell_action(pa, day_ret, rs, vsurge),
         })
     board = pd.DataFrame(rows)
