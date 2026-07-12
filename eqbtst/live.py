@@ -210,6 +210,13 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
     # live Nifty return for relative strength
     nifty = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
     idx_ret = _chp(nifty)
+    # REGIME GATE on TODAY's index, not yesterday's. The archive runs only through the
+    # last close, so an archive lookup would gate today's trade on yesterday's regime —
+    # not the rule the backtest validated (it gates on the signal day's OWN close). The
+    # regime flips on ~6.7% of sessions and ~7.5% of validated signals land on a flip,
+    # i.e. exactly at the turns where the gate earns its keep.
+    if date is None and nifty.get("lp"):
+        risk_on = regime.is_risk_on_live(nifty.get("lp"))
     # earnings guard: names reporting during the overnight hold can't be a BTST carry
     from . import events
     d0 = (pd.Timestamp(date) if date is not None else data.last_trading_date()).date()
@@ -495,7 +502,10 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
 
     uni = liquid_universe(date).set_index("symbol")
     q = _fetch_quotes([fy_symbol(s) for s in uni.index])
-    idx_ret = _chp(_fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {}))
+    _nf = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
+    idx_ret = _chp(_nf)
+    if date is None and _nf.get("lp"):          # gate on TODAY's index, not yesterday's
+        risk_on = regime.is_risk_on_live(_nf.get("lp"))
     # pre-filter: up on the day + closing the daily bar in the upper half
     pre = []
     for fys, v in q.items():

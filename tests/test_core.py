@@ -231,6 +231,33 @@ def test_live_signal_equals_backtested_signal():
     assert live.btst_readiness({"clr": 0.9}, 3.0, 0.05, 3.0, cvwap=None) < live.BTST_LEGS
 
 
+def test_live_regime_gate_matches_backtest():
+    """The regime gate is mandatory and load-bearing, so the LIVE gate must be the same
+    rule the backtest validated: the SIGNAL DAY's own close vs its own 50-day MA. The
+    archive only runs through yesterday, so an archive lookup gates today's trade on
+    YESTERDAY's regime — wrong on ~9% of sessions, and wrong precisely at the turns."""
+    from eqbtst import regime
+
+    # a synthetic index: flat, then a jump that crosses the MA today
+    nf = pd.DataFrame({"trade_date": pd.date_range("2025-01-01", periods=60, freq="B"),
+                       "close_val": [100.0] * 60})
+    truth = regime.nifty_regime(nf).dropna()
+    assert not truth["up"].iloc[-1]                     # flat -> not above its own MA
+
+    # TODAY closes well above the 50-day MA -> live gate must say risk-ON, even though
+    # every archived close (yesterday and before) was flat.
+    assert regime.is_risk_on_live(120.0, nf) is True
+    # TODAY closes below -> risk-OFF
+    assert regime.is_risk_on_live(80.0, nf) is False
+    # no index price -> stand aside, never a free pass
+    assert regime.is_risk_on_live(None, nf) is False
+
+    # and it reproduces the backtest exactly when fed each day's own close
+    ma50 = nf["close_val"].rolling(config.REGIME_MA).mean().iloc[-1]
+    assert regime.is_risk_on_live(float(ma50) + 1, nf) is True
+    assert regime.is_risk_on_live(float(ma50) - 1, nf) is False
+
+
 def test_long_only_locked():
     assert config.LONG_ONLY is True                  # short side proven dead (win 20%)
 
