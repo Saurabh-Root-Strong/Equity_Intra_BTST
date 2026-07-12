@@ -70,9 +70,30 @@ def market_open(now: dt.datetime | None = None) -> bool:
 
 
 # ── liquid universe (from the EOD archive's last close) ────────────────────────
+_UNI_CACHE: dict = {}          # date_key -> (frame, built_at)
+_UNI_TTL = 120.0               # seconds — the EOD universe changes once a DAY, not every 5s
+
+
+def clear_universe_cache() -> None:
+    """Drop the cached EOD universe (the dashboard's ↻ refresh calls this, so a fresh
+    nightly sync is picked up immediately rather than after the TTL)."""
+    _UNI_CACHE.clear()
+
+
 def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
     """The tradeable set + the EOD reference fields the live board needs
-    (prev_close proxy, avg daily volume baseline). One DuckDB read."""
+    (prev_close, volume baseline, ATR, trailing delivery, cumulative RS). One DuckDB read.
+
+    CACHED: this is derived from the EOD archive and changes once a DAY, but the live board
+    refreshes every 5s — uncached it re-opened DuckDB and re-scanned 40 days x 270 symbols
+    on every tick (~0.5-0.8s, i.e. ~10% of the refresh budget and ~720 archive reads/hour).
+    Returns a copy so a caller can never mutate the cached frame.
+    """
+    import time as _time
+    _key = str(pd.Timestamp(date).date()) if date is not None else "_live"
+    _hit = _UNI_CACHE.get(_key)
+    if _hit is not None and (_time.time() - _hit[1]) < _UNI_TTL:
+        return _hit[0].copy()
     date = pd.Timestamp(date) if date is not None else data.last_trading_date()
     start = (date - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
     df = data.load_eod(start=start, end=date.strftime("%Y-%m-%d")).sort_values(
@@ -112,11 +133,13 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
     last = last[last["turnover_lacs"] >= config.LIQ_MIN_LACS]
     sectors = data.load_sectors()
     last["sector"] = last["symbol"].map(lambda s: sectors.get(s, f"_{s}"))
-    return last[["symbol", "sector", "close_price", "prev_c", "vol_med20", "atr14",
-                 "deliv_trail", "deliv_trail_prior", "rs_cum9", "rs_cum9_prior",
-                 "high_price", "low_price"]].rename(
+    out = last[["symbol", "sector", "close_price", "prev_c", "vol_med20", "atr14",
+                "deliv_trail", "deliv_trail_prior", "rs_cum9", "rs_cum9_prior",
+                "high_price", "low_price"]].rename(
         columns={"close_price": "ref_close", "prev_c": "prev_close",
                  "high_price": "pdh", "low_price": "pdl"})
+    _UNI_CACHE[_key] = (out, _time.time())
+    return out.copy()
 
 
 # ── tier 1: batch quotes scan ──────────────────────────────────────────────────

@@ -78,6 +78,7 @@ date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
 if st.sidebar.button("↻ refresh"):
     st.cache_data.clear()
+    live.clear_universe_cache()      # also drop the EOD universe cache (picks up a new sync)
 test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", value=False,
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
