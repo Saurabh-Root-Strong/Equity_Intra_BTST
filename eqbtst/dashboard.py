@@ -316,8 +316,8 @@ if tf == "Intraday":
                   f"{scounts.get('SHORT', 0) + scounts.get('WEAK', 0)}")
 
         buy_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
-                    "RS%", "delivTr", "btst", "exp_ON", "band_lo", "band_hi", "entry",
-                    "stop", "t1", "t2", "risk%", "atr%", "action"]
+                    "RS%", "rsCum%", "cvwap%", "delivTr", "btst", "exp_ON", "band_lo", "band_hi",
+                    "entry", "stop", "t1", "t2", "risk%", "atr%", "action"]
         sell_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
