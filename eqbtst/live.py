@@ -256,6 +256,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
     rows = []
     _live_pc: dict = {}                    # symbol -> broker prev_close, for the trigger fetch
     _pending: dict = {}                    # symbol -> legs, for the session-VWAP (cvwap) pass
+    _vols: dict = {}                       # symbol -> today's cumulative volume
+    _hilo: dict = {}                       # symbol -> (day high, day low)
     ref = uni.set_index("symbol")
     for fys, v in q.items():
         sym = fy.get(fys)
@@ -292,9 +294,12 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         # The validated leg is the sustained leader, not a one-day burst.
         _c9 = ref.loc[sym, "rs_cum9"]
         rs_cum = (float(_c9) + (rs / 100.0)) if (_c9 == _c9 and rs is not None) else None
-        # TODAY's turnover in lacs (volume x price / 1e5) — the backtest's liquidity leg is
-        # on the SIGNAL DAY, and a footprint day's turnover far exceeds yesterday's.
-        turn_lacs = (vol * float(c)) / 1e5 if vol else 0.0
+        # TODAY's turnover in lacs. The archive's turnover_lacs is exactly
+        # volume x avg_price (the day's VWAP), so the honest universe-wide proxy from a
+        # quote is the TYPICAL price (h+l+c)/3 — median error 0.15% vs 0.39% for close.
+        # For the SHORTLIST the true session VWAP is fetched below, making the gate exact
+        # where the decision is actually made.
+        turn_lacs = (vol * (h + l + float(c)) / 3.0) / 1e5 if vol else 0.0
         liquid_ok = turn_lacs >= config.LIQ_MIN_LACS
         # cvwap (path signature) needs today's session VWAP, which a 5s quote lacks. It is
         # fetched below for the shortlist only; None here => that leg is NOT met.
@@ -305,6 +310,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         s_stop = round(float(c) + atr14, 2) if atr14 > 0 else None
         s_t1 = round(float(c) - atr14, 2) if atr14 > 0 else None
         s_t2 = round(float(c) - 2 * atr14, 2) if atr14 > 0 else None
+        _vols[sym] = vol
+        _hilo[sym] = (h, l)
         _pending[sym] = (pa, day_ret, rs_cum, vsurge, dtrail, float(c), liquid_ok)
         rows.append({
             "symbol": sym, "time": dt.datetime.now().strftime("%H:%M:%S"),
@@ -340,13 +347,20 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         # gives their EXACT trigger time: first-seen would read "when this dashboard
         # started", so opening the laptop at 13:00 would mislabel a 10:40 trigger.
         shortlist = board[board["action"].isin(["BTST-CARRY", "FORMING"])]["symbol"].tolist()
-        cvwaps, trigs, trigpx, since = {}, {}, {}, {}
+        cvwaps, trigs, trigpx, since, turns, estcl = {}, {}, {}, {}, {}, {}
         for s_ in shortlist:
             pa_, day_, rsc_, vs_, dt_, ltp_, liq_ = _pending[s_]
             ex = _session_extras(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
             vw_ = ex.get("vwap")
             cv_ = ((ltp_ - vw_) / vw_) if (vw_ and vw_ > 0) else None
             cvwaps[s_] = cv_
+            # EXACT liquidity for the names that can actually become CARRY: the archive's
+            # turnover_lacs IS volume x the day's VWAP, and we now hold that VWAP.
+            _v = _vols.get(s_)
+            if vw_ and vw_ > 0 and _v:
+                _t = (_v * vw_) / 1e5
+                turns[s_] = round(_t, 0)
+                liq_ = _t >= config.LIQ_MIN_LACS
             if ex.get("trigger"):
                 trigs[s_] = ex["trigger"]
             # move SINCE the footprint fired — has the name held/extended, or faded?
@@ -355,12 +369,36 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             if _px and _px > 0:
                 trigpx[s_] = round(_px, 2)
                 since[s_] = round(100 * (ltp_ / _px - 1), 2)
+            # ── JUDGE THE CLOSE-DECISION ON THE ESTIMATED OFFICIAL CLOSE ──────────────
+            # NSE's official close is the VWAP of 15:00-15:30, NOT the last trade — and it
+            # is the official close the EOD archive stores and the 8yr backtest gates on.
+            # Measured (38,099 stock-days): the last-30-min VWAP tracks it to 1.6 bps, the
+            # 15:30 LTP to 14.8 bps. Judging the legs on the LTP therefore evaluates a
+            # DIFFERENT price than the one that was validated. Before 15:00 no estimate
+            # exists, so the LTP stands and the board is a forecast (as it should be).
+            _c30 = ex.get("close30")
+            if _c30 and _c30 > 0:
+                _h_, _l_ = _hilo[s_]
+                _h_, _l_ = max(_h_, _c30), min(_l_, _c30)
+                if _h_ > _l_:
+                    pa_ = dict(pa_, clr=round((_c30 - _l_) / (_h_ - _l_), 3))
+                day_ = 100 * (_c30 / _live_pc[s_] - 1)
+                if vw_ and vw_ > 0:
+                    cv_ = (_c30 - vw_) / vw_
+                    cvwaps[s_] = cv_
+                estcl[s_] = round(_c30, 2)
             rdy_ = btst_readiness(pa_, day_, rsc_, vs_, cv_)
             act_ = ("EARNINGS" if s_ in earn else
                     _live_action(pa_, day_, rsc_, vs_, risk_on, deliv_trail=dt_,
                                  cvwap=cv_, liquid=liq_))
             m_ = board["symbol"] == s_
             board.loc[m_, "cvwap%"] = round(100 * cv_, 2) if cv_ is not None else None
+            if s_ in estcl:
+                board.loc[m_, "est_close"] = estcl[s_]
+                board.loc[m_, "clr"] = pa_["clr"]
+                board.loc[m_, "day%"] = round(day_, 2)
+            if s_ in turns:
+                board.loc[m_, "turn₹L"] = turns[s_]
             board.loc[m_, "btst"] = f"{rdy_}/{BTST_LEGS}"
             board.loc[m_, "action"] = act_
             board.loc[m_, "exp_ON"] = ("+0.3–0.4%" if act_ == "BTST-CARRY" else "")
@@ -403,6 +441,12 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
                 if s_ in wts:
                     board.loc[m_, "book"] = "✓ TAKE"
                     board.loc[m_, "wt%"] = round(100 * wts[s_], 1)
+                elif _mult <= 0:
+                    # NOT a concentration decision — the self-calibrator has vetoed the
+                    # whole book (edge decayed / posterior negative). Say so, or the label
+                    # would blame the sector cap for a stand-aside.
+                    board.loc[m_, "book"] = "✗ STAND ASIDE (calib)"
+                    board.loc[m_, "wt%"] = 0.0
                 else:                                # dropped by the sector cap or top-N
                     board.loc[m_, "book"] = "✗ capped"
                     board.loc[m_, "wt%"] = 0.0
@@ -563,7 +607,16 @@ def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None
         trig, trig_px = _formed_at(fine, ref_close, ref_avg_vol)
         if prev.get("trigger"):             # once fired today, the trigger is immutable
             trig, trig_px = prev["trigger"], prev.get("trig_px")
-        out = {"trigger": trig, "trig_px": trig_px, "vwap": indicators.vwap(fine)}
+        # ESTIMATE OF THE OFFICIAL CLOSE. NSE does not close at the last traded price — the
+        # official close is the VWAP of all trades in the final 30 minutes (15:00-15:30),
+        # and THAT is the number the EOD archive stores and the 8yr backtest gates on.
+        # Measured on 38,099 stock-days: the last-30-min VWAP predicts the official close to
+        # 1.6 bps, while the 15:30 LTP is off by 14.8 bps. Gating the live close-decision on
+        # the LTP therefore judges a DIFFERENT price than the one that was validated.
+        _w = fine[fine["ts"].dt.time >= dt.time(15, 0)]
+        close30 = indicators.vwap(_w) if (len(_w) and float(_w["volume"].sum()) > 0) else None
+        out = {"trigger": trig, "trig_px": trig_px,
+               "vwap": indicators.vwap(fine), "close30": close30}
     except Exception:
         return prev or _empty
     _SESS_CACHE[key] = (out, bucket)
