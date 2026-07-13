@@ -647,7 +647,7 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
     if date is None and _nf.get("lp"):          # gate on TODAY's index, not yesterday's
         risk_on = regime.is_risk_on_live(_nf.get("lp"))
     # pre-filter: up on the day + closing the daily bar in the upper half
-    pre = []
+    pre_up, pre_dn = [], []
     for fys, v in q.items():
         sym = fys.replace("NSE:", "").replace("-EQ", "")
         if sym not in uni.index:
@@ -656,12 +656,21 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         h, l = v.get("high_price"), v.get("low_price")
         if None in (c, pc, h, l) or h == l:
             continue
+        h, l = max(float(h), float(c)), min(float(l), float(c))   # broker range can lag the LTP
         day = 100 * (float(c) / float(pc) - 1)
-        clr = (float(c) - float(l)) / (float(h) - float(l))
+        clr = (float(c) - float(l)) / (float(h) - float(l)) if h > l else 0.5
+        # TWO pre-filters, one per side. The long screen admits only UP-and-strong names —
+        # and feeding the SHORT tab from that same list made it STRUCTURALLY BLIND: a name
+        # down 3% closing at its low could never appear, because the shortlist only ever
+        # contained names up >=1%. The short side gets the mirror screen (down, closing
+        # weak) so the weakness tab can actually show weakness.
         if day >= 100 * config.RET_TH and clr >= 0.5:
-            pre.append((sym, day, clr, float(pc)))     # carry the LIVE prev_close forward
-    pre.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    pre = pre[:max_names]
+            pre_up.append((sym, day, clr, float(pc)))
+        elif day <= -100 * config.RET_TH and clr <= 0.5:
+            pre_dn.append((sym, day, clr, float(pc)))
+    pre_up.sort(key=lambda x: (x[2], x[1]), reverse=True)          # strongest closes first
+    pre_dn.sort(key=lambda x: (x[2], x[1]))                        # weakest closes first
+    pre = pre_up[:max_names] + pre_dn[:max(4, max_names // 2)]
 
     rows = []
     for sym, day, _, live_pc in pre:
