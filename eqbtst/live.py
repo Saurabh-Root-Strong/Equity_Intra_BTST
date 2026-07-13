@@ -130,7 +130,15 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
     df["deliv_trail_prior"] = df.groupby("symbol")["deliv_per"].transform(
         lambda s: s.shift(1).rolling(config.DELIV_TRAIL_WIN).mean())
     last = df[df["trade_date"] == date].copy()
-    last = last[last["turnover_lacs"] >= config.LIQ_MIN_LACS]
+    # LIQUIDITY: the backtest gates on the SIGNAL DAY's turnover. When `date` is given
+    # (replay / EOD) this row IS the signal day, so filter here. But LIVE, this row is
+    # YESTERDAY — and a footprint day carries a 2x volume surge, so yesterday's turnover
+    # systematically excludes the very names that just exploded into liquidity. Measured:
+    # gating on t-1 drops 170 of 747 validated signals (23%), and those missed names average
+    # +29.3bps — the BEST ones. So live keeps the universe broad and gates on TODAY's
+    # turnover (volume x price), computed from the live quote in quotes_board.
+    if date is not None:
+        last = last[last["turnover_lacs"] >= config.LIQ_MIN_LACS]
     sectors = data.load_sectors()
     last["sector"] = last["symbol"].map(lambda s: sectors.get(s, f"_{s}"))
     out = last[["symbol", "sector", "close_price", "prev_c", "vol_med20", "atr14",
@@ -284,6 +292,10 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         # The validated leg is the sustained leader, not a one-day burst.
         _c9 = ref.loc[sym, "rs_cum9"]
         rs_cum = (float(_c9) + (rs / 100.0)) if (_c9 == _c9 and rs is not None) else None
+        # TODAY's turnover in lacs (volume x price / 1e5) — the backtest's liquidity leg is
+        # on the SIGNAL DAY, and a footprint day's turnover far exceeds yesterday's.
+        turn_lacs = (vol * float(c)) / 1e5 if vol else 0.0
+        liquid_ok = turn_lacs >= config.LIQ_MIN_LACS
         # cvwap (path signature) needs today's session VWAP, which a 5s quote lacks. It is
         # fetched below for the shortlist only; None here => that leg is NOT met.
         ready = btst_readiness(pa, day_ret, rs_cum, vsurge, cvwap=None)
@@ -293,7 +305,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         s_stop = round(float(c) + atr14, 2) if atr14 > 0 else None
         s_t1 = round(float(c) - atr14, 2) if atr14 > 0 else None
         s_t2 = round(float(c) - 2 * atr14, 2) if atr14 > 0 else None
-        _pending[sym] = (pa, day_ret, rs_cum, vsurge, dtrail, float(c))   # for the cvwap pass
+        _pending[sym] = (pa, day_ret, rs_cum, vsurge, dtrail, float(c), liquid_ok)
         rows.append({
             "symbol": sym, "time": dt.datetime.now().strftime("%H:%M:%S"),
             "sector": ref.loc[sym, "sector"], "ltp": float(c),
@@ -312,9 +324,10 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "band_lo": indicators.band(float(c), atr14).get("band_lo"),
             "band_hi": indicators.band(float(c), atr14).get("band_hi"),
             "earnings": "⚠" if sym in earn else "",
+            "turn₹L": round(turn_lacs, 0),
             "action": ("EARNINGS" if sym in earn
                        else _live_action(pa, day_ret, rs_cum, vsurge, risk_on,
-                                         deliv_trail=dtrail, cvwap=None)),
+                                         deliv_trail=dtrail, cvwap=None, liquid=liquid_ok)),
             "sell": _sell_action(pa, day_ret, rs, vsurge),
         })
     board = pd.DataFrame(rows)
@@ -329,7 +342,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         shortlist = board[board["action"].isin(["BTST-CARRY", "FORMING"])]["symbol"].tolist()
         cvwaps, trigs, trigpx, since = {}, {}, {}, {}
         for s_ in shortlist:
-            pa_, day_, rsc_, vs_, dt_, ltp_ = _pending[s_]
+            pa_, day_, rsc_, vs_, dt_, ltp_, liq_ = _pending[s_]
             ex = _session_extras(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
             vw_ = ex.get("vwap")
             cv_ = ((ltp_ - vw_) / vw_) if (vw_ and vw_ > 0) else None
@@ -344,7 +357,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
                 since[s_] = round(100 * (ltp_ / _px - 1), 2)
             rdy_ = btst_readiness(pa_, day_, rsc_, vs_, cv_)
             act_ = ("EARNINGS" if s_ in earn else
-                    _live_action(pa_, day_, rsc_, vs_, risk_on, deliv_trail=dt_, cvwap=cv_))
+                    _live_action(pa_, day_, rsc_, vs_, risk_on, deliv_trail=dt_,
+                                 cvwap=cv_, liquid=liq_))
             m_ = board["symbol"] == s_
             board.loc[m_, "cvwap%"] = round(100 * cv_, 2) if cv_ is not None else None
             board.loc[m_, "btst"] = f"{rdy_}/{BTST_LEGS}"
@@ -357,6 +371,41 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         board["entered"] = board["symbol"].map(lambda s_: trigs.get(s_) or seen.get(s_))
         board["at"] = board["symbol"].map(trigpx)          # price when it fired
         board["since%"] = board["symbol"].map(since)       # move since it fired
+
+        # ── RISK LAYER on the ACTIONABLE surface ────────────────────────────────
+        # This board is what you act on at 15:10-15:30. Until now it applied NONE of the
+        # risk controls — no sector cap, no top-N, no calibrated size — so it could show
+        # eight CARRY names, five of them one sector (a single macro bet), at full size.
+        # Those controls lived only in the EOD board, which you would not see until the
+        # NEXT day. Construct the book here, where the decision is actually made.
+        board["book"], board["wt%"] = None, None
+        carry = board[board["action"] == "BTST-CARRY"]
+        if not carry.empty:
+            from . import portfolio
+            try:                                    # cheap JSON read; never run a backtest here
+                from . import calibrate as _cal
+                _st = _cal.load_state()
+                _mult = _st["size_multiplier"] if _st else 1.0
+            except Exception:
+                _mult = 1.0
+            cand = carry.copy()
+            cand["score"] = (                        # mirrors features.conviction_score
+                cand["clr"].rank(pct=True)
+                + cand["delivTr"].rank(pct=True)
+                + cand["vol×"].clip(upper=6).rank(pct=True)
+                + cand["day%"].clip(lower=0).rank(pct=True)
+                + cand["rsCum%"].rank(pct=True))
+            cand = cand.sort_values("score", ascending=False)
+            bk = portfolio.select(cand, size_mult=_mult)
+            wts = dict(zip(bk["symbol"], bk["weight"]))
+            for s_ in cand["symbol"]:
+                m_ = board["symbol"] == s_
+                if s_ in wts:
+                    board.loc[m_, "book"] = "✓ TAKE"
+                    board.loc[m_, "wt%"] = round(100 * wts[s_], 1)
+                else:                                # dropped by the sector cap or top-N
+                    board.loc[m_, "book"] = "✗ capped"
+                    board.loc[m_, "wt%"] = 0.0
         board = board.sort_values(["action", "clr"], ascending=[True, False])
     health = archive_health(ref, q)          # is our EOD baseline the broker's baseline?
     return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "archive": health,
@@ -423,7 +472,7 @@ def _sell_action(pa: dict, day_ret: float, rs, vsurge) -> str:
 
 def _live_action(pa: dict, day_ret: float, rs_cum, vsurge, risk_on: bool,
                  now_time: "dt.time | None" = None, deliv_trail: float = 0.0,
-                 cvwap: float | None = None) -> str:
+                 cvwap: float | None = None, liquid: bool = True) -> str:
     """Honest live label with the intraday→BTST handoff.
 
     BTST-CARRY = near the close, the FULL LEAK-FREE footprint holds — the price legs
@@ -441,7 +490,7 @@ def _live_action(pa: dict, day_ret: float, rs_cum, vsurge, risk_on: bool,
     # BTST-CARRY must be the EXACT validated footprint: all BTST_LEGS price legs (incl.
     # path-signature + persistent RS) AND trailing delivery AND the regime gate AND the
     # close window. Anything looser would suggest names the 8yr backtest never blessed.
-    if ready >= BTST_LEGS and deliv_ok and near_close:
+    if ready >= BTST_LEGS and deliv_ok and near_close and liquid:
         return "BTST-CARRY"
     if ready >= BTST_LEGS - 1:
         return "FORMING"             # one leg short (often delivery or VWAP-path) — watch
