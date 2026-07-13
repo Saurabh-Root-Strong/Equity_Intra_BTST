@@ -350,7 +350,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         cvwaps, trigs, trigpx, since, turns, estcl = {}, {}, {}, {}, {}, {}
         for s_ in shortlist:
             pa_, day_, rsc_, vs_, dt_, ltp_, liq_ = _pending[s_]
-            ex = _session_extras(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
+            ex = _session_extras(s_, _live_pc[s_], ref.loc[s_, "vol_med20"],
+                                 rs_cum9=ref.loc[s_, "rs_cum9"])
             vw_ = ex.get("vwap")
             cv_ = ((ltp_ - vw_) / vw_) if (vw_ and vw_ > 0) else None
             cvwaps[s_] = cv_
@@ -580,7 +581,37 @@ def _bucket5(now: dt.datetime | None = None) -> str:
     return f"{n.hour:02d}:{(n.minute // 5) * 5:02d}"
 
 
-def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None) -> dict:
+def _nifty_prev_close() -> float | None:
+    """Nifty's previous close (archive) — the baseline for the index's intraday return."""
+    key = ("_NIFTYPC", dt.date.today(), "d")
+    if key in _SESS_CACHE:
+        return _SESS_CACHE[key]
+    try:
+        nf = data.load_nifty().sort_values("trade_date")
+        v = float(nf["close_val"].iloc[-1])
+    except Exception:
+        v = None
+    _SESS_CACHE[key] = v
+    return v
+
+
+def _rs_context(ts_index, rs_cum9) -> tuple | None:
+    """(rs_cum9, index-return-so-far at each of the stock's bars) — the running RS leg.
+    None if the index series or the archive baseline is unavailable (leg then not applied)."""
+    if rs_cum9 is None or rs_cum9 != rs_cum9:
+        return None
+    nif, npc = _index_intraday_5m(), _nifty_prev_close()
+    if nif.empty or not npc:
+        return None
+    aligned = nif.reindex(pd.Index(ts_index).union(nif.index)).sort_index().ffill()
+    aligned = aligned.reindex(pd.Index(ts_index))
+    idx_ret = (aligned.to_numpy(float) / npc) - 1.0
+    idx_ret = np.nan_to_num(idx_ret, nan=0.0)
+    return (float(rs_cum9), idx_ret)
+
+
+def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None,
+                    rs_cum9: float | None = None) -> dict:
     """Today's session facts that a 5-second QUOTE cannot give us, from the 5-min bars:
 
       trigger : WHEN the footprint first fired (5-min resolution, timeframe-independent —
@@ -604,7 +635,8 @@ def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None
         if fine.empty:
             return prev or _empty
         fine = fine[fine["ts"].dt.date == fine["ts"].dt.date.max()]     # today's 5m bars
-        trig, trig_px = _formed_at(fine, ref_close, ref_avg_vol)
+        _ctx = _rs_context(fine["ts"], rs_cum9)
+        trig, trig_px = _formed_at(fine, ref_close, ref_avg_vol, _ctx)
         if prev.get("trigger"):             # once fired today, the trigger is immutable
             trig, trig_px = prev["trigger"], prev.get("trig_px")
         # ESTIMATE OF THE OFFICIAL CLOSE. NSE does not close at the last traded price — the
@@ -695,7 +727,8 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         # resolution, INDEPENDENT of the selected timeframe. Must not come from the tf
         # bars: a 4h bar only exists at 09:15/13:15, so it could never report a 12:30
         # trigger. The timeframe governs the structure/RSI/levels read, NOT the clock.
-        _ex = _session_extras(sym, live_pc, uni.loc[sym, "vol_med20"])
+        _ex = _session_extras(sym, live_pc, uni.loc[sym, "vol_med20"],
+                              rs_cum9=uni.loc[sym, "rs_cum9"])
         entered = _ex.get("trigger")
         _tpx = _ex.get("trig_px")
         at_px = round(_tpx, 2) if _tpx else None
@@ -817,8 +850,29 @@ def _resample_ohlcv(df: pd.DataFrame, freq: str | None) -> pd.DataFrame:
     return r
 
 
+def _index_intraday_5m() -> pd.Series:
+    """Nifty's 5-min closes for TODAY, indexed by ts — for the running RS leg of the
+    trigger. Cached per 5-min bucket (one call, shared by every symbol)."""
+    key = ("_NIFTY5", dt.date.today(), _bucket5())
+    if key in _SESS_CACHE:
+        return _SESS_CACHE[key]
+    try:
+        d = fetch_intraday(config.NIFTY_FYERS.replace("NSE:", "").replace("-INDEX", ""),
+                           tf="5m", lookback_days=2)
+        if d.empty:
+            d = pd.DataFrame(columns=["ts", "close"])
+    except Exception:
+        d = pd.DataFrame(columns=["ts", "close"])
+    if not d.empty:
+        d = d[d["ts"].dt.date == d["ts"].dt.date.max()]
+    s = d.set_index("ts")["close"] if not d.empty else pd.Series(dtype=float)
+    _SESS_CACHE[key] = s
+    return s
+
+
 def _first_formed(gf: pd.DataFrame, prev_close: float,
-                  ref_avg_vol: float | None = None, _with_price: bool = False):
+                  ref_avg_vol: float | None = None, _with_price: bool = False,
+                  _rs_ctx: tuple | None = None):
     """The HH:MM the accumulation footprint FIRST formed, causally, from the fine
     intraday bars (≤ cut). Legs, all live-computable and evaluated at EVERY bar:
       up ≥ RET_TH on the day · running close-in-range ≥ CLR_TH · above running session
@@ -842,7 +896,18 @@ def _first_formed(gf: pd.DataFrame, prev_close: float,
     rng = run_hi - run_lo
     clr = np.where(rng > 0, (c - run_lo) / np.where(rng > 0, rng, 1), 0.5)     # running close-in-range
     day_ret = c / prev_close - 1.0
-    formed = (day_ret >= config.RET_TH) & (clr >= config.CLR_TH) & (c >= vwap)
+    # PATH SIGNATURE at the exact validated threshold: the signal wants the close a clear
+    # CVWAP_TH above session VWAP (trended-and-held), not merely >= VWAP. Using ">= vwap"
+    # here made `entered` fire on a LOOSER condition than the trade it claims to mark.
+    cvwap = np.where(vwap > 0, (c - vwap) / np.where(vwap > 0, vwap, 1), 0.0)
+    formed = ((day_ret >= config.RET_TH) & (clr >= config.CLR_TH)
+              & (cvwap >= config.CVWAP_TH))
+    if _rs_ctx is not None:
+        # PERSISTENT RS leg: the completed 9 sessions (from the archive) PLUS the running
+        # intraday RS at this bar (stock so far − index so far). Without it, `entered` was
+        # ignoring a leg the validated signal requires.
+        _cum9, _idx_ret_at = _rs_ctx
+        formed = formed & ((_cum9 + (day_ret - _idx_ret_at)) > config.RS_MIN)
     if ref_avg_vol and ref_avg_vol > 0:                 # volume-on-pace leg (time-normalised)
         # cumulative volume through bar i covers up to that bar's CLOSE, so the elapsed-
         # volume fraction must be read at the bar's close, not its open (ts). Using the
@@ -860,11 +925,11 @@ def _first_formed(gf: pd.DataFrame, prev_close: float,
 
 
 def _formed_at(gf: pd.DataFrame, prev_close: float,
-               ref_avg_vol: float | None = None) -> tuple:
+               ref_avg_vol: float | None = None, rs_ctx: tuple | None = None) -> tuple:
     """(HH:MM, price) of the bar where the footprint first formed — the trigger PRICE, so
     the board can show how far the name has run (or faded) SINCE it fired. (None, None) if
     it never formed."""
-    return _first_formed(gf, prev_close, ref_avg_vol, _with_price=True)
+    return _first_formed(gf, prev_close, ref_avg_vol, _with_price=True, _rs_ctx=rs_ctx)
 
 
 def replay_board(date, time_str: str = "13:00", tf: str = "15m",
@@ -938,7 +1003,8 @@ def replay_board(date, time_str: str = "13:00", tf: str = "15m",
         rs_cum = (float(_c9) + (rs / 100.0)) if (_c9 == _c9 and rs is not None) else None
         cvwap = st_["vs_vwap"] / 100.0          # PATH SIGNATURE — close vs session VWAP
         ready = btst_readiness(pa, day_ret, rs_cum, vsurge, cvwap)
-        _trg, _trgpx = _formed_at(gf, pc, uni.loc[sym, "vol_med20"])       # causal form time+price
+        _trg, _trgpx = _formed_at(gf, pc, uni.loc[sym, "vol_med20"],
+                                  _rs_context(gf["ts"], uni.loc[sym, "rs_cum9_prior"]))
         rows.append({
             "symbol": sym, "time": g["ts"].iloc[-1].strftime("%H:%M"),
             "entered": _trg,
