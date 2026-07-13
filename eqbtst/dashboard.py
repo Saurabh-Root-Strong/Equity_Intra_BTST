@@ -31,6 +31,8 @@ def _cols(df, cols):
 LIVE_COLS = {
     "symbol": st.column_config.TextColumn("symbol", help="NSE F&O stock (cash, no theta).", pinned=True),
     "bar": st.column_config.TextColumn("bar", help="Is the CURRENT candle on your selected timeframe still forming? ⏳ forming = the bar has NOT closed yet, so clr/structure/RSI can still CHANGE — the signal can REPAINT and may look different at the bar's close (on 4h that's 13:15 or 15:30). ✓ closed = the bar is done; that read is final. A trigger fired mid-candle is provisional until the bar closes."),
+    "at": st.column_config.NumberColumn("at", help="The PRICE when the footprint fired (the 'entered' bar's close). Paired with since%, it tells you what the name has done since it triggered. NOTE: this is NOT your entry — the validated BTST entry is at the CLOSE (15:15-15:25), not at the trigger.", format="%.2f"),
+    "since%": st.column_config.NumberColumn("since%", help="Move SINCE the footprint fired = (ltp / trigger-price - 1). POSITIVE = the name has HELD or EXTENDED since it triggered (the footprint is persisting — higher conviction). NEGATIVE = it has FADED since firing (the move is decaying; it may not hold into the close, and a name that fades back below VWAP loses the path-signature leg). IMPORTANT: this is NOT profit and NOT your P&L — you do not enter at the trigger. The BTST entry is near the CLOSE. Treat since% as a signal-QUALITY read (is it holding?), never as a return you captured.", format="%.2f"),
     "entered": st.column_config.TextColumn("entered", help="WHEN THE TRADE TRIGGERED — the wall-clock time (5-min resolution) the footprint FIRST fired today, INDEPENDENT of the timeframe you picked. If it fires at 12:30 while the 4h candle (09:15→13:15) is still forming, this reads 12:30 — not 09:15 or 13:15. The timeframe governs the structure/RSI/levels lens; the trigger is a clock event. (Qualification time, NOT the candle/scan timestamp.) Replay & the timeframe scans compute it CAUSALLY — the HH:MM the footprint first FORMED (up ≥1% AND closing the running session in the top of its range AND above session VWAP). The Live 5s snapshot has no intraday bars, so there it is FIRST-SEEN — the wall-clock time our scanner first saw the name qualify (accurate if the board ran from the open; later if you started the dashboard mid-session). Earlier + still holding = footprint persisted = higher conviction; just entered near the close = fresher/less proven. Blank = not currently qualifying."),
     "time": st.column_config.TextColumn("time", help="The candle the signal is on, as open→close (e.g. 13:15-15:15 = the 2h candle spanning 13:15 to 15:15). IMPORTANT: an intraday signal only CONFIRMS at the candle's CLOSE — during a live session the current candle is still forming and the signal can repaint until it closes. Live snapshot = scan time; replay = last bar at/before your cut."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
@@ -244,10 +246,10 @@ if tf == "Intraday":
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
-            long_cols = ["symbol", "entered", "time", "bar", "sector", "ltp", "day%", "structure",
+            long_cols = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%", "structure",
                          "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                          "entry", "stop", "t1", "t2", "atr%", "action"]
-            sell_cols_tf = ["symbol", "entered", "time", "bar", "sector", "ltp", "day%", "structure",
+            sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%", "structure",
                             "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                             "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
             tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
@@ -315,10 +317,10 @@ if tf == "Intraday":
         h4.metric("SELL (short/weak)",
                   f"{scounts.get('SHORT', 0) + scounts.get('WEAK', 0)}")
 
-        buy_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
+        buy_cols = ["symbol", "entered", "at", "since%", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                     "RS%", "rsCum%", "cvwap%", "delivTr", "btst", "exp_ON", "band_lo", "band_hi",
                     "entry", "stop", "t1", "t2", "risk%", "atr%", "action"]
-        sell_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
+        sell_cols = ["symbol", "entered", "at", "since%", "time", "sector", "ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
                                  "🔴 SELL (intraday short — square off same day)"])
@@ -418,10 +420,10 @@ if tf == "🎬 Replay (practice)":
     if not near_close:
         st.info(f"It's **{rtime}** — before the 15:10 window, so names show as ⏳ **FORMING** "
                 "(building). Move the slider to **15:15** to see which flip to 🌙 BTST-CARRY.")
-    buy_cols = ["symbol", "entered", "time", "sector", "ltp", "day%", "structure", "clr", "character",
+    buy_cols = ["symbol", "entered", "at", "since%", "time", "sector", "ltp", "day%", "structure", "clr", "character",
                 "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "rsCum%", "cvwap%", "btst", "entry",
                 "stop", "t1", "t2", "atr%", "action"]
-    sell_cols_r = ["symbol", "entered", "time", "sector", "ltp", "day%", "structure", "clr", "character",
+    sell_cols_r = ["symbol", "entered", "at", "since%", "time", "sector", "ltp", "day%", "structure", "clr", "character",
                    "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "entry",
                    "s_stop", "s_t1", "s_t2", "atr%", "sell"]
     rt_long, rt_short = st.tabs(["🟢 LONG (BTST-CARRY / FORMING)", "🔴 SHORT (intraday)"])

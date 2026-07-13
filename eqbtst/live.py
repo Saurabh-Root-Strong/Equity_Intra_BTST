@@ -327,7 +327,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         # gives their EXACT trigger time: first-seen would read "when this dashboard
         # started", so opening the laptop at 13:00 would mislabel a 10:40 trigger.
         shortlist = board[board["action"].isin(["BTST-CARRY", "FORMING"])]["symbol"].tolist()
-        cvwaps, trigs = {}, {}
+        cvwaps, trigs, trigpx, since = {}, {}, {}, {}
         for s_ in shortlist:
             pa_, day_, rsc_, vs_, dt_, ltp_ = _pending[s_]
             ex = _session_extras(s_, _live_pc[s_], ref.loc[s_, "vol_med20"])
@@ -336,6 +336,12 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             cvwaps[s_] = cv_
             if ex.get("trigger"):
                 trigs[s_] = ex["trigger"]
+            # move SINCE the footprint fired — has the name held/extended, or faded?
+            # NOT a P&L: the BTST entry is at the CLOSE, not at the trigger.
+            _px = ex.get("trig_px")
+            if _px and _px > 0:
+                trigpx[s_] = round(_px, 2)
+                since[s_] = round(100 * (ltp_ / _px - 1), 2)
             rdy_ = btst_readiness(pa_, day_, rsc_, vs_, cv_)
             act_ = ("EARNINGS" if s_ in earn else
                     _live_action(pa_, day_, rsc_, vs_, risk_on, deliv_trail=dt_, cvwap=cv_))
@@ -349,6 +355,8 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
                      | board["sell"].isin(["SHORT", "WEAK"])]["symbol"].tolist()
         seen = mark_first_seen(d0, qual)
         board["entered"] = board["symbol"].map(lambda s_: trigs.get(s_) or seen.get(s_))
+        board["at"] = board["symbol"].map(trigpx)          # price when it fired
+        board["since%"] = board["symbol"].map(since)       # move since it fired
         board = board.sort_values(["action", "clr"], ascending=[True, False])
     health = archive_health(ref, q)          # is our EOD baseline the broker's baseline?
     return {"ok": True, "status": ts["describe"], "risk_on": risk_on, "archive": health,
@@ -497,17 +505,18 @@ def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None
     if hit is not None and hit[1] == bucket:
         return hit[0]
     prev = hit[0] if hit else {}
+    _empty = {"trigger": None, "trig_px": None, "vwap": None}
     try:
         fine = fetch_intraday(sym, tf="5m", lookback_days=2)
         if fine.empty:
-            return prev or {"trigger": None, "vwap": None}
+            return prev or _empty
         fine = fine[fine["ts"].dt.date == fine["ts"].dt.date.max()]     # today's 5m bars
-        trig = _first_formed(fine, ref_close, ref_avg_vol)
+        trig, trig_px = _formed_at(fine, ref_close, ref_avg_vol)
         if prev.get("trigger"):             # once fired today, the trigger is immutable
-            trig = prev["trigger"]
-        out = {"trigger": trig, "vwap": indicators.vwap(fine)}
+            trig, trig_px = prev["trigger"], prev.get("trig_px")
+        out = {"trigger": trig, "trig_px": trig_px, "vwap": indicators.vwap(fine)}
     except Exception:
-        return prev or {"trigger": None, "vwap": None}
+        return prev or _empty
     _SESS_CACHE[key] = (out, bucket)
     return out
 
@@ -575,7 +584,11 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         # resolution, INDEPENDENT of the selected timeframe. Must not come from the tf
         # bars: a 4h bar only exists at 09:15/13:15, so it could never report a 12:30
         # trigger. The timeframe governs the structure/RSI/levels read, NOT the clock.
-        entered = _trigger_time(sym, live_pc, uni.loc[sym, "vol_med20"])
+        _ex = _session_extras(sym, live_pc, uni.loc[sym, "vol_med20"])
+        entered = _ex.get("trigger")
+        _tpx = _ex.get("trig_px")
+        at_px = round(_tpx, 2) if _tpx else None
+        since_pct = round(100 * (ltp / _tpx - 1), 2) if (_tpx and _tpx > 0) else None
         # is the current tf bar still FORMING? (a mid-candle trigger can repaint)
         forming = None
         if cndl is not None and len(cndl):
@@ -588,7 +601,8 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
         s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
         rows.append({
-            "symbol": sym, "entered": entered, "time": bar_time,
+            "symbol": sym, "entered": entered, "at": at_px, "since%": since_pct,
+            "time": bar_time,
             "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
             "sector": uni.loc[sym, "sector"], "ltp": ltp,
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
@@ -693,7 +707,7 @@ def _resample_ohlcv(df: pd.DataFrame, freq: str | None) -> pd.DataFrame:
 
 
 def _first_formed(gf: pd.DataFrame, prev_close: float,
-                  ref_avg_vol: float | None = None) -> str | None:
+                  ref_avg_vol: float | None = None, _with_price: bool = False):
     """The HH:MM the accumulation footprint FIRST formed, causally, from the fine
     intraday bars (≤ cut). Legs, all live-computable and evaluated at EVERY bar:
       up ≥ RET_TH on the day · running close-in-range ≥ CLR_TH · above running session
@@ -705,7 +719,7 @@ def _first_formed(gf: pd.DataFrame, prev_close: float,
     so 2.0 means 'on pace for a 2x day' at any hour, not '2x already traded' (impossible
     before the close). None if it never formed by the cut."""
     if gf is None or len(gf) == 0 or not prev_close:
-        return None
+        return (None, None) if _with_price else None
     d = gf.sort_values("ts")
     h, l, c = d["high"].to_numpy(float), d["low"].to_numpy(float), d["close"].to_numpy(float)
     v = d["volume"].to_numpy(float)
@@ -728,7 +742,18 @@ def _first_formed(gf: pd.DataFrame, prev_close: float,
         pace = np.where(frac > 0, (cv / float(ref_avg_vol)) / np.where(frac > 0, frac, 1), 0.0)
         formed = formed & (pace >= config.VOL_TH)
     idx = np.argmax(formed) if formed.any() else -1
-    return d["ts"].iloc[idx].strftime("%H:%M") if idx >= 0 else None
+    if idx < 0:
+        return (None, None) if _with_price else None
+    t = d["ts"].iloc[idx].strftime("%H:%M")
+    return (t, float(c[idx])) if _with_price else t
+
+
+def _formed_at(gf: pd.DataFrame, prev_close: float,
+               ref_avg_vol: float | None = None) -> tuple:
+    """(HH:MM, price) of the bar where the footprint first formed — the trigger PRICE, so
+    the board can show how far the name has run (or faded) SINCE it fired. (None, None) if
+    it never formed."""
+    return _first_formed(gf, prev_close, ref_avg_vol, _with_price=True)
 
 
 def replay_board(date, time_str: str = "13:00", tf: str = "15m",
@@ -802,9 +827,12 @@ def replay_board(date, time_str: str = "13:00", tf: str = "15m",
         rs_cum = (float(_c9) + (rs / 100.0)) if (_c9 == _c9 and rs is not None) else None
         cvwap = st_["vs_vwap"] / 100.0          # PATH SIGNATURE — close vs session VWAP
         ready = btst_readiness(pa, day_ret, rs_cum, vsurge, cvwap)
+        _trg, _trgpx = _formed_at(gf, pc, uni.loc[sym, "vol_med20"])       # causal form time+price
         rows.append({
             "symbol": sym, "time": g["ts"].iloc[-1].strftime("%H:%M"),
-            "entered": _first_formed(gf, pc, uni.loc[sym, "vol_med20"]),   # causal form time
+            "entered": _trg,
+            "at": round(_trgpx, 2) if _trgpx else None,
+            "since%": round(100 * (st_["ltp"] / _trgpx - 1), 2) if _trgpx else None,
             "sector": uni.loc[sym, "sector"], "ltp": st_["ltp"],
             "day%": day_ret, "structure": st_["structure"], "clr": pa["clr"],
             "character": pa["character"], "vwap": st_["vwap"], "vs_vwap%": st_["vs_vwap"],
