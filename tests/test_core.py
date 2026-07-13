@@ -258,6 +258,28 @@ def test_live_regime_gate_matches_backtest():
     assert regime.is_risk_on_live(float(ma50) - 1, nf) is False
 
 
+def test_clr_bounded_when_broker_range_lags_ltp():
+    """Seen LIVE: the broker's high/low momentarily lag the last trade, printing lp ABOVE
+    high. clr = (c-l)/(h-l) then exceeds 1.0 and SPURIOUSLY passes the >=CLR_TH strong-close
+    leg — a footprint fabricated from a stale tick. The LTP is by definition inside the day's
+    range, so the range must be reconciled to it: clr stays in [0,1]."""
+    from eqbtst import indicators as I
+
+    # raw (inconsistent) quote: lp above high -> clr > 1 and the leg would wrongly pass
+    raw = I.price_action(100.0, 102.0, 99.0, 103.0)["clr"]
+    assert raw > 1.0 and raw >= config.CLR_TH          # the bug, reproduced
+
+    # reconciled the way quotes_board now does it
+    o, h, l, c = 100.0, 102.0, 99.0, 103.0
+    h, l = max(h, c), min(l, c)
+    assert 0.0 <= I.price_action(o, h, l, c)["clr"] <= 1.0
+
+    # and the mirror case (lp below low)
+    o, h, l, c = 100.0, 102.0, 99.0, 98.0
+    h, l = max(h, c), min(l, c)
+    assert 0.0 <= I.price_action(o, h, l, c)["clr"] <= 1.0
+
+
 def test_long_only_locked():
     assert config.LONG_ONLY is True                  # short side proven dead (win 20%)
 

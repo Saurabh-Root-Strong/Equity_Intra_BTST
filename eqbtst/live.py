@@ -257,7 +257,13 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
         pc = v.get("prev_close_price") or float(ref.loc[sym, "ref_close"])
         if None in (o, h, l, c) or not pc:
             continue
-        pa = indicators.price_action(float(o), float(h), float(l), float(c))
+        o, h, l, c = float(o), float(h), float(l), float(c)
+        # The broker's high/low can momentarily LAG the last trade: we have seen lp print
+        # ABOVE high intraday, which makes clr = (c-l)/(h-l) exceed 1.0 and SPURIOUSLY pass
+        # the >=CLR_TH strong-close leg — a fabricated footprint from a stale tick. The LTP
+        # is by definition inside the day's range, so reconcile the range to it.
+        h, l = max(h, c), min(l, c)
+        pa = indicators.price_action(o, h, l, c)
         _live_pc[sym] = float(pc)          # broker prev_close (authoritative, stale-proof)
         day_ret = 100 * (float(c) / float(pc) - 1)
         rs = day_ret - idx_ret if idx_ret is not None else None
