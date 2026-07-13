@@ -162,8 +162,8 @@ TF_COLS = {
     "rsi7": st.column_config.NumberColumn("rsi7", help="Fast RSI (proactive) — turns before RSI14."),
     "rsi14": st.column_config.NumberColumn("rsi14", help="Standard Wilder RSI(14)."),
     "tone": st.column_config.TextColumn("tone", help="Momentum tone: strong / neutral / rolling-over / weak (from fast-RSI slope)."),
-    "structure": st.column_config.TextColumn("structure", help="Market structure on this timeframe (Kaufman efficiency + range logic): TREND_UP/DOWN (efficient directional), RANGE (choppy), CONSOLIDATION (range contracting — coil), BREAKOUT_UP/DOWN (beyond prior range). CONTEXT ONLY — intraday structure has no validated edge; use it to understand the tape, not as a buy/sell signal."),
-    "action": st.column_config.TextColumn("action", help="LONG = strong bar + above VWAP + RSI not weak + RS-leader, on this timeframe. AVOID = weak bar / below VWAP / regime-off. Long-only. NOTE: intraday direction has no validated overnight-grade edge — manage strictly by the stop."),
+    "structure": st.column_config.TextColumn("structure", help="Market structure on the timeframe you picked — computed over the last ~20 bars OF THAT TIMEFRAME, so it CHAINS ACROSS PRIOR DAYS (a 2h read spans ~7 trading days; a 4h read ~10). It is not today-only. Kaufman efficiency + range logic: TREND_UP/DOWN (efficient directional), RANGE (choppy), CONSOLIDATION (range contracting — coil), BREAKOUT_UP/DOWN (beyond prior range). CONTEXT ONLY — intraday structure has no validated edge; use it to understand the tape, not as a buy/sell signal."),
+    "action": st.column_config.TextColumn("action", help="STAGE-2 verdict. The stock reached this table because the 1-DAY BAR let it in (day% ≥1% and day-clr ≥0.5, top 25). THIS column is the timeframe's judgement of it: LONG = the last bar OF THIS TIMEFRAME closed strong + above session VWAP + RSI not weak + RS-leader. AVOID = weak bar / below VWAP / regime-off. Long-only. NOTE: intraday direction has no validated overnight-grade edge — manage strictly by the stop."),
 }
 
 
@@ -227,17 +227,42 @@ if tf == "Intraday":
     scan_tf = ddcol.selectbox("Timeframe → stock list",
                               ["4h", "2h", "1h", "15m", "Live snapshot"], index=1,
                               key="scan_tf",
-                              help="Live snapshot = current price-action scan (5s). "
-                                   "4h/2h/1h/15m = scan the universe on that bar timeframe. "
-                                   "NSE session is 6h15m, so a 4h bar = 9:15-13:15 then a "
-                                   "partial 13:15-15:30.")
+                              help=(
+                                  "WHAT THE TIMEFRAME ACTUALLY DOES — two stages.\n\n"
+                                  "① THE 1-DAY BAR SOURCES THE STOCKS. The whole universe "
+                                  "(~250 names) is filtered by TODAY'S OWN CANDLE: day% ≥ 1% "
+                                  "AND day-clr ≥ 0.5 (closing in the upper half of the day's "
+                                  "range). The top 25 by strength become the shortlist. "
+                                  "Nothing reaches the table unless the 1-day bar lets it in.\n\n"
+                                  "② THE TIMEFRAME JUDGES THOSE 25. Its candles — today's PLUS "
+                                  "prior days' (a 2h read spans ~15 days, a 4h read ~30) — give "
+                                  "structure (Kaufman efficiency), RSI/tone, the last bar's "
+                                  "close-strength, and the ATR that sets your stop/T1/T2. Those "
+                                  "decide LONG / NEUTRAL / AVOID.\n\n"
+                                  "SO: the timeframe NEVER SOURCES a stock — it only JUDGES and "
+                                  "STYLES one. Switch 2h→4h and you get the SAME 25 candidates, "
+                                  "re-judged, with a WIDER stop (4h ATR ≫ 15m ATR). The dropdown "
+                                  "changes your stop width and the tape view, not the stock pool.\n\n"
+                                  "NSE trades 6h15m, so a 4h bar = 09:15–13:15 then a partial "
+                                  "13:15–15:30 (only ~2 bars/day — which is why coarse frames "
+                                  "chain across prior days).\n\n"
+                                  "HONEST: this whole lane is intraday CONTEXT. Backtested at "
+                                  "every timeframe: 15m −6.2 · 1h −5.0 · 2h −5.4 · 4h −5.2 bps. "
+                                  "It loses money at every bar size. The one VALIDATED trade is "
+                                  "BTST-CARRY on the 1-day bar at 15:10–15:30 → 'Live snapshot'.")
+                              )
 
     # ---- timeframe-driven stock list (1h / 2h / 15m bars) ----------------------
     if scan_tf != "Live snapshot":
-        st.caption(f"Scanning the liquid universe on **{scan_tf} bars** — pre-filtered to "
-                   "today's up-and-strong names, then ranked by the footprint on this "
-                   "timeframe (bar close-strength · above-VWAP · RSI · RS). Long-only. "
-                   "Refresh to re-scan.")
+        st.caption(
+            f"**Two stages.** ① The **1-DAY BAR decides who is eligible** — the whole "
+            f"universe is filtered by today's own candle (day% ≥ 1% **and** day-clr ≥ 0.5), "
+            f"then the top 25 by strength become the shortlist. ② The **{scan_tf} bars then "
+            f"JUDGE those 25** — today's + prior days' candles give structure, RSI, bar "
+            f"close-strength and ATR levels → LONG / NEUTRAL / AVOID. "
+            f"**The timeframe never SOURCES a stock — it only judges and styles one.** "
+            f"Switch {scan_tf}→4h and you get the *same 25 candidates*, re-judged with a "
+            f"wider stop. Long-only. Refresh to re-scan.")
         with st.spinner(f"Scanning on {scan_tf} bars…"):
             sc = _tf_scan(scan_tf)
         if not sc["ok"] or sc["board"].empty:
