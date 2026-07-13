@@ -591,7 +591,7 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
             "symbol": sym, "entered": entered, "time": bar_time,
             "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
             "sector": uni.loc[sym, "sector"], "ltp": ltp,
-            "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["clr"],
+            "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
             "tone": s["tone"], "RS%": s.get("rs_vs_index"),
@@ -858,15 +858,18 @@ def _events_upcoming(d0) -> set:
 
 
 def _tf_action(s: dict, risk_on: bool) -> str:
-    """Action on a bar timeframe: strong bar + above VWAP + RSI not weak + RS>0."""
+    """Action on a bar timeframe: strong BAR (the last bar OF THIS TIMEFRAME — that is what
+    'bar close-strength' means; s['clr'] is the whole session's and is a different metric)
+    + above session VWAP + RSI not weak + RS>0. CONTEXT ONLY — proven -5bps at every tf."""
     if not risk_on:
         return "AVOID"
-    strong = (s["clr"] >= config.CLR_TH and s["above_vwap"]
+    bclr = s.get("bar_clr", s["clr"])
+    strong = (bclr >= config.CLR_TH and s["above_vwap"]
               and s["tone"] in ("strong", "neutral")
               and (s.get("rs_vs_index") is None or s["rs_vs_index"] > 0))
     if strong:
         return "LONG"
-    if s["clr"] <= 0.33 or not s["above_vwap"]:
+    if bclr <= 0.33 or not s["above_vwap"]:
         return "AVOID"
     return "NEUTRAL"
 
@@ -895,7 +898,13 @@ def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
     if c.empty:
         return {}
     today = c[c["ts"].dt.date == c["ts"].dt.date.max()]     # today's session for VWAP/clr
-    session = today if len(today) >= 2 else c
+    # Use TODAY's bars whenever there is at least one. The old `len(today) >= 2 else c`
+    # fallback silently swapped in the FULL MULTI-DAY frame — and on 4h today holds just
+    # ONE bar until 13:15 (2h until 11:15), so every morning clr/VWAP were computed over
+    # ~30 DAYS: "clr" became position in the 30-day range and "above_vwap" meant above the
+    # 30-day VWAP. The list then selected "stocks near a 30-day high" while the UI claimed
+    # "bar close-strength · above-VWAP". One bar is enough for both.
+    session = today if len(today) >= 1 else c
     pc = ref_close if ref_close else float(c["close"].iloc[0])
     state = indicators.live_state(session, pc, ref_avg_vol,
                                   (idx_ret / 100.0) if idx_ret is not None else None)
@@ -908,6 +917,12 @@ def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
     _rs = indicators.rsi_state(c["close"].to_numpy(float))
     state["rsi7"], state["rsi14"] = _rs["rsi7"], _rs["rsi14"]
     state["slope"], state["tone"] = _rs["slope"], _rs["tone"]
+    # TRUE bar close-strength: the LAST bar OF THE CHOSEN TIMEFRAME. state["clr"] is the
+    # close-in-range of today's whole SESSION (the BTST metric) — a different thing. The
+    # tf table's column and caption both promise "bar close-strength", so compute it.
+    _b = c.iloc[-1]
+    _rng = float(_b["high"]) - float(_b["low"])
+    state["bar_clr"] = round((float(_b["close"]) - float(_b["low"])) / _rng, 3) if _rng > 0 else 0.5
     atr_tf = indicators.atr(c, 14)                          # ATR on the chosen timeframe
     lv = indicators.levels(state["ltp"], atr_tf,
                            day_low=float(session["low"].min()),
