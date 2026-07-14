@@ -27,6 +27,20 @@ def _cols(df, cols):
     that predates a new column (e.g. 'entered'), so a missing column never crashes."""
     return [c for c in cols if c in df.columns]
 
+
+def _fmt(df):
+    """Render-time tidy-up. A name can sit in the timeframe list (it passed the tf verdict)
+    while NEVER having fired the BTST footprint — so entered / at / since% are genuinely
+    absent, not broken. Python's None then printed as the literal string 'None', which reads
+    like a bug rather than an answer. Show '—' (nothing fired) and leave the numerics blank."""
+    d = df.copy()
+    if "entered" in d.columns:
+        d["entered"] = d["entered"].where(d["entered"].notna(), "—")
+    for c in ("at", "since%", "cvwap%", "rsCum%", "est_close", "vol×", "turn₹L", "wt%"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")   # None -> NaN -> renders blank
+    return d
+
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
 LIVE_COLS = {
     "symbol": st.column_config.TextColumn("symbol", help="NSE F&O stock (cash, no theta).", pinned=True),
@@ -34,7 +48,7 @@ LIVE_COLS = {
     "est_close": st.column_config.NumberColumn("est_close", help="ESTIMATE OF THE OFFICIAL CLOSING PRICE — this is the number the decision is judged on, not the LTP. NSE does NOT close at the last traded price: the official close is the VOLUME-WEIGHTED AVERAGE of all trades in the final 30 minutes (15:00-15:30), and THAT is what the EOD archive stores and what the 8-year backtest gated on. Measured on 38,099 stock-days: the last-30-min VWAP tracks the official close to 1.6 bps, while the 15:30 last-traded price is off by 14.8 bps. So from 15:00 onward, clr / day% / cvwap% are recomputed on this estimate — judging them on the LTP would evaluate a DIFFERENT price than the one that was validated. Blank before 15:00 (no closing window yet, so the LTP stands and the board is a forecast).", format="%.2f"),
     "at": st.column_config.NumberColumn("at", help="The PRICE when the footprint fired (the 'entered' bar's close). Paired with since%, it tells you what the name has done since it triggered. NOTE: this is NOT your entry — the validated BTST entry is at the CLOSE (15:15-15:25), not at the trigger.", format="%.2f"),
     "since%": st.column_config.NumberColumn("since%", help="Move SINCE the footprint fired = (ltp / trigger-price - 1). POSITIVE = the name has HELD or EXTENDED since it triggered (the footprint is persisting — higher conviction). NEGATIVE = it has FADED since firing (the move is decaying; it may not hold into the close, and a name that fades back below VWAP loses the path-signature leg). IMPORTANT: this is NOT profit and NOT your P&L — you do not enter at the trigger. The BTST entry is near the CLOSE. Treat since% as a signal-QUALITY read (is it holding?), never as a return you captured.", format="%.2f"),
-    "entered": st.column_config.TextColumn("entered", help="WHEN THE TRADE TRIGGERED — the wall-clock time (5-min resolution) the footprint FIRST fired today, INDEPENDENT of the timeframe you picked. If it fires at 12:30 while the 4h candle (09:15→13:15) is still forming, this reads 12:30 — not 09:15 or 13:15. The timeframe governs the structure/RSI/levels lens; the trigger is a clock event. (Qualification time, NOT the candle/scan timestamp.) Replay & the timeframe scans compute it CAUSALLY — the HH:MM the footprint first FORMED (up ≥1% AND closing the running session in the top of its range AND above session VWAP). The Live 5s snapshot has no intraday bars, so there it is FIRST-SEEN — the wall-clock time our scanner first saw the name qualify (accurate if the board ran from the open; later if you started the dashboard mid-session). Earlier + still holding = footprint persisted = higher conviction; just entered near the close = fresher/less proven. Blank = not currently qualifying."),
+    "entered": st.column_config.TextColumn("entered", help="WHEN THE TRADE TRIGGERED — the wall-clock time (5-min resolution) the footprint FIRST fired today, INDEPENDENT of the timeframe you picked. If it fires at 12:30 while the 4h candle (09:15→13:15) is still forming, this reads 12:30 — not 09:15 or 13:15. The timeframe governs the structure/RSI/levels lens; the trigger is a clock event. (Qualification time, NOT the candle/scan timestamp.) Replay & the timeframe scans compute it CAUSALLY — the HH:MM the footprint first FORMED (up ≥1% AND closing the running session in the top of its range AND above session VWAP). The Live 5s snapshot has no intraday bars, so there it is FIRST-SEEN — the wall-clock time our scanner first saw the name qualify (accurate if the board ran from the open; later if you started the dashboard mid-session). Earlier + still holding = footprint persisted = higher conviction; just entered near the close = fresher/less proven. A DASH (—) means the validated footprint has NOT fired for this name today — it is in the timeframe list because it passed the (unvalidated) tf verdict, not because it formed the BTST footprint. Most often it is the VOLUME leg that fails: a name can be up 2.5%, closing strong and above VWAP on merely ordinary volume — price without participation is not accumulation."),
     "time": st.column_config.TextColumn("time", help="The candle the signal is on, as open→close (e.g. 13:15-15:15 = the 2h candle spanning 13:15 to 15:15). IMPORTANT: an intraday signal only CONFIRMS at the candle's CLOSE — during a live session the current candle is still forming and the signal can repaint until it closes. Live snapshot = scan time; replay = last bar at/before your cut."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
     "ltp": st.column_config.NumberColumn("ltp", help="Last-traded price (Fyers) — LIVE, refreshed every 5s on every tab (one batch quote). In the TIMEFRAME tables a two-tier refresh runs: the price and everything cheap that hangs off it (day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the LONG/AVOID verdict itself) all re-derive on the live price every 5s. Only the CANDLE-derived columns (structure, RSI, tone) stay as-of the last scan — they need ~70 /history calls and only change when a BAR CLOSES anyway (on 4h, twice a day). Their age is stamped above the table; ↻ refresh to re-pull the candles.", format="%.2f"),
@@ -328,7 +342,7 @@ if tf == "Intraday":
                 with tb:
                     lo = bb[bb["action"] == "LONG"]
                     _lo = lo if not lo.empty else bb
-                    st.dataframe(_lo[_cols(_lo, long_cols)],
+                    st.dataframe(_fmt(_lo)[_cols(_lo, long_cols)],
                                  use_container_width=True, hide_index=True,
                                  column_config={**LIVE_COLS, **TF_COLS})
                     if lo.empty:
@@ -342,7 +356,7 @@ if tf == "Intraday":
                     if sh.empty:
                         st.caption("No distribution/weakness names on this timeframe.")
                     else:
-                        st.dataframe(sh[_cols(sh, sell_cols_tf)], use_container_width=True,
+                        st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                      hide_index=True,
                                      column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
 
@@ -411,18 +425,18 @@ if tf == "Intraday":
             else:
                 st.success(f"{len(carry)} name(s) ready to carry overnight — act 15:15–15:30, "
                            "exit next 09:15–09:30.")
-                st.dataframe(carry[_cols(carry, buy_cols)], use_container_width=True, hide_index=True,
+                st.dataframe(_fmt(carry)[_cols(carry, buy_cols)], use_container_width=True, hide_index=True,
                              column_config=LIVE_COLS)
             # ⏳ FORMING — watch list, may flip to CARRY near the close
             st.markdown("#### ⏳ FORMING — building (watch)")
             if forming.empty:
                 b = bd.sort_values("clr", ascending=False).head(10)
                 st.caption("No footprint building yet — top-10 by close-strength meanwhile:")
-                st.dataframe(b[_cols(b, buy_cols)], use_container_width=True, hide_index=True,
+                st.dataframe(_fmt(b)[_cols(b, buy_cols)], use_container_width=True, hide_index=True,
                              column_config=LIVE_COLS)
             else:
                 st.caption(f"{len(forming)} building — may flip to 🌙 BTST-CARRY near the close.")
-                st.dataframe(forming[_cols(forming, buy_cols)], use_container_width=True, hide_index=True,
+                st.dataframe(_fmt(forming)[_cols(forming, buy_cols)], use_container_width=True, hide_index=True,
                              column_config=LIVE_COLS)
         with t_sell:
             st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Holding "
@@ -434,7 +448,7 @@ if tf == "Intraday":
             if s.empty:
                 st.caption("No distribution/weakness names live right now.")
             else:
-                st.dataframe(s[_cols(s, sell_cols)], use_container_width=True, hide_index=True,
+                st.dataframe(_fmt(s)[_cols(s, sell_cols)], use_container_width=True, hide_index=True,
                              column_config={**LIVE_COLS, **SELL_COLS})
         st.caption(f"updated {dt.datetime.now():%H:%M:%S} • hover any header for what+why. "
                    "VWAP · RSI7/14 · tone appear in the table when you pick a 1h/2h/15m "
@@ -507,7 +521,7 @@ if tf == "🎬 Replay (practice)":
         if long_side.empty:
             st.caption("None building at this time — top-10 by close-strength so far:")
             long_side = bd.sort_values("clr", ascending=False).head(10)
-        st.dataframe(long_side[_cols(long_side, buy_cols)], use_container_width=True, hide_index=True,
+        st.dataframe(_fmt(long_side)[_cols(long_side, buy_cols)], use_container_width=True, hide_index=True,
                      column_config={**LIVE_COLS, **TF_COLS})
         st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
                    "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone point-in-time.")
@@ -519,7 +533,7 @@ if tf == "🎬 Replay (practice)":
             st.caption("No distribution/weakness names at this time.")
         else:
             _c = [c for c in sell_cols_r if c in sh.columns]
-            st.dataframe(sh[_c], use_container_width=True, hide_index=True,
+            st.dataframe(_fmt(sh)[_c], use_container_width=True, hide_index=True,
                          column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
     st.stop()
 # ── BTST board ─────────────────────────────────────────────────────────────────
