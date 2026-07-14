@@ -231,19 +231,28 @@ if tf == "Intraday":
                               help=(
                                   "WHAT THE TIMEFRAME ACTUALLY DOES — two stages.\n\n"
                                   "① THE 1-DAY BAR SOURCES THE STOCKS. The whole universe "
-                                  "(~250 names) is filtered by TODAY'S OWN CANDLE: day% ≥ 1% "
-                                  "AND day-clr ≥ 0.5 (closing in the upper half of the day's "
-                                  "range). The top 25 by strength become the shortlist. "
-                                  "Nothing reaches the table unless the 1-day bar lets it in.\n\n"
-                                  "② THE TIMEFRAME JUDGES THOSE 25. Its candles — today's PLUS "
+                                  "(~250 names) is screened on TODAY'S OWN CANDLE, TWICE:\n"
+                                  "   • LONG screen  — day% ≥ +1% AND day-clr ≥ 0.5 → top 25 "
+                                  "by strength\n"
+                                  "   • SHORT screen — day% ≤ −1% AND day-clr ≤ 0.5 → top 12 "
+                                  "by weakness\n"
+                                  "Both must clear the ₹20cr turnover floor (a level you "
+                                  "cannot get filled at is worse than no level). Nothing "
+                                  "reaches the table unless the 1-day bar lets it in.\n\n"
+                                  "② THE TIMEFRAME JUDGES THEM. Its candles — today's PLUS "
                                   "prior days' (a 2h read spans ~15 days, a 4h read ~30) — give "
                                   "structure (Kaufman efficiency), RSI/tone, the last bar's "
                                   "close-strength, and the ATR that sets your stop/T1/T2. Those "
                                   "decide LONG / NEUTRAL / AVOID.\n\n"
                                   "SO: the timeframe NEVER SOURCES a stock — it only JUDGES and "
-                                  "STYLES one. Switch 2h→4h and you get the SAME 25 candidates, "
+                                  "STYLES one. Switch 2h→4h and you get the SAME candidates, "
                                   "re-judged, with a WIDER stop (4h ATR ≫ 15m ATR). The dropdown "
                                   "changes your stop width and the tape view, not the stock pool.\n\n"
+                                  "TWO CLOCKS in this table. LIVE every 5s (one batch quote): "
+                                  "ltp, day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the "
+                                  "VERDICT itself. AS-OF THE LAST SCAN: structure, rsi, tone — "
+                                  "they need ~70 /history calls and only move when a BAR CLOSES "
+                                  "anyway. Their age is stamped above the table.\n\n"
                                   "NSE trades 6h15m, so a 4h bar = 09:15–13:15 then a partial "
                                   "13:15–15:30 (only ~2 bars/day — which is why coarse frames "
                                   "chain across prior days).\n\n"
@@ -256,14 +265,14 @@ if tf == "Intraday":
     # ---- timeframe-driven stock list (1h / 2h / 15m bars) ----------------------
     if scan_tf != "Live snapshot":
         st.caption(
-            f"**Two stages.** ① The **1-DAY BAR decides who is eligible** — the whole "
-            f"universe is filtered by today's own candle (day% ≥ 1% **and** day-clr ≥ 0.5), "
-            f"then the top 25 by strength become the shortlist. ② The **{scan_tf} bars then "
-            f"JUDGE those 25** — today's + prior days' candles give structure, RSI, bar "
-            f"close-strength and ATR levels → LONG / NEUTRAL / AVOID. "
-            f"**The timeframe never SOURCES a stock — it only judges and styles one.** "
-            f"Switch {scan_tf}→4h and you get the *same 25 candidates*, re-judged with a "
-            f"wider stop. Long-only. Refresh to re-scan.")
+            f"**Two stages.** ① The **1-DAY BAR sources the stocks** — the whole universe is "
+            f"screened on today's own candle, **twice**: the LONG screen takes `day% ≥ +1% "
+            f"AND day-clr ≥ 0.5` (top 25 by strength), the SHORT screen takes the mirror "
+            f"`day% ≤ −1% AND day-clr ≤ 0.5` (top 12 by weakness). Both must clear the "
+            f"₹20cr turnover floor. ② The **{scan_tf} candles then JUDGE them** — "
+            f"today's + prior days' bars give structure / RSI / tone, and the ATR that sets "
+            f"your stop. **The timeframe never SOURCES a stock — it only judges and styles "
+            f"one.** Switch {scan_tf}→4h: *same candidates*, re-judged, wider stop.")
         with st.spinner(f"Scanning on {scan_tf} bars…"):
             sc = _tf_scan(scan_tf)
         if not sc["ok"] or sc["board"].empty:
@@ -286,8 +295,12 @@ if tf == "Intraday":
                         f"{_sa:%H:%M}). Prices, levels and the verdict are live (5s), but the "
                         "CANDLE-derived columns need a re-pull. Hit **↻ refresh**.")
                 else:
-                    st.caption(f"structure/RSI scanned **{_sa:%H:%M:%S}** ({int(_age)}s ago) "
-                               "— ↻ refresh to re-scan the candles.")
+                    st.caption(
+                        f"🕒 **Two clocks.** LIVE every 5s: `ltp` · `day%` · `RS%` · "
+                        f"`bar_clr` · `vs_vwap%` · `entry/stop/T1/T2` · **the verdict**. "
+                        f"As-of the **{_sa:%H:%M:%S}** scan ({int(_age)}s ago): `structure` · "
+                        f"`rsi` · `tone` — these need candles and only move when a bar closes. "
+                        "↻ refresh to re-pull them.")
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
