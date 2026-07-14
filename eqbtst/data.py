@@ -21,7 +21,23 @@ def _connect() -> duckdb.DuckDBPyConnection:
             f"DCM archive not found at {config.DCM_DUCKDB}. "
             "This system reads the Daily_Cash_Market DuckDB EOD spine."
         )
-    return duckdb.connect(str(config.DCM_DUCKDB), read_only=True)
+    try:
+        return duckdb.connect(str(config.DCM_DUCKDB), read_only=True)
+    except duckdb.IOException as e:
+        # DuckDB allows many readers OR one writer — never both. So any process holding the
+        # file read-write (the Daily_Cash_Market dashboard, its nightly sync) locks EVERY
+        # other process out, even read-only ones. The raw error names a PID and nothing else,
+        # which reads like corruption. Say what it actually is and how to clear it.
+        if "being used by another process" in str(e) or "lock" in str(e).lower():
+            raise RuntimeError(
+                "The DCM archive is LOCKED by another process — most likely the "
+                "Daily_Cash_Market dashboard (it opens the DuckDB read-write, and DuckDB "
+                "permits many readers OR one writer, never both).\n"
+                "  FIX: close the Daily_Cash_Market app (or its nightly sync), then ↻ refresh.\n"
+                "  This board is READ-ONLY and never writes to that archive.\n"
+                f"  ({e})"
+            ) from e
+        raise
 
 
 @functools.lru_cache(maxsize=1)
