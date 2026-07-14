@@ -1082,12 +1082,16 @@ def _tf_action(s: dict, risk_on: bool) -> str:
 def _tf_sell_action(s: dict, risk_on: bool) -> str:
     """SHORT side on a bar timeframe (INTRADAY ONLY, unvalidated): weak bar + below
     VWAP + RSI weak/rolling + RS-laggard. Square off same day."""
-    weak = (s["clr"] <= (1 - config.CLR_TH) and not s["above_vwap"]
+    # Read the SAME metric the long side does — the last bar OF THIS TIMEFRAME. Using the
+    # session's clr here while _tf_action uses bar_clr put two different quantities in one
+    # table under one timeframe column, so the SHORT verdict was not a timeframe read at all.
+    bclr = s.get("bar_clr", s["clr"])
+    weak = (bclr <= (1 - config.CLR_TH) and not s["above_vwap"]
             and s["tone"] in ("weak", "rolling-over")
             and (s.get("rs_vs_index") is None or s["rs_vs_index"] < 0))
     if weak:
         return "SHORT"
-    if s["clr"] <= 0.4 and not s["above_vwap"]:
+    if bclr <= 0.4 and not s["above_vwap"]:
         return "WEAK"
     return "—"
 
