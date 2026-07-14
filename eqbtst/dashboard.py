@@ -288,9 +288,8 @@ if tf == "Intraday":
                         f"frozen at the {_sa:%H:%M} price — they are **not live** and may be far "
                         "from the market. Hit **↻ refresh** to re-scan.")
                 else:
-                    st.caption(f"📸 snapshot · scanned **{_sa:%H:%M:%S}** "
-                               f"({int(_age)}s ago) — this table does NOT auto-refresh; "
-                               "↻ refresh to re-scan.")
+                    st.caption(f"structure/RSI scanned **{_sa:%H:%M:%S}** ({int(_age)}s ago) "
+                               "— ↻ refresh to re-scan the candles.")
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
@@ -300,26 +299,43 @@ if tf == "Intraday":
             sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%", "structure",
                             "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                             "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
-            tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
-            with tb:
-                lo = b[b["action"] == "LONG"]
-                _lo = lo if not lo.empty else b
-                st.dataframe(_lo[_cols(_lo, long_cols)],
-                             use_container_width=True, hide_index=True,
-                             column_config={**LIVE_COLS, **TF_COLS})
-                if lo.empty:
-                    st.caption("No LONG on this timeframe — showing the shortlist.")
-            with ts:
-                st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** "
-                           "Overnight short is proven -EV (win 20%); intraday direction "
-                           "has no validated edge either. Weakness screen, not alpha — "
-                           "trade small, manage by s_stop.")
-                sh = b[b["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
-                if sh.empty:
-                    st.caption("No distribution/weakness names on this timeframe.")
-                else:
-                    st.dataframe(sh[_cols(sh, sell_cols_tf)], use_container_width=True, hide_index=True,
-                                 column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
+
+            # ── TWO-TIER REFRESH ────────────────────────────────────────────────────
+            # The heavy half (structure / RSI / tone / bar_clr) only changes when a BAR
+            # CLOSES — on 4h, twice a day — and costs ~70 /history calls. The cheap half
+            # (price, and every level anchored to it) changes every tick and costs ONE
+            # batch quote. Freezing the whole table froze the wrong half: it pinned a
+            # precise-looking entry/stop/T1/T2 to a price that had stopped moving.
+            # So: prices tick here every 5s; structure stays as-of the stamped scan.
+            @st.fragment(run_every="5s")
+            def _tf_panel():
+                bb = live.refresh_prices(b) if live.market_open() else b
+                st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure as-of "
+                           f"{_sa:%H:%M}" if (_sa and live.market_open())
+                           else "market closed — last-session values")
+                tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
+                with tb:
+                    lo = bb[bb["action"] == "LONG"]
+                    _lo = lo if not lo.empty else bb
+                    st.dataframe(_lo[_cols(_lo, long_cols)],
+                                 use_container_width=True, hide_index=True,
+                                 column_config={**LIVE_COLS, **TF_COLS})
+                    if lo.empty:
+                        st.caption("No LONG on this timeframe — showing the shortlist.")
+                with ts:
+                    st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** "
+                               "Overnight short is proven -EV (win 20%); intraday direction "
+                               "has no validated edge either. Weakness screen, not alpha — "
+                               "trade small, manage by s_stop.")
+                    sh = bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
+                    if sh.empty:
+                        st.caption("No distribution/weakness names on this timeframe.")
+                    else:
+                        st.dataframe(sh[_cols(sh, sell_cols_tf)], use_container_width=True,
+                                     hide_index=True,
+                                     column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
+
+            _tf_panel()
             st.caption("Entry/Stop/T1/T2 = ATR risk geometry on this timeframe, NOT a "
                        "forecast. Long-only is the validated edge; SHORT is intraday context.")
         st.stop()

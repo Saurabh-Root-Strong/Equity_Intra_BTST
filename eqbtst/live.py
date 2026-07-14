@@ -765,6 +765,10 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
             "t1": lv.get("t1"), "t2": lv.get("t2"),
             "s_stop": s_stop, "s_t1": s_t1, "s_t2": s_t2, "atr%": lv.get("atr%"),
             "action": _tf_action(s, risk_on), "sell": _tf_sell_action(s, risk_on),
+            # kept for the CHEAP price refresh (below): the ATR and the day's baseline are
+            # what the levels are built from, and neither changes tick-to-tick.
+            "_atr_tf": atr_tf, "_pc": live_pc, "_daylow": float(cndl["low"].min())
+            if (cndl is not None and len(cndl)) else None,
         })
     board = pd.DataFrame(rows)
     if not board.empty:
@@ -847,6 +851,40 @@ def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
         _REPLAY_CACHE.mkdir(parents=True, exist_ok=True)
         out.to_parquet(cache, index=False)
     return out
+
+
+def refresh_prices(board: pd.DataFrame) -> pd.DataFrame:
+    """TIER-1 refresh of a tf_scan board: ONE batch quote → live ltp / day% and the ATR
+    levels rebuilt on that live price. Cheap enough to run every few seconds.
+
+    Why this exists: in the tf table the EXPENSIVE half (structure, RSI, tone, bar_clr —
+    ~70 /history calls) only changes when a BAR CLOSES (on 4h, twice a day), while the
+    CHEAP half (price, and every level anchored to it) changes every tick. Freezing the
+    whole table froze the wrong half: it left a precise-looking entry/stop/T1/T2 pinned to
+    a price that had stopped moving. Structure stays as-of the last scan (stamped); the
+    price and the levels track the market."""
+    if board is None or board.empty or "_atr_tf" not in board.columns:
+        return board
+    b = board.copy()
+    q = _fetch_quotes([fy_symbol(s) for s in b["symbol"]])
+    for i, r in b.iterrows():
+        v = q.get(fy_symbol(r["symbol"]))
+        if not v or not v.get("lp"):
+            continue
+        ltp = float(v["lp"])
+        pc = v.get("prev_close_price") or r.get("_pc")
+        atr = float(r.get("_atr_tf") or 0)
+        b.at[i, "ltp"] = round(ltp, 2)
+        if pc:
+            b.at[i, "day%"] = round(100 * (ltp / float(pc) - 1), 2)
+        if atr > 0:
+            lv = indicators.levels(ltp, atr, day_low=r.get("_daylow"))
+            for k in ("entry", "stop", "t1", "t2", "atr%"):
+                b.at[i, k] = lv.get(k)
+            b.at[i, "s_stop"] = round(ltp + atr, 2)      # mirror geometry for the short side
+            b.at[i, "s_t1"] = round(ltp - atr, 2)
+            b.at[i, "s_t2"] = round(ltp - 2 * atr, 2)
+    return b
 
 
 _REPLAY_TF = {"15m": None, "1h": "60min", "2h": "120min", "4h": "240min"}
