@@ -888,6 +888,11 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
         b.at[i, "ltp"] = round(ltp, 2)
         day = 100 * (ltp / float(pc) - 1) if pc else r.get("day%")
         b.at[i, "day%"] = round(day, 2) if day is not None else None
+        # since% is DERIVED from ltp — if the price ticks and this does not, the column
+        # silently contradicts the two numbers sitting beside it (at, ltp).
+        _at = r.get("at")
+        if _at and float(_at) > 0:
+            b.at[i, "since%"] = round(100 * (ltp / float(_at) - 1), 2)
         if atr > 0:
             lv = indicators.levels(ltp, atr, day_low=r.get("_daylow"))
             for k in ("entry", "stop", "t1", "t2", "atr%"):
