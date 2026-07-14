@@ -765,10 +765,15 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
             "t1": lv.get("t1"), "t2": lv.get("t2"),
             "s_stop": s_stop, "s_t1": s_t1, "s_t2": s_t2, "atr%": lv.get("atr%"),
             "action": _tf_action(s, risk_on), "sell": _tf_sell_action(s, risk_on),
-            # kept for the CHEAP price refresh (below): the ATR and the day's baseline are
-            # what the levels are built from, and neither changes tick-to-tick.
-            "_atr_tf": atr_tf, "_pc": live_pc, "_daylow": float(cndl["low"].min())
-            if (cndl is not None and len(cndl)) else None,
+            # Carried for the CHEAP tier-1 refresh: everything the LEVELS and the VERDICT
+            # are built from that does NOT change tick-to-tick. With these on the row, one
+            # batch quote can rebuild bar_clr / vs_vwap / RS / action — so the table never
+            # shows a live price beside a stale LONG.
+            "_atr_tf": atr_tf, "_pc": live_pc,
+            "_daylow": float(cndl["low"].min()) if (cndl is not None and len(cndl)) else None,
+            "_bar_h": float(cndl["high"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
+            "_bar_l": float(cndl["low"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
+            "_vwap": s.get("vwap"),
         })
     board = pd.DataFrame(rows)
     if not board.empty:
@@ -853,20 +858,26 @@ def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
     return out
 
 
-def refresh_prices(board: pd.DataFrame) -> pd.DataFrame:
-    """TIER-1 refresh of a tf_scan board: ONE batch quote → live ltp / day% and the ATR
-    levels rebuilt on that live price. Cheap enough to run every few seconds.
+def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
+    """TIER-1 refresh of a tf_scan board from ONE batch quote: live ltp / day% / RS, the
+    ATR levels rebuilt on that price, AND the VERDICT recomputed.
 
-    Why this exists: in the tf table the EXPENSIVE half (structure, RSI, tone, bar_clr —
-    ~70 /history calls) only changes when a BAR CLOSES (on 4h, twice a day), while the
-    CHEAP half (price, and every level anchored to it) changes every tick. Freezing the
-    whole table froze the wrong half: it left a precise-looking entry/stop/T1/T2 pinned to
-    a price that had stopped moving. Structure stays as-of the last scan (stamped); the
-    price and the levels track the market."""
+    Why this exists: in the tf table the EXPENSIVE half (structure, RSI, tone — ~70
+    /history calls) only changes when a BAR CLOSES (on 4h, twice a day), while the CHEAP
+    half changes every tick. Freezing the whole table froze the wrong half.
+
+    Why the verdict is recomputed too: a live price beside a stale LONG is worse than a
+    stale table. A name flagged LONG at 10:02 can slide under VWAP by 10:45 — and it would
+    still have read LONG, now next to a live (lower) price, which is exactly what an
+    actionable signal looks like. bar_clr, vs_vwap and RS all rebuild from the quote (the
+    bar's high/low and the session VWAP are carried on the row), so the gate is honest.
+    RSI/tone/structure still need candles and stay as-of the scan — they are slow-moving
+    and the table stamps their age."""
     if board is None or board.empty or "_atr_tf" not in board.columns:
         return board
     b = board.copy()
     q = _fetch_quotes([fy_symbol(s) for s in b["symbol"]])
+    idx_ret = _chp(_fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {}))
     for i, r in b.iterrows():
         v = q.get(fy_symbol(r["symbol"]))
         if not v or not v.get("lp"):
@@ -875,8 +886,8 @@ def refresh_prices(board: pd.DataFrame) -> pd.DataFrame:
         pc = v.get("prev_close_price") or r.get("_pc")
         atr = float(r.get("_atr_tf") or 0)
         b.at[i, "ltp"] = round(ltp, 2)
-        if pc:
-            b.at[i, "day%"] = round(100 * (ltp / float(pc) - 1), 2)
+        day = 100 * (ltp / float(pc) - 1) if pc else r.get("day%")
+        b.at[i, "day%"] = round(day, 2) if day is not None else None
         if atr > 0:
             lv = indicators.levels(ltp, atr, day_low=r.get("_daylow"))
             for k in ("entry", "stop", "t1", "t2", "atr%"):
@@ -884,6 +895,29 @@ def refresh_prices(board: pd.DataFrame) -> pd.DataFrame:
             b.at[i, "s_stop"] = round(ltp + atr, 2)      # mirror geometry for the short side
             b.at[i, "s_t1"] = round(ltp - atr, 2)
             b.at[i, "s_t2"] = round(ltp - 2 * atr, 2)
+
+        # ── rebuild the VERDICT's cheap inputs, then the verdict itself ──────────────
+        bh, bl, vw = r.get("_bar_h"), r.get("_bar_l"), r.get("_vwap")
+        st_ = {"tone": r.get("tone"), "clr": r.get("bar_clr")}
+        if bh and bl:                       # the forming bar's range must include the LTP
+            bh, bl = max(float(bh), ltp), min(float(bl), ltp)
+            bclr = ((ltp - bl) / (bh - bl)) if bh > bl else 0.5
+            st_["bar_clr"] = round(bclr, 3)
+            b.at[i, "bar_clr"] = st_["bar_clr"]
+        else:
+            st_["bar_clr"] = r.get("bar_clr")
+        if vw and float(vw) > 0:
+            vs = 100 * (ltp / float(vw) - 1)
+            b.at[i, "vs_vwap%"] = round(vs, 2)
+            st_["above_vwap"] = ltp >= float(vw)
+        else:
+            st_["above_vwap"] = bool(r.get("above_vwap"))
+        rs = (day - idx_ret) if (day is not None and idx_ret is not None) else None
+        if rs is not None:
+            b.at[i, "RS%"] = round(rs, 2)
+        st_["rs_vs_index"] = rs
+        b.at[i, "action"] = _tf_action(st_, risk_on)
+        b.at[i, "sell"] = _tf_sell_action(st_, risk_on)
     return b
 
 

@@ -37,7 +37,7 @@ LIVE_COLS = {
     "entered": st.column_config.TextColumn("entered", help="WHEN THE TRADE TRIGGERED — the wall-clock time (5-min resolution) the footprint FIRST fired today, INDEPENDENT of the timeframe you picked. If it fires at 12:30 while the 4h candle (09:15→13:15) is still forming, this reads 12:30 — not 09:15 or 13:15. The timeframe governs the structure/RSI/levels lens; the trigger is a clock event. (Qualification time, NOT the candle/scan timestamp.) Replay & the timeframe scans compute it CAUSALLY — the HH:MM the footprint first FORMED (up ≥1% AND closing the running session in the top of its range AND above session VWAP). The Live 5s snapshot has no intraday bars, so there it is FIRST-SEEN — the wall-clock time our scanner first saw the name qualify (accurate if the board ran from the open; later if you started the dashboard mid-session). Earlier + still holding = footprint persisted = higher conviction; just entered near the close = fresher/less proven. Blank = not currently qualifying."),
     "time": st.column_config.TextColumn("time", help="The candle the signal is on, as open→close (e.g. 13:15-15:15 = the 2h candle spanning 13:15 to 15:15). IMPORTANT: an intraday signal only CONFIRMS at the candle's CLOSE — during a live session the current candle is still forming and the signal can repaint until it closes. Live snapshot = scan time; replay = last bar at/before your cut."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
-    "ltp": st.column_config.NumberColumn("ltp", help="Last-traded price (Fyers). HOW LIVE IT IS DEPENDS ON THE TAB: in the LIVE SNAPSHOT it refreshes every 5s (one batch quote, genuinely ticking). In the TIMEFRAME tables (15m/1h/2h/4h) it is a FROZEN SNAPSHOT from your last scan — that scan pulls ~70 /history calls, far too heavy to run every 5s, and the page has no auto-refresh, so the price (and entry/stop/T1/T2 built on it) can be minutes old while looking perfectly current. The scan time is shown above the table; ↻ refresh to re-scan.", format="%.2f"),
+    "ltp": st.column_config.NumberColumn("ltp", help="Last-traded price (Fyers) — LIVE, refreshed every 5s on every tab (one batch quote). In the TIMEFRAME tables a two-tier refresh runs: the price and everything cheap that hangs off it (day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the LONG/AVOID verdict itself) all re-derive on the live price every 5s. Only the CANDLE-derived columns (structure, RSI, tone) stay as-of the last scan — they need ~70 /history calls and only change when a BAR CLOSES anyway (on 4h, twice a day). Their age is stamped above the table; ↻ refresh to re-pull the candles.", format="%.2f"),
     "day%": st.column_config.NumberColumn("day%", help="Return vs previous close. The signal wants demand in control (≥ +1%).", format="%.2f"),
     "clr": st.column_config.NumberColumn("clr", help="Close Location in Range = (close−low)/(high−low). ≥0.70 = closing strong, buyers held into the bar. Core of the accumulation footprint.", format="%.2f"),
     "character": st.column_config.TextColumn("character", help="Candle shape: marubozu_bull (strong body, best), hammer (demand rejected lows), shooting_star (supply capped highs, avoid), doji (indecision), strong/weak_close."),
@@ -280,13 +280,11 @@ if tf == "Intraday":
             _age = (dt.datetime.now() - _sa).total_seconds() if _sa else 0
             _mkt = live.market_open()
             if _sa:
-                if _mkt and _age > 120:
-                    st.error(
-                        f"🛑 **STALE SNAPSHOT — scanned {_sa:%H:%M:%S}, "
-                        f"{int(_age // 60)}m {int(_age % 60)}s ago.** This table does **not** "
-                        "tick. `ltp` and every level built on it (entry / stop / T1 / T2) are "
-                        f"frozen at the {_sa:%H:%M} price — they are **not live** and may be far "
-                        "from the market. Hit **↻ refresh** to re-scan.")
+                if _mkt and _age > 1800:
+                    st.warning(
+                        f"⚠ **structure/RSI are {int(_age // 60)}m old** (scanned "
+                        f"{_sa:%H:%M}). Prices, levels and the verdict are live (5s), but the "
+                        "CANDLE-derived columns need a re-pull. Hit **↻ refresh**.")
                 else:
                     st.caption(f"structure/RSI scanned **{_sa:%H:%M:%S}** ({int(_age)}s ago) "
                                "— ↻ refresh to re-scan the candles.")
@@ -309,7 +307,7 @@ if tf == "Intraday":
             # So: prices tick here every 5s; structure stays as-of the stamped scan.
             @st.fragment(run_every="5s")
             def _tf_panel():
-                bb = live.refresh_prices(b) if live.market_open() else b
+                bb = live.refresh_prices(b, risk_on=sc['risk_on']) if live.market_open() else b
                 st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure as-of "
                            f"{_sa:%H:%M}" if (_sa and live.market_open())
                            else "market closed — last-session values")
