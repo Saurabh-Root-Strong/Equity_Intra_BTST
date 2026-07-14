@@ -689,6 +689,14 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         if None in (c, pc, h, l) or h == l:
             continue
         h, l = max(float(h), float(c)), min(float(l), float(c))   # broker range can lag the LTP
+        # LIQUIDITY FLOOR — today's turnover (volume x typical price). liquid_universe no
+        # longer pre-filters on the archive's STALE t-1 turnover (that dropped 23% of the
+        # validated signals), and quotes_board gained a today-turnover gate — but tf_scan
+        # was left with NO floor at all, so it surfaced unfillable names complete with
+        # entry/stop/targets. A level you cannot get filled at is worse than no level.
+        _vol = v.get("volume") or 0
+        if ((_vol * (h + l + float(c)) / 3.0) / 1e5) < config.LIQ_MIN_LACS:
+            continue
         day = 100 * (float(c) / float(pc) - 1)
         clr = (float(c) - float(l)) / (float(h) - float(l)) if h > l else 0.5
         # TWO pre-filters, one per side. The long screen admits only UP-and-strong names —
