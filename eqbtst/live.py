@@ -769,8 +769,13 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
     board = pd.DataFrame(rows)
     if not board.empty:
         board = board.sort_values(["action", "bar_clr"], ascending=[True, False])
+    # WHEN this snapshot was taken. The tf scan is heavy (~70 /history calls) so it CANNOT
+    # tick like the 5s quote board — and the dashboard's tf branch never reaches the
+    # auto-refresh fragment, so the table is frozen until the user re-scans. The ltp and
+    # every level derived from it (entry/stop/T1/T2) age silently. Surface the age.
     return {"ok": True, "status": ts["describe"], "tf": tf, "risk_on": risk_on,
-            "idx_ret": idx_ret, "board": board, "n_scanned": len(pre)}
+            "idx_ret": idx_ret, "board": board, "n_scanned": len(pre),
+            "scanned_at": dt.datetime.now()}
 
 
 _REPLAY_CACHE = Path(__file__).resolve().parent.parent / "data" / "replay"
