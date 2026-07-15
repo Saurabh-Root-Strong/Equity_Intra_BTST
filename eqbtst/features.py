@@ -106,4 +106,4 @@ def conviction_score(df: pd.DataFrame) -> pd.Series:
     r = r + df["ret"].clip(lower=0).rank(pct=True)
     if "rs_idx_cum" in df.columns:              # prefer the strongest persistent leaders
         r = r + df["rs_idx_cum"].rank(pct=True)
-    return r
+    return r    

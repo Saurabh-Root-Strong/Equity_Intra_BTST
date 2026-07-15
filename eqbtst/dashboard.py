@@ -90,7 +90,32 @@ def _last_date():
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("Equity BTST")
-last = _last_date()
+# The archive can be transiently unavailable — the DCM dashboard holds DuckDB read-write
+# (many-readers-OR-one-writer), or the nightly sync is mid-write. data._connect already
+# raises a plain-English RuntimeError; catch it HERE so the page shows that guidance as a
+# clean banner instead of a Python traceback with an "Ask ChatGPT" button. Retry a couple
+# of times first — a sync lock clears in seconds.
+last = None
+for _try in range(3):
+    try:
+        _last_date.clear() if _try else None      # bypass the cached exception on retry
+        last = _last_date()
+        break
+    except Exception as _e:
+        _err = _e
+        if _try < 2:
+            import time as _t
+            _t.sleep(1.0)
+if last is None:
+    st.error(str(_err))
+    st.caption("This board only READS the archive — it never writes to it. The moment the "
+               "other process releases the file, hit **↻ refresh** (top-left) and the board "
+               "loads. Nothing here is broken.")
+    if st.button("↻ retry now"):
+        st.cache_data.clear()
+        live.clear_universe_cache()
+        st.rerun()
+    st.stop()
 tf = st.sidebar.radio("Timeframe",
                       ["BTST (overnight)", "Intraday", "🎬 Replay (practice)"],
                       index=0)
