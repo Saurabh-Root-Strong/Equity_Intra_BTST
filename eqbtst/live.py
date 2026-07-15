@@ -752,10 +752,13 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
         s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
         s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
+        _mtf = mtf_structure(sym)               # 6-TF structure, one cached 15m fetch
         rows.append({
             "symbol": sym, "entered": entered, "at": at_px, "since%": since_pct,
             "time": bar_time,
             "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
+            "s15m": _mtf["15m"], "s1h": _mtf["1h"], "s2h": _mtf["2h"],
+            "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
             "sector": uni.loc[sym, "sector"], "ltp": ltp,
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
@@ -855,6 +858,72 @@ def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
     if not out.empty:
         _REPLAY_CACHE.mkdir(parents=True, exist_ok=True)
         out.to_parquet(cache, index=False)
+    return out
+
+
+# ── multi-timeframe structure (one cheap fetch, five resamples, archive for D/W) ──
+_MTF_CACHE: dict = {}          # (sym, date, bucket5) -> {tf: structure}
+_DAILY_HIST: dict = {}         # date -> {sym: daily OHLC frame}  (one archive read per day)
+
+
+def _daily_hist() -> dict:
+    """Per-symbol DAILY bars for the whole universe, ~14 months back — ONE archive read per
+    day, then free. Feeds the 1D and 1W structure reads (leak-free: through the last close;
+    no forming daily bar, so unlike the intraday TFs these never repaint intraday)."""
+    key = dt.date.today()
+    if key in _DAILY_HIST:
+        return _DAILY_HIST[key]
+    try:
+        start = (pd.Timestamp(key) - pd.Timedelta(days=430)).strftime("%Y-%m-%d")
+        df = data.load_eod(start=start)[["symbol", "trade_date", "open_price",
+                                         "high_price", "low_price", "close_price"]]
+        df = df.rename(columns={"trade_date": "ts", "open_price": "open",
+                                "high_price": "high", "low_price": "low",
+                                "close_price": "close"})
+        out = {s: g.sort_values("ts").reset_index(drop=True) for s, g in df.groupby("symbol")}
+    except Exception:
+        out = {}
+    _DAILY_HIST.clear()                     # never hold two days of frames in memory
+    _DAILY_HIST[key] = out
+    return out
+
+
+def mtf_structure(sym: str) -> dict:
+    """Kaufman structure on SIX timeframes for one name — {15m,1h,2h,4h,1D,1W} — from ONE
+    15-minute fetch (~20 days, resampled locally to 1h/2h/4h) plus the daily archive
+    (resampled W-FRI for weekly). NOT six fetches. Cached per 5-min bucket.
+
+    HONESTY: the intraday TFs include today's forming bar, so they can REPAINT until that
+    bar closes; 1D/1W are through the LAST CLOSE (they cannot repaint intraday, but also do
+    not see today). Cross-TF alignment (e.g. BREAKOUT on 4h while CONSOLIDATION on 1h) is
+    classic MTF tape-reading — the related validated evidence in this stack is Daily×Weekly
+    breakout-from-tight-base (sister project); INTRADAY MTF alignment is unvalidated context,
+    same as everything else in this lane."""
+    key = (sym, dt.date.today(), _bucket5())
+    hit = _MTF_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = {t: "n/a" for t in ("15m", "1h", "2h", "4h", "1D", "1W")}
+    try:
+        f = fetch_intraday(sym, tf="15m", lookback_days=20)
+        if not f.empty:
+            out["15m"] = indicators.structure(f)
+            for lab, freq in (("1h", "60min"), ("2h", "120min"), ("4h", "240min")):
+                r = _resample_ohlcv(f, freq)
+                out[lab] = indicators.structure(r) if len(r) >= 5 else "n/a"
+    except Exception:
+        pass
+    try:
+        d = _daily_hist().get(sym)
+        if d is not None and len(d) >= 5:
+            out["1D"] = indicators.structure(d.tail(60))
+            w = (d.set_index("ts").groupby(pd.Grouper(freq="W-FRI"))
+                 .agg(open=("open", "first"), high=("high", "max"),
+                      low=("low", "min"), close=("close", "last")).dropna().reset_index())
+            out["1W"] = indicators.structure(w) if len(w) >= 5 else "n/a"
+    except Exception:
+        pass
+    _MTF_CACHE[key] = out
     return out
 
 

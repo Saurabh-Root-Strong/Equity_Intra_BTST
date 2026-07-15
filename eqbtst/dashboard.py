@@ -53,6 +53,12 @@ LIVE_COLS = {
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
     "ltp": st.column_config.NumberColumn("ltp", help="Last-traded price (Fyers) — LIVE, refreshed every 5s on every tab (one batch quote). In the TIMEFRAME tables a two-tier refresh runs: the price and everything cheap that hangs off it (day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the LONG/AVOID verdict itself) all re-derive on the live price every 5s. Only the CANDLE-derived columns (structure, RSI, tone) stay as-of the last scan — they need ~70 /history calls and only change when a BAR CLOSES anyway (on 4h, twice a day). Their age is stamped above the table; ↻ refresh to re-pull the candles.", format="%.2f"),
     "day%": st.column_config.NumberColumn("day%", help="Return vs previous close. The signal wants demand in control (≥ +1%).", format="%.2f"),
+    "s15m": st.column_config.TextColumn("15m", help="Structure on 15-MINUTE bars (Kaufman efficiency over the last ~20 bars ≈ 5 hours). The fastest, noisiest frame — repaints until each 15m bar closes. Computed from one 15-min fetch (~20 days), NOT a separate API call per timeframe."),
+    "s1h": st.column_config.TextColumn("1h", help="Structure on 1-HOUR bars (~20 bars ≈ 3 sessions), resampled locally from the same 15-min fetch. Includes today's forming bar → can repaint until it closes."),
+    "s2h": st.column_config.TextColumn("2h", help="Structure on 2-HOUR bars (~20 bars ≈ 7 sessions), resampled from the 15-min fetch. Includes the forming bar → can repaint."),
+    "s4h": st.column_config.TextColumn("4h", help="Structure on 4-HOUR bars (~20 bars ≈ 10 sessions; NSE's 6h15m session = 2 bars/day, 09:15–13:15 + a partial to 15:30). The big intraday frame. Includes the forming bar → can repaint until 13:15/15:30."),
+    "s1D": st.column_config.TextColumn("1D", help="Structure on DAILY bars (last ~60 daily bars from the EOD archive). THROUGH THE LAST CLOSE — leak-free and it cannot repaint intraday, but it does not see today's bar yet. In the sister index project, Daily×Weekly BREAKOUT-from-tight-base was the one MTF pattern that survived validation — intraday MTF alignment has no such evidence and stays context."),
+    "s1W": st.column_config.TextColumn("1W", help="Structure on WEEKLY bars (daily archive resampled W-FRI, ~20 weeks ≈ 5 months). The slowest frame — the regime this stock lives in. Through the last close; the current week's bar is still forming until Friday. Classic MTF read: trade in the direction of 1W/1D, time with the intraday frames — but remember the intraday lane itself is −5bps; this is tape-reading context, not a validated signal."),
     "clr": st.column_config.NumberColumn("clr", help="Close Location in Range = (close−low)/(high−low). ≥0.70 = closing strong, buyers held into the bar. Core of the accumulation footprint.", format="%.2f"),
     "character": st.column_config.TextColumn("character", help="Candle shape: marubozu_bull (strong body, best), hammer (demand rejected lows), shooting_star (supply capped highs, avoid), doji (indecision), strong/weak_close."),
     "body": st.column_config.NumberColumn("body", help="Signed body fraction of range. Positive & large = conviction green candle.", format="%.2f"),
@@ -343,12 +349,56 @@ if tf == "Intraday":
             st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
                        f"{sc.get('idx_ret', 0):+.2f}% · regime "
                        f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
-            long_cols = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%", "structure",
+            long_cols = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%",
+                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                          "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                          "entry", "stop", "t1", "t2", "atr%", "action"]
-            sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%", "structure",
+            sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%",
+                            "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                             "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                             "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
+
+            # ── MULTI-TIMEFRAME STRUCTURE FILTER ────────────────────────────────────
+            # The classic MTF read: pick a HIGHER-TF structure and a LOWER-TF structure and
+            # keep only names where BOTH hold (e.g. BREAKOUT_UP on 4h while CONSOLIDATION on
+            # 1h = broke out on the big frame, coiling on the small one). 15m/1h/2h/4h come
+            # from one 15-min fetch resampled (they include today's forming bar → can
+            # repaint); 1D/1W come from the EOD archive (through LAST close → cannot repaint
+            # intraday, but do not see today). Context, not validated alpha.
+            _TF_RANK = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440, "1W": 10080}
+            _STRUCTS = ["Any", "BREAKOUT_UP", "TREND_UP", "CONSOLIDATION", "RANGE",
+                        "TREND_DOWN", "BREAKOUT_DOWN"]
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            f_htf = fc1.selectbox("Higher TF", ["1h", "2h", "4h", "1D", "1W"], index=2,
+                                  key="mtf_htf",
+                                  help="The BIG frame — trend/breakout context. 1D & 1W are "
+                                       "from the EOD archive (through last close, leak-free, "
+                                       "never repaint intraday).")
+            f_hst = fc2.selectbox("HTF structure", _STRUCTS, index=0, key="mtf_hst",
+                                  help="Keep only names whose HIGHER-TF structure equals this. "
+                                       "'Any' = no filter.")
+            f_ltf = fc3.selectbox("Lower TF", ["15m", "1h", "2h", "4h", "1D"], index=1,
+                                  key="mtf_ltf",
+                                  help="The SMALL frame — the setup inside the big frame's "
+                                       "context. Intraday TFs include today's forming bar "
+                                       "(can repaint until it closes).")
+            f_lst = fc4.selectbox("LTF structure", _STRUCTS, index=0, key="mtf_lst",
+                                  help="Keep only names whose LOWER-TF structure equals this. "
+                                       "'Any' = no filter. Example: HTF 4h=BREAKOUT_UP + LTF "
+                                       "1h=CONSOLIDATION = broke out on 4h, now coiling on 1h.")
+            if (f_hst != "Any" and f_lst != "Any"
+                    and _TF_RANK[f_ltf] >= _TF_RANK[f_htf]):
+                st.warning(f"⚠ your 'lower' TF ({f_ltf}) is not below your 'higher' TF "
+                           f"({f_htf}) — the filter still applies, but the HTF/LTF logic is "
+                           "inverted.")
+
+            def _mtf_filter(df_):
+                d_ = df_
+                if f_hst != "Any" and f"s{f_htf}" in d_.columns:
+                    d_ = d_[d_[f"s{f_htf}"] == f_hst]
+                if f_lst != "Any" and f"s{f_ltf}" in d_.columns:
+                    d_ = d_[d_[f"s{f_ltf}"] == f_lst]
+                return d_
 
             # ── TWO-TIER REFRESH ────────────────────────────────────────────────────
             # The heavy half (structure / RSI / tone / bar_clr) only changes when a BAR
@@ -360,9 +410,20 @@ if tf == "Intraday":
             @st.fragment(run_every="5s")
             def _tf_panel():
                 bb = live.refresh_prices(b, risk_on=sc['risk_on']) if live.market_open() else b
+                _n0 = len(bb)
+                bb = _mtf_filter(bb)
                 st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure as-of "
                            f"{_sa:%H:%M}" if (_sa and live.market_open())
                            else "market closed — last-session values")
+                if len(bb) < _n0:
+                    st.caption(f"🔎 MTF filter: **{len(bb)}/{_n0}** names match "
+                               f"(HTF {f_htf}={f_hst} · LTF {f_ltf}={f_lst}). The rest are "
+                               "hidden, not gone — set both to 'Any' to clear.")
+                if bb.empty:
+                    st.info("No name matches this MTF combination right now. That is an "
+                            "answer, not an error — alignment across frames is rare, which "
+                            "is exactly why traders look for it.")
+                    return
                 tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
                 with tb:
                     lo = bb[bb["action"] == "LONG"]
