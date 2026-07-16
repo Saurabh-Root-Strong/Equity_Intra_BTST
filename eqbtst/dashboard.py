@@ -28,6 +28,27 @@ def _cols(df, cols):
     return [c for c in cols if c in df.columns]
 
 
+# ── structure labels: the engine returns terse ENUMS (BREAKOUT_UP…); humans read glyph+word.
+# The ENUM stays the underlying value everywhere (filter compares s{tf} == enum, columns store
+# enum) — this map is DISPLAY ONLY: format_func on the dropdowns, and a cell rewrite in _fmt.
+_STRUCT_LABEL = {
+    "BREAKOUT_UP":   "🚀 Breakout ↑",
+    "TREND_UP":      "📈 Uptrend",
+    "CONSOLIDATION": "🌀 Coiling",
+    "RANGE":         "↔️ Range",
+    "TREND_DOWN":    "📉 Downtrend",
+    "BREAKOUT_DOWN": "💥 Breakdown ↓",
+    "n/a":           "—",
+    "Any":           "Any (no filter)",
+}
+_STRUCT_COLS = ("s15m", "s1h", "s2h", "s4h", "s1D", "s1W", "structure")
+
+
+def _struct_label(v):
+    """Enum → friendly label for display; unknown/missing values pass through unchanged."""
+    return _STRUCT_LABEL.get(v, v)
+
+
 def _fmt(df):
     """Render-time tidy-up. A name can sit in the timeframe list (it passed the tf verdict)
     while NEVER having fired the BTST footprint — so entered / at / since% are genuinely
@@ -39,6 +60,9 @@ def _fmt(df):
     for c in ("at", "since%", "cvwap%", "rsCum%", "est_close", "vol×", "turn₹L", "wt%"):
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")   # None -> NaN -> renders blank
+    for c in _STRUCT_COLS:                                 # terse enum -> glyph+word (display only)
+        if c in d.columns:
+            d[c] = d[c].map(_struct_label)
     return d
 
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
@@ -166,11 +190,14 @@ except Exception as _e:
 
 
 def render_price_band():
-    """Compact price-band filter row, right-aligned above the table."""
+    """Compact price-band filter row, right-aligned above the table.
+
+    Max defaults to ₹900 (user preference). price_filter reads Max=0 as 'no cap' (0 or 1e9), so
+    set Max to 0 to see every name above ₹900 (most index heavyweights)."""
     sp, c1, c2 = st.columns([6, 1, 1])
-    sp.markdown("**Price band (₹)** — filter the list by stock price →")
+    sp.markdown("**Price band (₹)** — filter by stock price (Max 0 = no limit) →")
     c1.number_input("Min ₹", min_value=0.0, value=0.0, step=50.0, key="price_min")
-    c2.number_input("Max ₹", min_value=0.0, value=900.0, step=50.0, key="price_max")
+    c2.number_input("Max ₹ (0 = all)", min_value=0.0, value=900.0, step=50.0, key="price_max")
 
 
 def price_filter(df, col):
@@ -194,6 +221,22 @@ def _tf_scan(tf: str):
     return live.tf_scan(tf)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _uni_scan(nonce: int):
+    # Pinned by an explicit nonce, NOT by time: the ~270-fetch scan must re-run ONLY on the ↻
+    # button (which bumps the nonce), never as a side effect of moving a filter widget. Without
+    # this, a filter change that happens to land after the 5-min memo bucket rolls would trigger
+    # a surprise ~30s cold re-scan. Filters must be instant; scanning must be deliberate.
+    sc = live.universe_mtf_scan()
+    # RAISE on failure so st.cache_data does NOT store an ok=False result. Otherwise a scan run
+    # before the morning token refresh would pin an empty board for the full 30-min TTL, and the
+    # user would see nothing even after re-authing (until they happened to hit ↻). Raising makes
+    # the next rerun retry cleanly.
+    if not sc.get("ok"):
+        raise RuntimeError(sc.get("status") or "universe scan unavailable")
+    return sc
+
+
 SELL_COLS = {
     "short": st.column_config.TextColumn("short", help="Distribution readiness x/4: weak close · down ≥1% · vol surge · RS-laggard. High = supply in control."),
     "s_stop": st.column_config.NumberColumn("s_stop", help="Short stop = 1×ATR ABOVE entry. Defines risk on a short.", format="%.2f"),
@@ -210,6 +253,22 @@ TF_COLS = {
     "tone": st.column_config.TextColumn("tone", help="Momentum tone: strong / neutral / rolling-over / weak (from fast-RSI slope)."),
     "structure": st.column_config.TextColumn("structure", help="Market structure on the timeframe you picked — computed over the last ~20 bars OF THAT TIMEFRAME, so it CHAINS ACROSS PRIOR DAYS (a 2h read spans ~7 trading days; a 4h read ~10). It is not today-only. Kaufman efficiency + range logic: TREND_UP/DOWN (efficient directional), RANGE (choppy), CONSOLIDATION (range contracting — coil), BREAKOUT_UP/DOWN (beyond prior range). CONTEXT ONLY — intraday structure has no validated edge; use it to understand the tape, not as a buy/sell signal."),
     "action": st.column_config.TextColumn("action", help="STAGE-2 verdict. The stock reached this table because the 1-DAY BAR let it in (day% ≥1% and day-clr ≥0.5, top 25). THIS column is the timeframe's judgement of it: LONG = the last bar OF THIS TIMEFRAME closed strong + above session VWAP + RSI not weak + RS-leader. AVOID = weak bar / below VWAP / regime-off. Long-only. NOTE: intraday direction has no validated overnight-grade edge — manage strictly by the stop."),
+}
+
+# Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
+DELIV_COLS = {
+    "wtd_deliv7": st.column_config.NumberColumn(
+        "wtdDeliv7 %", format="%.1f%%",
+        help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
+             "The share of recent volume that took actual delivery (not intraday churn), weighted "
+             "by rupees traded. High = real accumulation, not day-trading noise. Ported verbatim "
+             "from the Daily_Cash_Market sector-rotation engine. Leak-free (through last close)."),
+    "deliv_vs_100d": st.column_config.NumberColumn(
+        "vs100D %", format="%+.1f%%",
+        help="(7D wtd-delivery ÷ own 100-trading-day baseline − 1) × 100. +15% = recent delivery "
+             "is 15% ABOVE this stock's OWN historical norm (conviction building); −10% = fading. "
+             "0% = exactly at its own average. Compares a name to ITSELF, not to peers — so a "
+             "structurally high- or low-delivery stock is judged fairly. DCM-ported."),
 }
 
 
@@ -267,188 +326,303 @@ if tf == "Intraday":
         st.warning("🧪 **TEST MODE** — market is closed; data below is UNRELIABLE off-hours "
                    "Fyers (indicative prices, junk volume). Layout/flow testing only.")
 
-    render_price_band()
-    # timeframe dropdown — right above the table, right-aligned
-    _, ddcol = st.columns([3, 1])
-    scan_tf = ddcol.selectbox("Timeframe → stock list",
-                              ["4h", "2h", "1h", "15m", "Live snapshot"], index=1,
-                              key="scan_tf",
-                              help=(
-                                  "WHAT THE TIMEFRAME ACTUALLY DOES — two stages.\n\n"
-                                  "① THE 1-DAY BAR SOURCES THE STOCKS. The whole universe "
-                                  "(~250 names) is screened on TODAY'S OWN CANDLE, TWICE:\n"
-                                  "   • LONG screen  — day% ≥ +1% AND day-clr ≥ 0.5 → top 25 "
-                                  "by strength\n"
-                                  "   • SHORT screen — day% ≤ −1% AND day-clr ≤ 0.5 → top 12 "
-                                  "by weakness\n"
-                                  "Both must clear the ₹20cr turnover floor (a level you "
-                                  "cannot get filled at is worse than no level). Nothing "
-                                  "reaches the table unless the 1-day bar lets it in.\n\n"
-                                  "② THE TIMEFRAME JUDGES THEM. Its candles — today's PLUS "
-                                  "prior days' (a 2h read spans ~15 days, a 4h read ~30) — give "
-                                  "structure (Kaufman efficiency), RSI/tone, the last bar's "
-                                  "close-strength, and the ATR that sets your stop/T1/T2. Those "
-                                  "decide LONG / NEUTRAL / AVOID.\n\n"
-                                  "SO: the timeframe NEVER SOURCES a stock — it only JUDGES and "
-                                  "STYLES one. Switch 2h→4h and you get the SAME candidates, "
-                                  "re-judged, with a WIDER stop (4h ATR ≫ 15m ATR). The dropdown "
-                                  "changes your stop width and the tape view, not the stock pool.\n\n"
-                                  "TWO CLOCKS in this table. LIVE every 5s (one batch quote): "
-                                  "ltp, day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the "
-                                  "VERDICT itself. AS-OF THE LAST SCAN: structure, rsi, tone — "
-                                  "they need ~70 /history calls and only move when a BAR CLOSES "
-                                  "anyway. Their age is stamped above the table.\n\n"
-                                  "NSE trades 6h15m, so a 4h bar = 09:15–13:15 then a partial "
-                                  "13:15–15:30 (only ~2 bars/day — which is why coarse frames "
-                                  "chain across prior days).\n\n"
-                                  "HONEST: this whole lane is intraday CONTEXT. Backtested at "
-                                  "every timeframe: 15m −6.2 · 1h −5.0 · 2h −5.4 · 4h −5.2 bps. "
-                                  "It loses money at every bar size. The one VALIDATED trade is "
-                                  "BTST-CARRY on the 1-day bar at 15:10–15:30 → 'Live snapshot'.")
-                              )
+    render_price_band()          # shared by BOTH lanes (structure scan + live snapshot)
+    # ── VIEW TOGGLE — the old "Timeframe → stock list" dropdown is gone. Two lanes:
+    #    • Live snapshot  = the validated 5s BTST accumulation board (unchanged, falls through).
+    #    • Structure scan = the WHOLE liquid universe with its 6-TF structure, narrowed ONLY by
+    #      the HTF/LTF structure filter. No day-move / close-strength pre-screen (Stage-1 gone).
+    _, vcol = st.columns([2, 1])
+    view = vcol.radio("View", ["Live snapshot", "🔬 Structure scan"], index=0, horizontal=True,
+                      key="intraday_view",
+                      help=(
+                          "TWO LANES.\n\n"
+                          "• LIVE SNAPSHOT — the validated lane. A 5s price-action scan for the "
+                          "BTST accumulation footprint (delivery confirms at the close). This is "
+                          "where BTST-CARRY lives.\n\n"
+                          "• STRUCTURE SCAN — structure-first research. The ENTIRE F&O universe "
+                          "(~270 names, NO turnover floor; the price band still applies) is pulled "
+                          "on SIX timeframes, then YOU narrow it with the Higher-TF / Lower-TF "
+                          "structure and delivery filters (e.g. BREAKOUT_UP on 4h + CONSOLIDATION "
+                          "on 1h). No 1-day-bar pre-screen — the filters ARE the selection. Thin "
+                          "names appear too; watch turn₹L for fill risk.\n\n"
+                          "HONEST: the structure lane is intraday CONTEXT. Backtested −5bps at "
+                          "every bar size; MTF alignment is unvalidated. The one validated trade "
+                          "is BTST-CARRY on the 1-day bar at 15:25–15:29 → Live snapshot."))
 
-    # ---- timeframe-driven stock list (1h / 2h / 15m bars) ----------------------
-    if scan_tf != "Live snapshot":
+    # ---- STRUCTURE-FIRST scan: full liquid universe, narrowed by the HTF/LTF filter ----
+    if view == "🔬 Structure scan":
         st.caption(
-            f"**Two stages.** ① The **1-DAY BAR sources the stocks** — the whole universe is "
-            f"screened on today's own candle, **twice**: the LONG screen takes `day% ≥ +1% "
-            f"AND day-clr ≥ 0.5` (top 25 by strength), the SHORT screen takes the mirror "
-            f"`day% ≤ −1% AND day-clr ≤ 0.5` (top 12 by weakness). Both must clear the "
-            f"₹20cr turnover floor. ② The **{scan_tf} candles then JUDGE them** — "
-            f"today's + prior days' bars give structure / RSI / tone, and the ATR that sets "
-            f"your stop. **The timeframe never SOURCES a stock — it only judges and styles "
-            f"one.** Switch {scan_tf}→4h: *same candidates*, re-judged, wider stop.")
-        with st.spinner(f"Scanning on {scan_tf} bars…"):
-            sc = _tf_scan(scan_tf)
-        if not sc["ok"] or sc["board"].empty:
-            st.info(f"No {scan_tf} candidates — market closed / pre-open, or nothing "
-                    "clears the footprint on this timeframe. During a live session this "
-                    "fills. For today's delivery-confirmed picks use the BTST tab.")
-        else:
-            b = price_filter(sc["board"], "ltp")
-            # STALENESS — this table does NOT tick. The tf scan is heavy (~70 /history
-            # calls), so unlike the 5s Live snapshot it is a FROZEN SNAPSHOT: Streamlit
-            # only re-runs on interaction, so ltp — and every level derived from it
-            # (entry/stop/T1/T2) — can be arbitrarily old while looking perfectly actionable.
-            _sa = sc.get("scanned_at")
-            _age = (dt.datetime.now() - _sa).total_seconds() if _sa else 0
-            _mkt = live.market_open()
-            if _sa:
-                if _mkt and _age > 1800:
-                    st.warning(
-                        f"⚠ **structure/RSI are {int(_age // 60)}m old** (scanned "
-                        f"{_sa:%H:%M}). Prices, levels and the verdict are live (5s), but the "
-                        "CANDLE-derived columns need a re-pull. Hit **↻ refresh**.")
-                else:
-                    st.caption(
-                        f"🕒 **Two clocks.** LIVE every 5s: `ltp` · `day%` · `RS%` · "
-                        f"`bar_clr` · `vs_vwap%` · `entry/stop/T1/T2` · **the verdict**. "
-                        f"As-of the **{_sa:%H:%M:%S}** scan ({int(_age)}s ago): `structure` · "
-                        f"`rsi` · `tone` — these need candles and only move when a bar closes. "
-                        "↻ refresh to re-pull them.")
-            st.caption(f"scanned {sc['n_scanned']} shortlisted names · Nifty "
-                       f"{sc.get('idx_ret', 0):+.2f}% · regime "
-                       f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}")
-            long_cols = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%",
-                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
-                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
-                         "entry", "stop", "t1", "t2", "atr%", "action"]
-            sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "day%",
-                            "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
-                            "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
-                            "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
+            "**Structure-first.** The **entire F&O universe** appears — **no 1-day-bar pre-screen, "
+            "no turnover floor** (the price band above still applies). Set a **Higher-TF** and/or "
+            "**Lower-TF** structure (and/or a delivery slider) below; only names where the filters "
+            "hold survive, and those get levels / RSI / verdict on your **Lower TF**. "
+            "⚠ **Watch `turn₹L`** (today's turnover, ₹lacs) — thin names now appear too, and a "
+            "tape-reading level on a low-turnover name may be unfillable. 15m/1h/2h/4h include "
+            "today's forming bar (can repaint); 1D/1W are from the EOD archive (leak-free).")
+        st.session_state.setdefault("uni_nonce", 0)
+        rsc1, rsc2 = st.columns([3, 1])
+        auto_struct = rsc1.toggle(
+            "Auto-refresh structure on each 15-min bar close", value=False, key="auto_struct",
+            help="OFF (default): structure is a MANUAL snapshot — hit ↻ to re-pull; filtering stays "
+                 "instant. ON: re-scans ONCE right after each :00/:15/:30/:45 close (the finest "
+                 "frame). Structure only CHANGES on a bar close, so this keeps it fresh live with "
+                 "the minimum scans (~4/hour) and never re-scans mid-bar (which would repeat the "
+                 "same result for ~270 wasted fetches). Prices/verdict already tick every 5s "
+                 "regardless.")
+        if rsc2.button("↻ re-scan universe",
+                       help="Force a fresh full-universe pull (~270 concurrent /history calls, "
+                            "~30s). The scan is otherwise PINNED — moving a filter never re-scans, "
+                            "so filtering stays instant."):
+            st.session_state["uni_nonce"] += 1     # only this bumps the nonce → only this re-scans
+            live._UNISCAN_CACHE.clear()            # also drop the module memo so it truly re-fetches
+        try:
+            with st.spinner("Scanning the full F&O universe on 6 timeframes (concurrent fetch, "
+                            "~30s cold; instant once pinned)…"):
+                sc = _uni_scan(st.session_state["uni_nonce"])
+        except Exception as _e:
+            st.info(f"Universe scan unavailable — {_e}. Market closed / pre-open, or the Fyers "
+                    "token is stale (~06:00 daily expiry). Re-auth, then hit **↻ re-scan**.")
+            st.stop()
+        if sc["board"].empty:
+            st.info("Universe scan returned no names — market closed / pre-open. During a live "
+                    "session this fills with the full F&O universe.")
+            st.stop()
+        light = price_filter(sc["board"], "ltp")     # price band applies; no turnover floor
+        _sa = sc.get("scanned_at")
+        _age = (dt.datetime.now() - _sa).total_seconds() if _sa else 0
 
-            # ── MULTI-TIMEFRAME STRUCTURE FILTER ────────────────────────────────────
-            # The classic MTF read: pick a HIGHER-TF structure and a LOWER-TF structure and
-            # keep only names where BOTH hold (e.g. BREAKOUT_UP on 4h while CONSOLIDATION on
-            # 1h = broke out on the big frame, coiling on the small one). 15m/1h/2h/4h come
-            # from one 15-min fetch resampled (they include today's forming bar → can
-            # repaint); 1D/1W come from the EOD archive (through LAST close → cannot repaint
-            # intraday, but do not see today). Context, not validated alpha.
-            _TF_RANK = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440, "1W": 10080}
-            _STRUCTS = ["Any", "BREAKOUT_UP", "TREND_UP", "CONSOLIDATION", "RANGE",
-                        "TREND_DOWN", "BREAKOUT_DOWN"]
-            fc1, fc2, fc3, fc4 = st.columns(4)
-            f_htf = fc1.selectbox("Higher TF", ["1h", "2h", "4h", "1D", "1W"], index=2,
-                                  key="mtf_htf",
-                                  help="The BIG frame — trend/breakout context. 1D & 1W are "
-                                       "from the EOD archive (through last close, leak-free, "
-                                       "never repaint intraday).")
-            f_hst = fc2.selectbox("HTF structure", _STRUCTS, index=0, key="mtf_hst",
-                                  help="Keep only names whose HIGHER-TF structure equals this. "
-                                       "'Any' = no filter.")
-            f_ltf = fc3.selectbox("Lower TF", ["15m", "1h", "2h", "4h", "1D"], index=1,
-                                  key="mtf_ltf",
-                                  help="The SMALL frame — the setup inside the big frame's "
-                                       "context. Intraday TFs include today's forming bar "
-                                       "(can repaint until it closes).")
-            f_lst = fc4.selectbox("LTF structure", _STRUCTS, index=0, key="mtf_lst",
-                                  help="Keep only names whose LOWER-TF structure equals this. "
-                                       "'Any' = no filter. Example: HTF 4h=BREAKOUT_UP + LTF "
-                                       "1h=CONSOLIDATION = broke out on 4h, now coiling on 1h.")
-            if (f_hst != "Any" and f_lst != "Any"
-                    and _TF_RANK[f_ltf] >= _TF_RANK[f_htf]):
-                st.warning(f"⚠ your 'lower' TF ({f_ltf}) is not below your 'higher' TF "
-                           f"({f_htf}) — the filter still applies, but the HTF/LTF logic is "
-                           "inverted.")
-
-            def _mtf_filter(df_):
-                d_ = df_
-                if f_hst != "Any" and f"s{f_htf}" in d_.columns:
-                    d_ = d_[d_[f"s{f_htf}"] == f_hst]
-                if f_lst != "Any" and f"s{f_ltf}" in d_.columns:
-                    d_ = d_[d_[f"s{f_ltf}"] == f_lst]
-                return d_
-
-            # ── TWO-TIER REFRESH ────────────────────────────────────────────────────
-            # The heavy half (structure / RSI / tone / bar_clr) only changes when a BAR
-            # CLOSES — on 4h, twice a day — and costs ~70 /history calls. The cheap half
-            # (price, and every level anchored to it) changes every tick and costs ONE
-            # batch quote. Freezing the whole table froze the wrong half: it pinned a
-            # precise-looking entry/stop/T1/T2 to a price that had stopped moving.
-            # So: prices tick here every 5s; structure stays as-of the stamped scan.
-            @st.fragment(run_every="5s")
-            def _tf_panel():
-                bb = live.refresh_prices(b, risk_on=sc['risk_on']) if live.market_open() else b
-                _n0 = len(bb)
-                bb = _mtf_filter(bb)
-                st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure as-of "
-                           f"{_sa:%H:%M}" if (_sa and live.market_open())
-                           else "market closed — last-session values")
-                if len(bb) < _n0:
-                    st.caption(f"🔎 MTF filter: **{len(bb)}/{_n0}** names match "
-                               f"(HTF {f_htf}={f_hst} · LTF {f_ltf}={f_lst}). The rest are "
-                               "hidden, not gone — set both to 'Any' to clear.")
-                if bb.empty:
-                    st.info("No name matches this MTF combination right now. That is an "
-                            "answer, not an error — alignment across frames is rare, which "
-                            "is exactly why traders look for it.")
+        # ── AUTO-REFRESH aligned to the 15-min bar close (opt-in) ───────────────────────
+        # Structure changes ONLY when a bar closes; the 15m frame is the finest, so its
+        # boundary (:00/:15/:30/:45) is the natural cadence. This fragment ticks lightly and
+        # triggers ONE full re-scan just after each boundary — never mid-bar (same result,
+        # wasted fetches). `scanned_b15` remembers the bucket the current scan belongs to so
+        # the first tick after a fresh scan does not immediately re-fire.
+        def _b15(t=None):
+            t = t or dt.datetime.now()
+            return f"{t:%H}:{(t.minute // 15) * 15:02d}"
+        st.session_state["scanned_b15"] = _b15(_sa) if _sa else _b15()
+        if auto_struct:
+            @st.fragment(run_every="20s")
+            def _auto_rescan():
+                if not live.market_open():
                     return
-                tb, ts = st.tabs([f"🟢 LONG ({scan_tf} bars)", f"🔴 SHORT ({scan_tf} bars)"])
-                with tb:
-                    lo = bb[bb["action"] == "LONG"]
-                    _lo = lo if not lo.empty else bb
-                    st.dataframe(_fmt(_lo)[_cols(_lo, long_cols)],
-                                 use_container_width=True, hide_index=True,
-                                 column_config={**LIVE_COLS, **TF_COLS})
-                    if lo.empty:
-                        st.caption("No LONG on this timeframe — showing the shortlist.")
-                with ts:
-                    st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** "
-                               "Overnight short is proven -EV (win 20%); intraday direction "
-                               "has no validated edge either. Weakness screen, not alpha — "
-                               "trade small, manage by s_stop.")
-                    sh = bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
-                    if sh.empty:
-                        st.caption("No distribution/weakness names on this timeframe.")
-                    else:
-                        st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
-                                     hide_index=True,
-                                     column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
+                if _b15() != st.session_state.get("scanned_b15"):
+                    st.session_state["scanned_b15"] = _b15()
+                    st.session_state["uni_nonce"] += 1     # force a fresh pull on the next run
+                    live._UNISCAN_CACHE.clear()
+                    st.rerun()
+            _auto_rescan()
 
-            _tf_panel()
-            st.caption("Entry/Stop/T1/T2 = ATR risk geometry on this timeframe, NOT a "
-                       "forecast. Long-only is the validated edge; SHORT is intraday context.")
+        if _sa and live.market_open() and _age > 300 and not auto_struct:
+            st.caption(f"🕒 structure as-of **{_sa:%H:%M:%S}** ({int(_age // 60)}m {int(_age % 60)}s "
+                       "ago) — ↻ re-scan to re-pull. Prices on matched names tick live below.")
+        st.caption(f"scanned **{sc['n_scanned']}** liquid names · Nifty "
+                   f"{sc.get('idx_ret', 0):+.2f}% · regime "
+                   f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}"
+                   + ("  ·  🔄 auto-refresh ON (next 15-min close)" if auto_struct else ""))
+
+        # ── DELIVERY-CONVICTION FILTERS — ported from the DCM sector-rotation view ──
+        # Same two sliders you use there, same formulas (turnover-weighted delivery). Default 0
+        # = show everything (this lane's premise is 'all names appear, THEN you filter'); raise
+        # them to demand real accumulation. These narrow the list BEFORE the per-name enrich, so
+        # they also cut the fetch cost.
+        dc1, dc2 = st.columns(2)
+        min_wtd = dc1.slider(
+            "Min stock Wtd Delivery % — filters the list below", 0, 100, 0, step=1,
+            key="eqbtst_min_wtd",
+            help="Hide names whose 7-day turnover-weighted delivery % is BELOW this. DCM uses 48 "
+                 "as its default cut for 'genuine accumulation'; 0 here = show all.")
+        min_vs = dc2.slider(
+            "Min 7D vs 100D excess % — filters the list below", 0, 100, 0, step=5,
+            key="eqbtst_min_vs",
+            help="Hide names whose recent delivery is not at least this % ABOVE their own 100-day "
+                 "norm. 0 = show all; +10 = only names delivering ≥10% above their own baseline "
+                 "(conviction accelerating). Names with no 100D history are dropped when >0.")
+
+        def _deliv_filter(df_):
+            d_ = df_
+            if min_wtd > 0 and "wtd_deliv7" in d_.columns:
+                d_ = d_[d_["wtd_deliv7"] >= min_wtd]          # NaN >= n is False → dropped, correct
+            if min_vs > 0 and "deliv_vs_100d" in d_.columns:
+                d_ = d_[d_["deliv_vs_100d"] >= min_vs]
+            return d_
+
+        # ── MULTI-TIMEFRAME STRUCTURE FILTER — now THE selection mechanism ──
+        with st.expander("❓ How structure is computed — the 20-bar window (read this)"):
+            st.markdown(
+                "**`structure()` always looks at the LAST 20 bars of each frame** "
+                "(`lookback=20`, Kaufman efficiency + range). Not the whole history — the last "
+                "20 bars *of that timeframe*. So the calendar span differs per frame:\n\n"
+                "| Frame | Bars/day (NSE 6h15m) | 20 bars ≈ prior days | Fetched (raw) |\n"
+                "|---|---|---|---|\n"
+                "| **1h** | ~6.5 | **~3 trading days** | 15m over 20 cal-days, resampled |\n"
+                "| **2h** | ~3.5 | **~6–7 trading days** | ″ |\n"
+                "| **4h** | 2 | **~10 trading days** | ″ |\n"
+                "| **1D** | 1 | **~20 trading days (~1 month)** | EOD archive `tail(60)`, uses last 20 |\n"
+                "| **1W** | 1/wk | **~20 weeks (~5 months)** | EOD archive, W-FRI resample |\n\n"
+                "**Why only 20 bars, when we have 8+ years?** Deliberate — structure = the "
+                "**current regime, not ancient history**:\n"
+                "- 🚀 **Breakout ↑** = today's close above the *prior 19 bars'* highest high. Over "
+                "20 bars that means a fresh ~N-bar high. Over *thousands* of bars it would mean an "
+                "*all-time* high → almost never fires, useless.\n"
+                "- **Efficiency ratio** (trend detection) washes to ~0 over huge windows — every "
+                "stock would read ↔️ Range.\n\n"
+                "20 is the standard Kaufman window: long enough to define a range, short enough to "
+                "react. The 8 years of data feed the **validated overnight edge** + delivery "
+                "baselines — *not* the tape-reading structure label.\n\n"
+                "**So your combo can read 0 matches and that's normal:** e.g. 4h 🚀 Breakout ↑ ∩ "
+                "1h 🌀 Coiling is rare — a breakout, then a pause, caught in the same snapshot. "
+                "Loosen one leg (4h 📈 Uptrend, or LTF = Any) to populate.")
+        _TF_RANK = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440, "1W": 10080}
+        _STRUCTS = ["Any", "BREAKOUT_UP", "TREND_UP", "CONSOLIDATION", "RANGE",
+                    "TREND_DOWN", "BREAKOUT_DOWN"]
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        f_htf = fc1.selectbox("Higher TF", ["1h", "2h", "4h", "1D", "1W"], index=2, key="mtf_htf",
+                              help=(
+                                  "**HIGHER TIMEFRAME — the big picture.**\n\n"
+                                  "Pick the LARGE timeframe you want to judge the trend on. This is "
+                                  "the CONTEXT: where is the stock in its bigger move? A bigger "
+                                  "frame changes slowly and matters more.\n\n"
+                                  "• **1h / 2h / 4h** — built live from today's + recent days' "
+                                  "candles. They include the bar still forming now, so they can "
+                                  "CHANGE (repaint) until that bar closes.\n"
+                                  "• **1D / 1W** — from the end-of-day archive, through the LAST "
+                                  "close. Rock-solid: they never change during the day (but they "
+                                  "don't see today yet).\n\n"
+                                  "This box picks the frame; the next box picks the SHAPE you want "
+                                  "on it."))
+        f_hst = fc2.selectbox("HTF structure", _STRUCTS, index=0, key="mtf_hst",
+                              format_func=_struct_label,
+                              help=(
+                                  "**What SHAPE must the Higher TF be in?** Keep only stocks whose "
+                                  "big-frame structure matches this. `Any` = don't filter on the "
+                                  "big frame.\n\n"
+                                  "The six shapes (from Kaufman trend-efficiency + range):\n"
+                                  "• 🚀 **Breakout ↑** — pushed ABOVE its recent range (fresh "
+                                  "up-move)\n"
+                                  "• 📈 **Uptrend** — steady, clean climb\n"
+                                  "• 🌀 **Coiling** — range TIGHTENING (energy building for a "
+                                  "move)\n"
+                                  "• ↔️ **Range** — choppy sideways, no clear direction\n"
+                                  "• 📉 **Downtrend** — steady, clean fall\n"
+                                  "• 💥 **Breakdown ↓** — broke BELOW its range (fresh "
+                                  "down-move)"))
+        f_ltf = fc3.selectbox("Lower TF", ["15m", "1h", "2h", "4h", "1D"], index=1, key="mtf_ltf",
+                              help=(
+                                  "**LOWER TIMEFRAME — the zoom-in.**\n\n"
+                                  "Pick the SMALL timeframe where you want to TIME the entry inside "
+                                  "the big frame's context. Think of it as zooming into the same "
+                                  "chart.\n\n"
+                                  "It does two jobs:\n"
+                                  "1. Filters on the small-frame SHAPE (next box).\n"
+                                  "2. Your **entry / stop / T1 / T2 levels are built on THIS "
+                                  "frame** (its ATR sets the stop width). Smaller frame = tighter "
+                                  "levels.\n\n"
+                                  "Keep it BELOW the Higher TF (e.g. Higher 4h, Lower 1h). Intraday "
+                                  "frames can repaint until the bar closes."))
+        f_lst = fc4.selectbox("LTF structure", _STRUCTS, index=0, key="mtf_lst",
+                              format_func=_struct_label,
+                              help=(
+                                  "**What SHAPE must the Lower TF be in?** Keep only stocks whose "
+                                  "small-frame structure matches this. `Any` = don't filter on the "
+                                  "small frame. (Same six shapes as HTF structure.)\n\n"
+                                  "**The whole idea — a worked example:**\n"
+                                  "Higher TF **4h = 🚀 Breakout ↑** + Lower TF **1h = 🌀 Coiling** "
+                                  "→ the stock BROKE OUT on the big frame and is now COILING on the "
+                                  "small one: it made its move, then paused to gather energy — a "
+                                  "classic continuation setup. A name shows ONLY if BOTH boxes "
+                                  "match.\n\n"
+                                  "⚠ This is tape-reading CONTEXT, not a proven edge — intraday "
+                                  "alignment is unvalidated. The validated trade is BTST-CARRY."))
+        if (f_hst != "Any" and f_lst != "Any" and _TF_RANK[f_ltf] >= _TF_RANK[f_htf]):
+            st.warning(f"⚠ your 'lower' TF ({f_ltf}) is not below your 'higher' TF ({f_htf}) — "
+                       "the filter still applies, but the HTF/LTF logic is inverted.")
+
+        def _mtf_filter(df_):
+            d_ = df_
+            if f_hst != "Any" and f"s{f_htf}" in d_.columns:
+                d_ = d_[d_[f"s{f_htf}"] == f_hst]
+            if f_lst != "Any" and f"s{f_ltf}" in d_.columns:
+                d_ = d_[d_[f"s{f_ltf}"] == f_lst]
+            return d_
+
+        filtered = _mtf_filter(_deliv_filter(light))
+        active = (f_hst != "Any") or (f_lst != "Any") or (min_wtd > 0) or (min_vs > 0)
+        light_cols = ["symbol", "sector", "ltp", "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
+                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"]
+
+        if not active:
+            st.info(f"**{len(light)} names** in the universe. Pick a **HTF/LTF structure** or "
+                    "raise a **delivery** slider above to select — then the matches get levels, "
+                    "RSI and a verdict on your Lower TF. Showing structure + delivery only until "
+                    "you filter.")
+            st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
+                         hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS})
+            st.stop()
+
+        st.caption(f"🔎 filters: **{len(filtered)}/{len(light)}** names match "
+                   f"(HTF {f_htf}={_struct_label(f_hst)} · LTF {f_ltf}={_struct_label(f_lst)} · "
+                   f"wtdDeliv≥{min_wtd} · vs100D≥{min_vs}).")
+        if filtered.empty:
+            st.info("No name matches this MTF combination right now. That is an answer, not an "
+                    "error — alignment across frames is rare, which is exactly why it's worth "
+                    "screening for. Loosen one leg to 'Any'.")
+            st.stop()
+
+        _MAXE = 60
+        capped = filtered.head(_MAXE)
+        if len(filtered) > _MAXE:
+            st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by day% for "
+                       "levels/verdict (bounds the per-name fetch). Tighten a leg to see the rest.")
+        with st.spinner(f"Reading {len(capped)} matches on {f_ltf} bars for levels & verdict…"):
+            enr = live.enrich_mtf(capped, ltf=f_ltf, risk_on=sc["risk_on"],
+                                  idx_ret=sc.get("idx_ret", 0.0))
+        enr = price_filter(enr, "ltp")
+        if enr.empty:
+            st.info("Matches found, but none could be read on the Lower TF (thin candles). "
+                    "Try a coarser Lower TF.")
+            st.stop()
+
+        long_cols = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "turn₹L",
+                     "day%", "wtd_deliv7", "deliv_vs_100d",
+                     "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
+                     "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
+                     "entry", "stop", "t1", "t2", "atr%", "action"]
+        sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "turn₹L",
+                        "day%", "wtd_deliv7", "deliv_vs_100d",
+                        "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
+                        "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
+                        "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
+
+        @st.fragment(run_every="5s")
+        def _struct_panel():
+            bb = live.refresh_prices(enr, risk_on=sc["risk_on"]) if live.market_open() else enr
+            st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure/levels as-of "
+                       f"{_sa:%H:%M}" if (_sa and live.market_open())
+                       else "market closed — last-session values")
+            tb, tsh = st.tabs([f"🟢 LONG ({f_ltf} bars)", f"🔴 SHORT ({f_ltf} bars)"])
+            with tb:
+                lo = bb[bb["action"] == "LONG"]
+                _lo = lo if not lo.empty else bb
+                st.dataframe(_fmt(_lo)[_cols(_lo, long_cols)], use_container_width=True,
+                             hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS})
+                if lo.empty:
+                    st.caption("No LONG verdict among the matches — showing all matches.")
+            with tsh:
+                st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Overnight "
+                           "short is proven -EV (win 20%); intraday direction has no validated "
+                           "edge either. Weakness screen, not alpha — trade small, manage by s_stop.")
+                sh = bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
+                if sh.empty:
+                    st.caption("No distribution/weakness names among the matches.")
+                else:
+                    st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
+                                 hide_index=True,
+                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SELL_COLS})
+
+        _struct_panel()
+        st.caption("Entry/Stop/T1/T2 = ATR risk geometry on your Lower TF, NOT a forecast. "
+                   "Structure-first is a research lens; the validated trade is BTST-CARRY.")
         st.stop()
 
     # ---- live snapshot (5s price-action scan) — Buy / Sell tabs ---------------

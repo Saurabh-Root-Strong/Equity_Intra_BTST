@@ -888,6 +888,52 @@ def _daily_hist() -> dict:
     return out
 
 
+_DELIV_MOM: dict = {}          # date -> DataFrame(symbol, wtd_deliv7, avg_deliv100, deliv_vs_100d)
+
+
+def deliv_momentum(date=None) -> pd.DataFrame:
+    """Per-stock turnover-weighted DELIVERY metrics — ported verbatim from the DCM
+    sector-rotation view (Daily_Cash_Market/src/analytics/sector_rotation.py):
+
+      • wtd_deliv7    = 7-CALENDAR-day turnover-weighted delivery %
+                        SUM(deliv% x turnover) / SUM(turnover)   — 'smart-money' conviction now
+      • avg_deliv100  = 100-TRADING-day turnover-weighted delivery % baseline (strictly BEFORE
+                        as_of), same units so the comparison is apples-to-apples
+      • deliv_vs_100d = (wtd_deliv7 / avg_deliv100 - 1) x 100    — recent vs OWN historical norm
+                        (+15 = delivery 15% above its own 100D norm; -10 = fading interest)
+
+    ONE archive read per day (cached in _DELIV_MOM), off the 5s path. Leak-free for a next-
+    session entry: as_of = the last COMPLETED close, whose delivery is already published."""
+    key = (pd.Timestamp(date).date() if date is not None else data.last_trading_date().date())
+    hit = _DELIV_MOM.get(key)
+    if hit is not None:
+        return hit
+    as_of = pd.Timestamp(key)
+    start = (as_of - pd.Timedelta(days=170)).strftime("%Y-%m-%d")   # ~100 trading days + buffer
+    df = data.load_eod(start=start, end=as_of.strftime("%Y-%m-%d"))
+    df = df[(df["turnover_lacs"] > 0) & df["deliv_per"].notna()]
+    recent_cut = as_of - pd.Timedelta(days=7)                        # DCM uses 7 CALENDAR days
+
+    def _wtd(x):
+        t = x["turnover_lacs"].sum()
+        return float((x["deliv_per"] * x["turnover_lacs"]).sum() / t) if t > 0 else np.nan
+
+    rows = []
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("trade_date")
+        rec = g[g["trade_date"] > recent_cut]                       # last 7 cal days (incl as_of)
+        hist = g[g["trade_date"] < as_of].tail(100)                 # 100 trading days BEFORE as_of
+        w7 = _wtd(rec) if len(rec) else np.nan
+        w100 = _wtd(hist) if len(hist) else np.nan
+        vs = (w7 / w100 - 1) * 100 if (w100 and w100 > 0 and not np.isnan(w7)) else np.nan
+        rows.append({"symbol": sym, "wtd_deliv7": w7, "avg_deliv100": w100, "deliv_vs_100d": vs})
+    res = pd.DataFrame(rows).set_index("symbol") if rows else pd.DataFrame(
+        columns=["wtd_deliv7", "avg_deliv100", "deliv_vs_100d"])
+    _DELIV_MOM.clear()                                              # never hold two days of frames
+    _DELIV_MOM[key] = res
+    return res
+
+
 def mtf_structure(sym: str) -> dict:
     """Kaufman structure on SIX timeframes for one name — {15m,1h,2h,4h,1D,1W} — from ONE
     15-minute fetch (~20 days, resampled locally to 1h/2h/4h) plus the daily archive
@@ -925,6 +971,185 @@ def mtf_structure(sym: str) -> dict:
         pass
     _MTF_CACHE[key] = out
     return out
+
+
+_UNISCAN_CACHE: dict = {}          # bucket5 -> {"board":..., "risk_on":..., "idx_ret":..., "scanned_at":...}
+_SCAN_WORKERS = 6                  # concurrent /history fetches — the scan is I/O-bound. 6 keeps
+                                   # us near Fyers' ~10 req/s history budget (a burst 429 just
+                                   # yields 'n/a' for that name, non-fatal; a re-scan fills it).
+
+
+def universe_mtf_scan(date=None) -> dict:
+    """STRUCTURE-FIRST scan: the WHOLE liquid universe with its 6-timeframe structure —
+    NO day-move / close-strength pre-screen. This is the source list the HTF/LTF structure
+    filter then narrows (e.g. keep only BREAKOUT_UP on 4h + CONSOLIDATION on 1h).
+
+    Cost is the point to understand: to FILTER by structure you must first COMPUTE structure
+    for every name — one 15-min /history fetch each (~270 calls, resampled locally to
+    1h/2h/4h; 1D/1W from the EOD archive at zero API cost). No bulk history endpoint exists, so
+    the per-name fetch is unavoidable — BUT it is embarrassingly parallel I/O, so the fetches
+    run CONCURRENTLY (bounded pool), turning ~3 min of serial round-trips into ~30s. Then FREE
+    within the same 5-minute bucket (memoised in _UNISCAN_CACHE). Manual snapshot, not a 5s
+    auto-loop. Returns a LIGHT board (structure + ltp + day% + turnover + delivery only);
+    levels/RSI/verdict are added later by enrich_mtf on the FILTERED survivors."""
+    ts = token_status()
+    risk_on = regime.is_risk_on(pd.Timestamp(date) if date is not None
+                                else data.last_trading_date())
+    if not ts["usable"]:
+        return {"ok": False, "status": ts["describe"], "risk_on": risk_on, "board": pd.DataFrame()}
+
+    key = _bucket5()
+    hit = _UNISCAN_CACHE.get(key)
+    if hit is not None and date is None:
+        return {"ok": True, **hit}
+
+    uni = liquid_universe(date).set_index("symbol")
+    dm = deliv_momentum(date)                    # DCM-ported delivery conviction (one read/day)
+    q = _fetch_quotes([fy_symbol(s) for s in uni.index])
+    _nf = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
+    idx_ret = _chp(_nf)
+    if date is None and _nf.get("lp"):
+        risk_on = regime.is_risk_on_live(_nf.get("lp"))
+
+    # ── PHASE 1: cheap pass over the ONE batch quote — no per-name network here ──
+    cand = []
+    for fys, v in q.items():
+        sym = fys.replace("NSE:", "").replace("-EQ", "")
+        if sym not in uni.index:
+            continue
+        c, pc = v.get("lp"), v.get("prev_close_price") or uni.loc[sym, "ref_close"]
+        h, l = v.get("high_price"), v.get("low_price")
+        if None in (c, pc, h, l) or h == l:
+            continue
+        h, l = max(float(h), float(c)), min(float(l), float(c))   # broker range can lag the LTP
+        # NO liquidity floor (user override): the WHOLE F&O universe appears; turn₹L is carried
+        # so you can SEE how thin a name is and judge fill risk yourself.
+        _vol = v.get("volume") or 0
+        turn_l = round((_vol * (h + l + float(c)) / 3.0) / 1e5, 1)   # today's turnover, ₹lacs
+        cand.append((sym, float(c), float(pc), 100 * (float(c) / float(pc) - 1), turn_l))
+
+    # ── PHASE 2: the 15-min structure fetch is the ONLY per-name network cost — and it is
+    # embarrassingly parallel I/O. Run the fetches CONCURRENTLY (bounded pool) instead of one
+    # blocking round-trip at a time: ~30s vs ~3min for the full universe. Pre-warm the shared
+    # daily-archive read ONCE before the fan-out, else N worker threads each trigger a DuckDB
+    # load (mtf_structure's _MTF_CACHE / _daily_hist are plain dicts — GIL makes get/set atomic,
+    # but the first heavy LOAD must be serialised).
+    from concurrent.futures import ThreadPoolExecutor
+    _daily_hist()                                   # warm the 1D/1W source once
+    syms = [x[0] for x in cand]
+    with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as ex:
+        mtfs = dict(zip(syms, ex.map(mtf_structure, syms)))
+
+    _NA = {t: "n/a" for t in ("15m", "1h", "2h", "4h", "1D", "1W")}
+    rows = []
+    for sym, c, pc, day, turn_l in cand:
+        _mtf = mtfs.get(sym) or _NA
+        _wd = float(dm.loc[sym, "wtd_deliv7"]) if sym in dm.index else np.nan
+        _dv = float(dm.loc[sym, "deliv_vs_100d"]) if sym in dm.index else np.nan
+        rows.append({
+            "symbol": sym, "sector": uni.loc[sym, "sector"], "ltp": c, "day%": round(day, 2),
+            "turn₹L": turn_l,                                          # today's turnover (₹lacs)
+            "wtd_deliv7": round(_wd, 1) if _wd == _wd else np.nan,     # NaN-safe (x==x)
+            "deliv_vs_100d": round(_dv, 1) if _dv == _dv else np.nan,
+            "s15m": _mtf["15m"], "s1h": _mtf["1h"], "s2h": _mtf["2h"],
+            "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
+            # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
+            "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
+            "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
+        })
+    board = pd.DataFrame(rows)
+    if not board.empty:
+        board = board.sort_values("day%", ascending=False)
+    out = {"status": ts["describe"], "risk_on": risk_on, "idx_ret": idx_ret,
+           "board": board, "n_scanned": len(rows), "scanned_at": dt.datetime.now()}
+    if date is None:
+        _UNISCAN_CACHE.clear()                  # never hold two buckets of full-universe boards
+        _UNISCAN_CACHE[key] = out
+    return {"ok": True, **out}
+
+
+def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
+               idx_ret: float = 0.0) -> pd.DataFrame:
+    """Add levels / RSI / structure / verdict to the FILTERED survivors of universe_mtf_scan.
+    The LOWER timeframe (ltf) drives the risk geometry and the read — HTF is the context gate,
+    LTF is where you actually time and size the entry. Bounded to the handful the MTF filter
+    let through, so the heavy per-name deep_state fetch only runs on names you care about."""
+    if board.empty:
+        return board
+    _tfmin = {"4h": 240, "2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(ltf, 60)
+
+    def _one(r):
+        sym, live_pc = r["symbol"], r["_pc"]
+        ds = deep_state(sym, tf=ltf, ref_close=live_pc, ref_avg_vol=None, idx_ret=idx_ret)
+        if not ds:
+            return None
+        s, lv = ds["state"], ds["levels"]
+        atr_tf = ds.get("atr_tf", 0.0)
+        ltp = s["ltp"]
+        cndl = ds.get("candles")
+        bar_time = None
+        if cndl is not None and len(cndl):
+            o = cndl["ts"].iloc[-1]
+            close_t = min(o + pd.Timedelta(minutes=_tfmin), o.normalize() + pd.Timedelta("15h30min"))
+            bar_time = f"{o.strftime('%H:%M')}-{close_t.strftime('%H:%M')}"
+        _ex = _session_extras(sym, live_pc, r["_vol_med20"], rs_cum9=r["_rs_cum9"])
+        entered = _ex.get("trigger")
+        _tpx = _ex.get("trig_px")
+        at_px = round(_tpx, 2) if _tpx else None
+        since_pct = round(100 * (ltp / _tpx - 1), 2) if (_tpx and _tpx > 0) else None
+        forming = None
+        if cndl is not None and len(cndl):
+            _o = cndl["ts"].iloc[-1]
+            _close_t = min(_o + pd.Timedelta(minutes=_tfmin),
+                           _o.normalize() + pd.Timedelta("15h30min"))
+            forming = dt.datetime.now() < _close_t.to_pydatetime()
+        s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
+        s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
+        s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
+        return {
+            "symbol": sym, "entered": entered, "at": at_px, "since%": since_pct,
+            "time": bar_time,
+            "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
+            "s15m": r["s15m"], "s1h": r["s1h"], "s2h": r["s2h"],
+            "s4h": r["s4h"], "s1D": r["s1D"], "s1W": r["s1W"],
+            "sector": r["sector"], "ltp": ltp, "turn₹L": r.get("turn₹L"),
+            "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
+            "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
+            "character": s["character"], "vs_vwap%": s["vs_vwap"],
+            "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
+            "tone": s["tone"], "RS%": s.get("rs_vs_index"),
+            "entry": lv.get("entry"), "stop": lv.get("stop"),
+            "t1": lv.get("t1"), "t2": lv.get("t2"),
+            "s_stop": s_stop, "s_t1": s_t1, "s_t2": s_t2, "atr%": lv.get("atr%"),
+            "action": _tf_action(s, risk_on), "sell": _tf_sell_action(s, risk_on),
+            "_atr_tf": atr_tf, "_pc": live_pc,
+            "_daylow": float(cndl["low"].min()) if (cndl is not None and len(cndl)) else None,
+            "_bar_h": float(cndl["high"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
+            "_bar_l": float(cndl["low"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
+            "_vwap": s.get("vwap"),
+        }
+
+    # Same parallel-I/O pattern as the universe scan: each survivor's deep_state is one blocking
+    # /history fetch, independent of the rest. Pre-warm the shared index series once (RS leg
+    # source), then fan out. Bounded pool — survivors are capped upstream, so this is small.
+    def _one_safe(r):
+        # deep_state -> fetch_intraday does a bare requests.get: a network blip / bad candle on
+        # ONE name would raise, and ex.map surfaces it on iteration — killing the WHOLE table.
+        # Isolate each name: a failure drops that row, never the batch.
+        try:
+            return _one(r)
+        except Exception:
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    _index_intraday_5m(); _nifty_prev_close()       # warm the RS-leg source before the fan-out
+    recs = [r for _, r in board.iterrows()]
+    with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as ex:
+        out = [o for o in ex.map(_one_safe, recs) if o is not None]
+    eb = pd.DataFrame(out)
+    if not eb.empty:
+        eb = eb.sort_values(["action", "bar_clr"], ascending=[True, False])
+    return eb
 
 
 def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
