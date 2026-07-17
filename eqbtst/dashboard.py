@@ -228,12 +228,16 @@ def _uni_scan(nonce: int):
     # this, a filter change that happens to land after the 5-min memo bucket rolls would trigger
     # a surprise ~30s cold re-scan. Filters must be instant; scanning must be deliberate.
     sc = live.universe_mtf_scan()
-    # RAISE on failure so st.cache_data does NOT store an ok=False result. Otherwise a scan run
-    # before the morning token refresh would pin an empty board for the full 30-min TTL, and the
-    # user would see nothing even after re-authing (until they happened to hit ↻). Raising makes
-    # the next rerun retry cleanly.
+    # RAISE on failure OR on an empty board, so st.cache_data NEVER stores a barren result.
+    # Two poisoning paths this closes: (1) a scan before the ~06:00 token refresh -> ok=False;
+    # (2) a scan in the pre-open / first seconds of the session -> ok=True but ZERO quotes ->
+    # empty board. Either one, if cached, pins "no names" for the full 30-min TTL — so the board
+    # stays empty even after the market opens. Raising keeps it OUT of the cache, so the very
+    # next rerun (or the one-shot auto-retry below) re-fetches cleanly.
     if not sc.get("ok"):
         raise RuntimeError(sc.get("status") or "universe scan unavailable")
+    if sc["board"].empty:
+        raise RuntimeError("no names returned (pre-open, or a transient quote-fetch miss)")
     return sc
 
 
@@ -379,13 +383,24 @@ if tf == "Intraday":
             with st.spinner("Scanning the full F&O universe on 6 timeframes (concurrent fetch, "
                             "~30s cold; instant once pinned)…"):
                 sc = _uni_scan(st.session_state["uni_nonce"])
+            st.session_state.pop("_uni_retried", None)      # success — clear the retry guard
         except Exception as _e:
-            st.info(f"Universe scan unavailable — {_e}. Market closed / pre-open, or the Fyers "
-                    "token is stale (~06:00 daily expiry). Re-auth, then hit **↻ re-scan**.")
-            st.stop()
-        if sc["board"].empty:
-            st.info("Universe scan returned no names — market closed / pre-open. During a live "
-                    "session this fills with the full F&O universe.")
+            # An empty/failed scan is NOT cached (it raised). If the market is open this is almost
+            # always a transient first-seconds-of-session quote miss — auto-retry ONCE with a fresh
+            # nonce before bothering the user. Guarded so it can never loop.
+            if live.market_open() and not st.session_state.get("_uni_retried"):
+                st.session_state["_uni_retried"] = True
+                st.session_state["uni_nonce"] += 1
+                live._UNISCAN_CACHE.clear()
+                st.rerun()
+            _open = live.market_open()
+            st.session_state.pop("_uni_retried", None)
+            st.info(
+                (f"Universe scan came back empty — {_e}. **Market is OPEN**, so this is a "
+                 "transient quote-fetch miss (or the very first seconds of the session). It is "
+                 "**not cached** — just hit **↻ re-scan universe**.") if _open else
+                (f"Universe scan unavailable — {_e}. Market is closed / pre-open, or the Fyers "
+                 "token is stale (~06:00 daily expiry). Re-auth, then hit **↻ re-scan**."))
             st.stop()
         light = price_filter(sc["board"], "ltp")     # price band applies; no turnover floor
         _sa = sc.get("scanned_at")
@@ -538,6 +553,27 @@ if tf == "Intraday":
             st.warning(f"⚠ your 'lower' TF ({f_ltf}) is not below your 'higher' TF ({f_htf}) — "
                        "the filter still applies, but the HTF/LTF logic is inverted.")
 
+        # STATUS LINE — a TF pick does NOTHING until its structure box is a shape. Say so, so
+        # a selected "4h / 1h" next to "Any" never reads as an active-but-empty filter.
+        _htf_on, _ltf_on = f_hst != "Any", f_lst != "Any"
+        if not (_htf_on or _ltf_on or min_wtd > 0 or min_vs > 0):
+            st.caption(f"⚪ **No filter active.** Higher **{f_htf}** / Lower **{f_ltf}** are "
+                       "selected but INERT — a timeframe filters only once its **structure** box "
+                       "is set to a shape (not 'Any'). Showing all names. When you do filter, "
+                       f"**Lower {f_ltf}** builds the levels/RSI/verdict.")
+        else:
+            _bits = []
+            if _htf_on:
+                _bits.append(f"Higher **{f_htf}** = {_struct_label(f_hst)}")
+            if _ltf_on:
+                _bits.append(f"Lower **{f_ltf}** = {_struct_label(f_lst)}")
+            if min_wtd > 0:
+                _bits.append(f"wtdDeliv ≥ **{min_wtd}%**")
+            if min_vs > 0:
+                _bits.append(f"vs100D ≥ **{min_vs}%**")
+            st.caption("🟢 **Active filter:** " + "  ·  ".join(_bits)
+                       + f"  →  levels/verdict on Lower **{f_ltf}**.")
+
         def _mtf_filter(df_):
             d_ = df_
             if f_hst != "Any" and f"s{f_htf}" in d_.columns:
@@ -546,7 +582,8 @@ if tf == "Intraday":
                 d_ = d_[d_[f"s{f_ltf}"] == f_lst]
             return d_
 
-        filtered = _mtf_filter(_deliv_filter(light))
+        after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
+        filtered = _mtf_filter(after_deliv)
         active = (f_hst != "Any") or (f_lst != "Any") or (min_wtd > 0) or (min_vs > 0)
         light_cols = ["symbol", "sector", "ltp", "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                       "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"]
@@ -560,20 +597,32 @@ if tf == "Intraday":
                          hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS})
             st.stop()
 
-        st.caption(f"🔎 filters: **{len(filtered)}/{len(light)}** names match "
-                   f"(HTF {f_htf}={_struct_label(f_hst)} · LTF {f_ltf}={_struct_label(f_lst)} · "
-                   f"wtdDeliv≥{min_wtd} · vs100D≥{min_vs}).")
+        # ── FILTER FUNNEL — show WHERE names drop, so a 0 is diagnosable (which stage killed
+        # it?), not a mystery. Only stages you actually engaged appear.
+        _funnel = [f"scanned **{sc['n_scanned']}**"]
+        if (st.session_state.get("price_max") or 0) or (st.session_state.get("price_min") or 0):
+            _funnel.append(f"price band → **{len(light)}**")
+        if min_wtd > 0 or min_vs > 0:
+            _funnel.append(f"delivery (wtd≥{min_wtd} · vs100D≥{min_vs}) → **{len(after_deliv)}**")
+        if f_hst != "Any" or f_lst != "Any":
+            _funnel.append(f"structure (HTF {f_htf}={_struct_label(f_hst)} · "
+                           f"LTF {f_ltf}={_struct_label(f_lst)}) → **{len(filtered)}**")
+        st.caption("🔎 funnel:  " + "  →  ".join(_funnel))
         if filtered.empty:
-            st.info("No name matches this MTF combination right now. That is an answer, not an "
-                    "error — alignment across frames is rare, which is exactly why it's worth "
-                    "screening for. Loosen one leg to 'Any'.")
+            st.info("No name survives this combination right now. That is an answer, not an error "
+                    "— read the funnel above to see WHICH stage emptied it, then loosen that leg "
+                    "(a slider to 0, or a structure box to 'Any').")
             st.stop()
 
+        # CAP the per-name enrich (cost bound). Sort by TURNOVER, not day% — day%-desc kept the
+        # top gainers and would drop the very names a Downtrend/Breakdown filter is looking for
+        # (they have LOW day%). Liquidity-first keeps the most FILLABLE matches, any direction.
         _MAXE = 60
-        capped = filtered.head(_MAXE)
+        _cap_key = "turn₹L" if "turn₹L" in filtered.columns else "day%"
+        capped = filtered.sort_values(_cap_key, ascending=False).head(_MAXE)
         if len(filtered) > _MAXE:
-            st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by day% for "
-                       "levels/verdict (bounds the per-name fetch). Tighten a leg to see the rest.")
+            st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by turnover "
+                       "(most fillable) for levels/verdict. Tighten a leg to see the rest.")
         with st.spinner(f"Reading {len(capped)} matches on {f_ltf} bars for levels & verdict…"):
             enr = live.enrich_mtf(capped, ltf=f_ltf, risk_on=sc["risk_on"],
                                   idx_ret=sc.get("idx_ret", 0.0))
