@@ -588,7 +588,7 @@ if tf == "Intraday":
                                    "| Horizon | Trigger (LTF) | Confirm (HTF) | Hold |\n"
                                    "|---|---|---|---|\n"
                                    "| Intraday | 15m | 1h | same day |\n"
-                                   "| BTST | 1h | 4h | overnight → ~09:30 |\n"
+                                   "| BTST | 1h | 4h | buy today → sell next day |\n"
                                    "| Swing | 4h | 1D | 2–10 sessions |\n"
                                    "| Positional | 1D | 1W | weeks |\n\n"
                                    "The higher frame gives the **box and the trend**; the lower "

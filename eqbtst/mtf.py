@@ -48,10 +48,14 @@ PRESETS: dict[str, dict] = {
     },
     "btst": {
         "label": "BTST  ·  1h trigger / 4h confirm",
-        "ltf": "1h", "htf": "4h", "hold": "buy today, exit tomorrow ~09:30",
+        "ltf": "1h", "htf": "4h", "hold": "buy today, sell NEXT DAY (one night)",
         "note": "Matches the ONE validated edge in this project (overnight carry) in HORIZON "
                 "only. The edge itself comes from the delivery + close-strength footprint, "
-                "not from these bars -- use structure to size and time, not to select.",
+                "not from these bars -- use structure to size and time, not to select. "
+                "WHERE THE MONEY IS: the measured payoff is the OVERNIGHT GAP, i.e. it is "
+                "already in your hands at the next open. The following day session added "
+                "nothing in testing, and holding a SECOND night (day-2) was dead. So sell "
+                "next day -- early in it, not late.",
     },
     "swing": {
         "label": "Swing  ·  4h trigger / 1D confirm",
