@@ -180,7 +180,19 @@ def levels(ltp: float, atr_val: float, day_low: float | None = None,
 
 
 def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
-    """Market structure on this timeframe (CONTEXT, not a signal — intraday structure has
+    """Structure LABEL only — thin wrapper over struct_full (see it for the rules)."""
+    return struct_full(candles, lookback)["struct"]
+
+
+def struct_full(candles: pd.DataFrame, lookback: int | None = None) -> dict:
+    """Structure label PLUS the context a multi-timeframe synthesis needs: the window's
+    range hi/lo (the BOX price lives in), Kaufman ER, coil ratio, bar count, last close.
+
+    The box is the point. A label alone cannot tell you whether a lower-TF breakout is real
+    — that depends on WHERE inside the higher-TF box price sits (edge = possible resolution,
+    middle = statistically a false break). See mtf.synthesize.
+
+    Market structure on this timeframe (CONTEXT, not a signal — intraday structure has
     no validated edge). MAGNITUDE-gated, ATR-normalised: the label is defined by the SIZE
     of the move, not just topology, so a marginal new high is NOT called a breakout.
 
@@ -195,9 +207,11 @@ def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
     """
     from . import config
     lb = lookback if lookback is not None else config.STRUCT_LOOKBACK
+    if candles is None or "close" not in getattr(candles, "columns", []):
+        return {"struct": "n/a", "n": 0}
     c = candles["close"].to_numpy(float)
     if len(c) < 5:
-        return "n/a"
+        return {"struct": "n/a", "n": int(len(c))}
     seg = c[-lb:]
     net = seg[-1] - seg[0]
     denom = np.abs(np.diff(seg)).sum()
@@ -212,25 +226,33 @@ def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
     margin = config.STRUCT_BREAKOUT_ATR * a
     prior_hi = hi[:-1].max() if len(hi) > 1 else last
     prior_lo = lo[:-1].min() if len(lo) > 1 else last
+    coil = None
+    if len(hi) >= 8:
+        _sp = np.array([hi[i:i + 3].max() - lo[i:i + 3].min() for i in range(len(hi) - 2)])
+        _typ = float(np.median(_sp[:-1]))
+        coil = round(float(_sp[-1]) / _typ, 2) if _typ > 0 else None
+    ctx = {"hi": float(hi.max()), "lo": float(lo.min()), "er": round(float(er), 2),
+           "coil": coil, "n": int(len(c)), "last": float(last), "atr": float(a)}
+
+    def _r(s):
+        return {"struct": s, **ctx}
+
     # BREAKOUT — only if the close clears the range by a MEANINGFUL margin (not a 0.1% poke)
     if last > prior_hi + margin:
-        return "BREAKOUT_UP"
+        return _r("BREAKOUT_UP")
     if last < prior_lo - margin:
-        return "BREAKOUT_DOWN"
+        return _r("BREAKOUT_DOWN")
     # TREND — efficient AND a real distance covered
     if er >= config.STRUCT_TREND_ER and abs(net) >= config.STRUCT_TREND_ATR * a:
-        return "TREND_UP" if net > 0 else "TREND_DOWN"
+        return _r("TREND_UP" if net > 0 else "TREND_DOWN")
     # COIL — the recent range is TIGHT vs its OWN typical range. Apples-to-apples: the latest
     # 3-bar span against the MEDIAN 3-bar span (same window length). The old test compared 3
     # bars to the other 17 — mechanically biased, since fewer bars always span less, so it fired
     # on ~70% of random walks (labelled normal chop as "coiling"). This measures a REAL
     # volatility contraction: the recent squeeze is < STRUCT_COIL x what this name usually does.
-    if len(hi) >= 8:
-        spans = np.array([hi[i:i + 3].max() - lo[i:i + 3].min() for i in range(len(hi) - 2)])
-        typ = float(np.median(spans[:-1]))                 # typical 3-bar span (excl. the latest)
-        if typ > 0 and spans[-1] < config.STRUCT_COIL * typ:
-            return "CONSOLIDATION"
-    return "RANGE"
+    if coil is not None and coil < config.STRUCT_COIL:
+        return _r("CONSOLIDATION")
+    return _r("RANGE")
 
 
 def band_pct(candles: pd.DataFrame, label: str | None = None,

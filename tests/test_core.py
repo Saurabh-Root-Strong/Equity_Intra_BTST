@@ -383,3 +383,69 @@ def test_calibrate_shrinks_and_only_cuts():
     assert _mult(_synth(80, -30.0, 1))["size_multiplier"] == 0.0     # clearly negative -> stand aside
     assert _mult(_synth(300, 26.0, 2))["size_multiplier"] > 0.0      # healthy large sample not falsely killed
     assert _mult(_synth(3, 20.0, 3))["size_multiplier"] == calibrate._SIZE_FLOOR   # tiny n -> floor
+
+
+# ── multi-timeframe HTF x LTF synthesis (eqbtst/mtf.py) ────────────────────────
+def test_struct_full_matches_structure_label():
+    """struct_full must be a pure superset of structure() — the label cannot drift when the
+    box/ER context is added, or every existing filter silently changes meaning."""
+    from eqbtst import indicators
+    rng = np.random.default_rng(11)
+    for _ in range(300):
+        c = 100 + np.cumsum(rng.normal(0, 1, 60))
+        d = pd.DataFrame({"open": c, "high": c + rng.random(60),
+                          "low": c - rng.random(60), "close": c, "volume": 1})
+        assert indicators.struct_full(d)["struct"] == indicators.structure(d)
+    assert indicators.struct_full(pd.DataFrame({"close": [1.0, 2.0]}))["struct"] == "n/a"
+
+
+def test_location_decides_whether_a_break_is_real():
+    """The same LTF breakout is a RESOLUTION at the HTF box edge and a TRAP mid-box. This is
+    the entire point of using two timeframes — if it ever stops holding, the tag is noise."""
+    from eqbtst import mtf
+    htf = {"struct": "RANGE", "hi": 110.0, "lo": 100.0, "n": 20}
+    up = {"struct": "BREAKOUT_UP", "n": 20}
+    dn = {"struct": "BREAKOUT_DOWN", "n": 20}
+    assert mtf.synthesize(htf, up, 109.5)["tag"] == "RANGE-TOP BREAK"     # loc 0.95
+    assert mtf.synthesize(htf, up, 105.0)["tag"] == "FALSE-BREAK TRAP"    # loc 0.50
+    assert mtf.synthesize(htf, dn, 100.5)["tag"] == "RANGE-FLOOR BREAK"   # loc 0.05
+    assert mtf.synthesize(htf, dn, 105.0)["tag"] == "FALSE-BREAK TRAP"
+
+
+def test_sideways_is_not_a_squeeze():
+    """REGRESSION: lumping plain RANGE in with CONSOLIDATION stamped 'NESTED SQUEEZE' on 85 of
+    140 names on a live board. A squeeze needs a real volatility CONTRACTION on some frame."""
+    from eqbtst import mtf
+    box = {"hi": 110.0, "lo": 100.0, "n": 20}
+    rng_ = {"struct": "RANGE", **box}
+    coil = {"struct": "CONSOLIDATION", **box}
+    assert mtf.synthesize(rng_, rng_, 105.0)["tag"] == "RANGE-BOUND (no setup)"
+    assert mtf.synthesize(coil, rng_, 105.0)["tag"] == "NESTED SQUEEZE"
+    assert mtf.synthesize(rng_, coil, 105.0)["tag"] == "NESTED SQUEEZE"
+    assert mtf.synthesize(coil, coil, 105.0)["tag"] == "NESTED SQUEEZE"
+
+
+def test_with_trend_continuation_and_warming_guards():
+    from eqbtst import mtf
+    trend = {"struct": "TREND_UP", "hi": 110.0, "lo": 100.0, "n": 20}
+    assert mtf.synthesize(trend, {"struct": "CONSOLIDATION", "n": 20},
+                          108.0)["tag"] == "WITH-TREND CONTINUATION"
+    assert mtf.synthesize(trend, {"struct": "TREND_UP", "n": 20},
+                          108.0)["tag"] == "EXTENDED (aligned)"
+    assert mtf.synthesize(trend, {"struct": "TREND_DOWN", "n": 20},
+                          108.0)["tag"] == "PULLBACK vs HTF"
+    # too few closed bars must NEVER produce a tradeable-looking tag
+    assert mtf.synthesize({"struct": "TREND_UP", "n": 3}, trend, 105.0)["tag"] == "HTF warming"
+    assert mtf.synthesize(trend, {"struct": "n/a", "n": 0}, 105.0)["tag"] == "LTF warming"
+
+
+def test_every_preset_is_nested_and_ranked():
+    """A preset whose 'lower' frame is not below its 'higher' frame inverts the whole read."""
+    from eqbtst import mtf
+    order = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440, "1W": 10080}
+    for k in mtf.PRESET_ORDER:
+        p = mtf.PRESETS[k]
+        assert order[p["ltf"]] < order[p["htf"]], k
+    for tag in mtf.TAG_ICON:                      # every tag must be rankable and drawable
+        assert tag in mtf.TAG_RANK, tag
+    assert mtf.TAG_RANK["WITH-TREND CONTINUATION"] < mtf.TAG_RANK["FALSE-BREAK TRAP"]

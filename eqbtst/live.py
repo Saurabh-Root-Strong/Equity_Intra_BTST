@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -965,13 +966,25 @@ def mtf_structure(sym: str) -> dict:
         return hit
     # out carries BOTH the label (s-key, used for filtering) and the live band ±% (b-key, used
     # for display). Additive b-keys keep every existing caller working (they read only labels).
-    out = {t: "n/a" for t in ("15m", "1h", "2h", "4h", "1D", "1W")}
-    out.update({f"b{t}": float("nan") for t in ("15m", "1h", "2h", "4h", "1D", "1W")})
+    _TFS = ("15m", "1h", "2h", "4h", "1D", "1W")
+    out = {t: "n/a" for t in _TFS}
+    out.update({f"b{t}": float("nan") for t in _TFS})
+    # h/l = that frame's RANGE BOX, n = closed bars behind the label. Carried so the HTFxLTF
+    # synthesis can compute WHERE price sits in the higher-TF box (the variable that separates
+    # a real range resolution from a false break) WITHOUT re-fetching a single candle.
+    out.update({f"h{t}": float("nan") for t in _TFS})
+    out.update({f"l{t}": float("nan") for t in _TFS})
+    out.update({f"n{t}": 0 for t in _TFS})
 
     def _set(tf, frame):
-        lab = indicators.structure(frame) if (frame is not None and len(frame) >= 5) else "n/a"
+        sf = (indicators.struct_full(frame) if (frame is not None and len(frame) >= 5)
+              else {"struct": "n/a", "n": 0})
+        lab = sf["struct"]
         out[tf] = lab
         out[f"b{tf}"] = indicators.band_pct(frame, lab) if lab != "n/a" else float("nan")
+        out[f"h{tf}"] = float(sf.get("hi", float("nan")) or float("nan"))
+        out[f"l{tf}"] = float(sf.get("lo", float("nan")) or float("nan"))
+        out[f"n{tf}"] = int(sf.get("n", 0))
 
     try:
         f = fetch_intraday(sym, tf="15m", lookback_days=20)
@@ -1062,7 +1075,25 @@ def universe_mtf_scan(date=None) -> dict:
     with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as ex:
         mtfs = dict(zip(syms, ex.map(mtf_structure, syms)))
 
-    _NA = {t: "n/a" for t in ("15m", "1h", "2h", "4h", "1D", "1W")}
+    # THROTTLE SWEEP — a burst of ~250 /history calls trips Fyers' rate limit for a slice of
+    # the universe, and mtf_structure swallows the error into 'n/a'. Measured: 48 of 243 names
+    # (TCS, RELIANCE — not thin names) came back blank on EVERY intraday frame, and a blank
+    # row silently VANISHES from any HTF/LTF filter. That is the worst failure mode there is:
+    # a filter that quietly answers from 80% of the universe while looking complete. Retry the
+    # blanks once, slower and narrower, and report what still failed.
+    _blank = [s for s in syms if (mtfs.get(s) or {}).get("15m", "n/a") == "n/a"]
+    if _blank:
+        time.sleep(1.0)                                  # let the rate-limit window roll over
+        for s in _blank:
+            _MTF_CACHE.pop((s, dt.date.today(), _bucket5()), None)   # drop the cached blank
+        with ThreadPoolExecutor(max_workers=2) as ex:    # gentler than the main fan-out
+            for s, v in zip(_blank, ex.map(mtf_structure, _blank)):
+                mtfs[s] = v
+    _still = sum(1 for s in syms if (mtfs.get(s) or {}).get("15m", "n/a") == "n/a")
+
+    _TFS = ("15m", "1h", "2h", "4h", "1D", "1W")
+    _NA = {t: "n/a" for t in _TFS}
+    _NA.update({f"{p}{t}": (0 if p == "n" else float("nan")) for t in _TFS for p in "bhln"})
     rows = []
     for sym, c, pc, day, turn_l in cand:
         _mtf = mtfs.get(sym) or _NA
@@ -1077,6 +1108,9 @@ def universe_mtf_scan(date=None) -> dict:
             "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
             "bnds15m": _mtf["b15m"], "bnds1h": _mtf["b1h"], "bnds2h": _mtf["b2h"],
             "bnds4h": _mtf["b4h"], "bnds1D": _mtf["b1D"], "bnds1W": _mtf["b1W"],
+            # the per-frame range BOX + bar count — feeds the HTFxLTF synthesis (mtf.py)
+            **{f"box_{p}{t}": _mtf.get(f"{p}{t}", float("nan"))
+               for t in _TFS for p in ("h", "l", "n")},
             # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
             "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
             "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
@@ -1085,11 +1119,43 @@ def universe_mtf_scan(date=None) -> dict:
     if not board.empty:
         board = board.sort_values("day%", ascending=False)
     out = {"status": ts["describe"], "risk_on": risk_on, "idx_ret": idx_ret,
-           "board": board, "n_scanned": len(rows), "scanned_at": dt.datetime.now()}
+           "board": board, "n_scanned": len(rows), "scanned_at": dt.datetime.now(),
+           # names whose intraday frames are STILL blank after the retry — they cannot match
+           # any intraday structure filter, so the count must be visible, not swallowed.
+           "n_blank_intraday": int(_still)}
     if date is None:
         _UNISCAN_CACHE.clear()                  # never hold two buckets of full-universe boards
         _UNISCAN_CACHE[key] = out
     return {"ok": True, **out}
+
+
+def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
+    """Attach the HTFxLTF chartist synthesis to every row: setup tag, quality rank, the
+    plain-English read, and `loc` (where the LTP sits inside the higher-TF range box).
+
+    ZERO network cost — the scan already carried each frame's box (box_h/box_l/box_n), so
+    this is pure arithmetic over the existing board and re-runs instantly when you switch
+    preset. See mtf.py for what the tags mean and why none of them is a validated signal."""
+    from . import mtf as _mtf_mod
+    if board is None or board.empty:
+        return board
+    b = board.copy()
+    tags, reads, ranks, locs = [], [], [], []
+    for _, r in b.iterrows():
+        def _side(tf):
+            return {"struct": r.get(f"s{tf}", "n/a"),
+                    "hi": r.get(f"box_h{tf}"), "lo": r.get(f"box_l{tf}"),
+                    "n": int(r.get(f"box_n{tf}") or 0)}
+        s = _mtf_mod.synthesize(_side(htf), _side(ltf), r.get("ltp"))
+        tags.append(s["tag"])
+        reads.append(s["read"])
+        ranks.append(_mtf_mod.TAG_RANK.get(s["tag"], 9))
+        locs.append(round(s["loc"], 2) if s.get("loc") is not None else np.nan)
+    b["setup"] = tags
+    b["setup_rank"] = ranks
+    b["loc"] = locs                      # 0 = at HTF box low, 1 = at HTF box high
+    b["setup_read"] = reads
+    return b
 
 
 def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
@@ -1139,6 +1205,9 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             "bnds15m": r.get("bnds15m"), "bnds1h": r.get("bnds1h"), "bnds2h": r.get("bnds2h"),
             "bnds4h": r.get("bnds4h"), "bnds1D": r.get("bnds1D"), "bnds1W": r.get("bnds1W"),
             "sector": r["sector"], "ltp": ltp, "turn₹L": r.get("turn₹L"),
+            # carried through so the enriched table keeps the HTFxLTF read it was selected on
+            "setup": r.get("setup"), "loc": r.get("loc"),
+            "setup_rank": r.get("setup_rank"), "setup_read": r.get("setup_read"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],

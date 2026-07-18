@@ -17,7 +17,7 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from eqbtst import config, data, ledger, live, screen
+from eqbtst import config, data, ledger, live, mtf, screen
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
 
@@ -49,6 +49,16 @@ def _struct_label(v):
     return _STRUCT_LABEL.get(v, v)
 
 
+def _tally(shown, total, what="names", extra=""):
+    """Footer under a table: how many rows you are LOOKING at vs how many exist upstream.
+    A table that is capped or filtered otherwise reads as 'that is all there is' — the
+    denominator is what stops a 12-row view being mistaken for a 12-name universe."""
+    pct = f" · {shown / total * 100:.0f}% of universe" if total else ""
+    same = shown == total
+    body = (f"**{shown}** {what}" if same else f"showing **{shown}** of **{total}** {what}{pct}")
+    return st.caption("Σ  " + body + (f"  ·  {extra}" if extra else ""))
+
+
 def _fmt(df):
     """Render-time tidy-up. A name can sit in the timeframe list (it passed the tf verdict)
     while NEVER having fired the BTST footprint — so entered / at / since% are genuinely
@@ -76,6 +86,9 @@ def _fmt(df):
             ]
         else:
             d[c] = d[c].map(_struct_label)
+    if "setup" in d.columns:                               # tag -> icon + tag (display only)
+        d["setup"] = [f"{mtf.TAG_ICON.get(v, '')} {v}".strip() if isinstance(v, str) else "—"
+                      for v in d["setup"]]
     return d
 
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
@@ -272,6 +285,33 @@ TF_COLS = {
     "action": st.column_config.TextColumn("action", help="STAGE-2 verdict. The stock reached this table because the 1-DAY BAR let it in (day% ≥1% and day-clr ≥0.5, top 25). THIS column is the timeframe's judgement of it: LONG = the last bar OF THIS TIMEFRAME closed strong + above session VWAP + RSI not weak + RS-leader. AVOID = weak bar / below VWAP / regime-off. Long-only. NOTE: intraday direction has no validated overnight-grade edge — manage strictly by the stop."),
 }
 
+# HTF x LTF synthesis columns — the chartist read (see eqbtst/mtf.py).
+SETUP_COLS = {
+    "setup": st.column_config.TextColumn(
+        "setup", width="medium",
+        help="The HIGHER-TF × LOWER-TF read for your chosen horizon — what the two frames say "
+             "TOGETHER, which neither says alone.\n\n"
+             "🎯 WITH-TREND CONTINUATION — HTF trending, LTF coiling into it. Textbook.\n"
+             "🚀 RANGE-TOP BREAK — LTF breaking up AT the HTF ceiling (the only place a break "
+             "can be real).\n"
+             "🔻 RANGE-FLOOR BREAK — the mirror, at the HTF floor.\n"
+             "↩️ PULLBACK vs HTF — LTF against the HTF trend: a dip zone if the HTF holds, an "
+             "early reversal warning if it breaks.\n"
+             "⚠️ EXTENDED (aligned) — both frames same direction but late; chasing.\n"
+             "🌀 NESTED SQUEEZE — both compressing. Move loading, DIRECTION UNKNOWN. Wait.\n"
+             "〰️ DRIFT-IN-RANGE — LTF wandering mid-box. Noise.\n"
+             "🪤 FALSE-BREAK TRAP — LTF break in the MIDDLE of the HTF box. Statistically fades. "
+             "Do not chase.\n\n"
+             "CONTEXT, not a signal — intraday MTF alignment is unvalidated in this stack."),
+    "loc": st.column_config.NumberColumn(
+        "loc", format="%.2f",
+        help="WHERE the price sits inside the HIGHER-TF range box. 0.00 = at the box LOW, "
+             "1.00 = at the box HIGH, 0.50 = dead middle.\n\n"
+             "This is the variable that decides whether a lower-TF breakout means anything: "
+             "≥0.72 (at the ceiling) or ≤0.28 (at the floor) = a break can genuinely resolve "
+             "the range. Anywhere in the middle = the same break is a trap."),
+}
+
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
 DELIV_COLS = {
     "wtd_deliv7": st.column_config.NumberColumn(
@@ -448,6 +488,14 @@ if tf == "Intraday":
                    f"{sc.get('idx_ret', 0):+.2f}% · regime "
                    f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}"
                    + ("  ·  🔄 auto-refresh ON (next 15-min close)" if auto_struct else ""))
+        # A name with no intraday candles cannot match ANY intraday structure filter — it just
+        # disappears. Say how many, so the board is never silently answering from a subset.
+        _nb = sc.get("n_blank_intraday", 0)
+        if _nb:
+            st.caption(f"⚠ **{_nb}** of {sc['n_scanned']} names have no intraday candles (broker "
+                       "rate-limit or no data) — they show `—` on 15m/1h/2h/4h and CANNOT match "
+                       "an intraday structure filter. Their 1D/1W are unaffected. ↻ refresh to "
+                       "retry them.")
 
         # ── DELIVERY-CONVICTION FILTERS — ported from the DCM sector-rotation view ──
         # Same two sliders you use there, same formulas (turnover-weighted delivery). Default 0
@@ -519,9 +567,55 @@ if tf == "Intraday":
         _NONE = "— none —"                     # disable this whole TF leg (TF + its structure)
         _STRUCTS = ["Any", "BREAKOUT_UP", "TREND_UP", "CONSOLIDATION", "RANGE",
                     "TREND_DOWN", "BREAKOUT_DOWN"]
+        # ── TRADE HORIZON PRESET ──────────────────────────────────────────────────────
+        # The LTF/HTF pair is not a taste, it is the HOLD PERIOD. Each preset nests a trigger
+        # frame inside a confirmation frame ~4x coarser (the classical ratio: fine enough to
+        # time an entry, coarse enough for the context to mean something). Picking a horizon
+        # sets BOTH frames at once and turns on the HTFxLTF setup read.
+        _PRE_OPTS = ["custom"] + mtf.PRESET_ORDER
+        _pre_lbl = {"custom": "⚙ Custom — pick both frames myself",
+                    **{k: v["label"] for k, v in mtf.PRESETS.items()}}
+        pc1, pc2 = st.columns([3, 2])
+        preset = pc1.selectbox("Trade horizon (sets both timeframes)", _PRE_OPTS,
+                               index=_PRE_OPTS.index("btst"), key="mtf_preset",
+                               format_func=lambda k: _pre_lbl[k],
+                               help=(
+                                   "**Pick the HOLD, and the timeframes follow.**\n\n"
+                                   "A pair is only useful if the confirmation bar closes inside "
+                                   "your holding period — a weekly bar cannot inform a trade you "
+                                   "exit at 15:20. Each preset nests the trigger frame inside a "
+                                   "confirmation frame about 4× coarser.\n\n"
+                                   "| Horizon | Trigger (LTF) | Confirm (HTF) | Hold |\n"
+                                   "|---|---|---|---|\n"
+                                   "| Intraday | 15m | 1h | same day |\n"
+                                   "| BTST | 1h | 4h | overnight → ~09:30 |\n"
+                                   "| Swing | 4h | 1D | 2–10 sessions |\n"
+                                   "| Positional | 1D | 1W | weeks |\n\n"
+                                   "The higher frame gives the **box and the trend**; the lower "
+                                   "frame gives the **trigger**. Where price sits inside that box "
+                                   "(`loc`) is what separates a real break from a trap.\n\n"
+                                   "⚠ Longer horizons stand on firmer ground — not because the "
+                                   "structure is better, but because the ~22bps round-trip cost "
+                                   "eats a far smaller share of a multi-day move than of a "
+                                   "30-minute one. The intraday hunt in this stack is closed."))
+        _P = mtf.PRESETS.get(preset)
+        _setup_f = "All"
+        if _P:
+            _setup_f = pc2.selectbox(
+                "Setup quality", ["All", "🎯 Textbook only", "🟢 Long-side setups",
+                                  "🪤 Exclude traps"], index=0, key="mtf_setupf",
+                help=("Filter on the **HTF × LTF setup tag** (the chartist read), not on raw "
+                      "shapes.\n\n"
+                      "• **🎯 Textbook only** — `WITH-TREND CONTINUATION`: higher-TF trending, "
+                      "lower-TF coiling into it. The classical continuation setup.\n"
+                      "• **🟢 Long-side** — continuation + range-top break + pullback-with-trend.\n"
+                      "• **🪤 Exclude traps** — drops `FALSE-BREAK TRAP` (a lower-TF break in the "
+                      "MIDDLE of the higher-TF box — statistically fades).\n\n"
+                      "Rows sort best-setup-first regardless."))
+            st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
         fc1, fc2, fc3, fc4 = st.columns(4)
         f_htf = fc1.selectbox("Higher TF", [_NONE, "1h", "2h", "4h", "1D", "1W"], index=3,
-                              key="mtf_htf",
+                              key="mtf_htf", disabled=bool(_P),
                               help=(
                                   "**HIGHER TIMEFRAME — the big picture.**\n\n"
                                   "Pick the LARGE timeframe you want to judge the trend on. This is "
@@ -558,7 +652,7 @@ if tf == "Intraday":
                                   "• 💥 **Breakdown ↓** — closed BELOW its 20-bar low by "
                                   "≥0.5×ATR (mirror of Breakout)"))
         f_ltf = fc3.selectbox("Lower TF", [_NONE, "15m", "1h", "2h", "4h", "1D"], index=2,
-                              key="mtf_ltf",
+                              key="mtf_ltf", disabled=bool(_P),
                               help=(
                                   "**LOWER TIMEFRAME — the zoom-in.**\n\n"
                                   "Pick the SMALL timeframe where you want to TIME the entry inside "
@@ -590,6 +684,10 @@ if tf == "Intraday":
                                   "alignment is unvalidated. The validated trade is BTST-CARRY."))
         # A leg is ON only if BOTH its TF is a real frame (not '— none —') AND its structure is a
         # shape (not 'Any'). Either one off = that leg does not filter.
+        # A preset OVERRIDES the two frame boxes (they render disabled, showing the pair). The
+        # SHAPE boxes stay live — they are an optional extra cut on top of the setup read.
+        if _P:
+            f_htf, f_ltf = _P["htf"], _P["ltf"]
         _htf_on = (f_htf != _NONE) and (f_hst != "Any")
         _ltf_on = (f_ltf != _NONE) and (f_lst != "Any")
         # LEVELS/RSI/verdict need a REAL frame even if the Lower TF is '— none —': fall back to
@@ -628,11 +726,43 @@ if tf == "Intraday":
                 d_ = d_[d_[f"s{f_ltf}"] == f_lst]
             return d_
 
+        # SETUP READ — free (pure arithmetic on boxes the scan already carried). Applied to the
+        # WHOLE universe so the default view is already sorted best-context-first.
+        _setup_on = False
+        if _P:
+            light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"])
+            _keep = {"🎯 Textbook only": {"WITH-TREND CONTINUATION"},
+                     "🟢 Long-side setups": mtf.LONG_TAGS}.get(_setup_f)
+            if _keep is not None:
+                light, _setup_on = light[light["setup"].isin(_keep)], True
+            elif _setup_f == "🪤 Exclude traps":
+                light, _setup_on = light[~light["setup"].isin(mtf.AVOID_TAGS)], True
+            light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
+
         after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
         filtered = _mtf_filter(after_deliv)
-        active = _htf_on or _ltf_on or (min_wtd > 0) or (min_vs > 0)
-        light_cols = ["symbol", "sector", "ltp", "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
-                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"]
+        active = _htf_on or _ltf_on or _setup_on or (min_wtd > 0) or (min_vs > 0)
+        light_cols = (["symbol", "sector", "ltp", "turn₹L", "day%"]
+                      + (["setup", "loc"] if _P else [])
+                      + ["wtd_deliv7", "deliv_vs_100d",
+                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
+
+        # WHAT THE TAPE LOOKS LIKE RIGHT NOW — the census of setups across the whole universe,
+        # with the full read for each. A tag in a cell is a label; this is what it MEANS.
+        if _P and "setup" in light.columns and not light.empty:
+            _vc = light["setup"].value_counts()
+            with st.expander(f"🔭 What the {_P['ltf']} × {_P['htf']} tape says right now — "
+                             f"{len(_vc)} setup types across {len(light)} names"):
+                for _tag, _cnt in _vc.items():
+                    _r = light[light["setup"] == _tag]
+                    _ex = ", ".join(_r.nlargest(min(4, len(_r)), "turn₹L")["symbol"])
+                    st.markdown(f"**{mtf.TAG_ICON.get(_tag, '')} {_tag}** — {_cnt} names  \n"
+                                f"{_r['setup_read'].iloc[0]}  \n"
+                                f"*most liquid:* {_ex}")
+                st.caption("⚠ Setup quality is a CHARTIST ranking, not an expected return. "
+                           "Intraday multi-TF alignment has no validated edge in this stack; the "
+                           "one validated trade here is the overnight BTST carry, which is "
+                           "selected by delivery + close-strength, not by these shapes.")
 
         if not active:
             st.info(f"**{len(light)} names** in the universe. Pick a **HTF/LTF structure** or "
@@ -640,12 +770,17 @@ if tf == "Intraday":
                     "RSI and a verdict on your Lower TF. Showing structure + delivery only until "
                     "you filter.")
             st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
-                         hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS})
+                         hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS})
+            _tally(len(light), sc["n_scanned"], "names",
+                   "no filter active" if len(light) == sc["n_scanned"]
+                   else "price band is the only cut")
             st.stop()
 
         # ── FILTER FUNNEL — show WHERE names drop, so a 0 is diagnosable (which stage killed
         # it?), not a mystery. Only stages you actually engaged appear.
         _funnel = [f"scanned **{sc['n_scanned']}**"]
+        if _setup_on:
+            _funnel.append(f"setup ({_setup_f}) → **{len(light)}**")
         if (st.session_state.get("price_max") or 0) or (st.session_state.get("price_min") or 0):
             _funnel.append(f"price band → **{len(light)}**")
         if min_wtd > 0 or min_vs > 0:
@@ -680,13 +815,14 @@ if tf == "Intraday":
                     "Try a coarser Lower TF.")
             st.stop()
 
-        long_cols = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "turn₹L",
-                     "day%", "wtd_deliv7", "deliv_vs_100d",
+        _sc = ["setup", "loc"] if _P else []
+        long_cols = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
+                     "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                      "entry", "stop", "t1", "t2", "atr%", "action"]
-        sell_cols_tf = ["symbol", "entered", "at", "since%", "time", "bar", "sector", "ltp", "turn₹L",
-                        "day%", "wtd_deliv7", "deliv_vs_100d",
+        sell_cols_tf = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
+                        "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                         "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
@@ -702,7 +838,10 @@ if tf == "Intraday":
                 lo = bb[bb["action"] == "LONG"]
                 _lo = lo if not lo.empty else bb
                 st.dataframe(_fmt(_lo)[_cols(_lo, long_cols)], use_container_width=True,
-                             hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS})
+                             hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS})
+                _tally(len(_lo), sc["n_scanned"], "names",
+                       f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}"
+                       + ("" if lo.empty else f" · {len(lo)} LONG"))
                 if lo.empty:
                     st.caption("No LONG verdict among the matches — showing all matches.")
             with tsh:
@@ -715,7 +854,9 @@ if tf == "Intraday":
                 else:
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                  hide_index=True,
-                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SELL_COLS})
+                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SELL_COLS})
+                    _tally(len(sh), sc["n_scanned"], "names",
+                           f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
 
         _struct_panel()
         st.caption("Entry/Stop/T1/T2 = ATR risk geometry on your Lower TF, NOT a forecast. "
