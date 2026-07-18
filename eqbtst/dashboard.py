@@ -264,6 +264,18 @@ def _uni_scan(nonce: int):
         raise RuntimeError(sc.get("status") or "universe scan unavailable")
     if sc["board"].empty:
         raise RuntimeError("no names returned (pre-open, or a transient quote-fetch miss)")
+    # (3) STRUCTURALLY BARREN: rows came back, but with NO structure on any frame. The quote
+    # endpoint is cheap and usually survives while /history is rate-limited AND the DuckDB
+    # archive is locked (DCM mid-sync) — that combination yields a full-looking board of ~243
+    # names whose every timeframe reads '—'. It passes both guards above, so it used to be
+    # cached for the whole TTL: a board that looks populated, filters to nothing, and cannot be
+    # cleared by any action except ↻. The DAILY frame is the test — it comes from the archive
+    # at zero API cost, so if even 1D is blank across the board, this scan is not usable.
+    _bd = sc["board"]
+    if "s1D" in _bd.columns and (_bd["s1D"] == "n/a").mean() > 0.9:
+        raise RuntimeError("structure came back empty for every name — the EOD archive read "
+                           "failed (DuckDB busy: DCM may be syncing) and/or the broker "
+                           "rate-limited the history calls. Not caching this board.")
     return sc
 
 

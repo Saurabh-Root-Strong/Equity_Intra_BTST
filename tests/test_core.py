@@ -449,3 +449,30 @@ def test_every_preset_is_nested_and_ranked():
     for tag in mtf.TAG_ICON:                      # every tag must be rankable and drawable
         assert tag in mtf.TAG_RANK, tag
     assert mtf.TAG_RANK["WITH-TREND CONTINUATION"] < mtf.TAG_RANK["FALSE-BREAK TRAP"]
+
+
+def test_failed_archive_read_is_not_cached():
+    """REGRESSION: _daily_hist cached {} on failure, pinning every name's 1D/1W structure to
+    'n/a' for the WHOLE DAY after one transient DuckDB lock (DCM mid-sync). A lock must cost
+    one scan, not a session."""
+    from eqbtst import live
+    live._DAILY_HIST.clear()
+    orig = live.data.load_eod
+    try:
+        live.data.load_eod = lambda **k: (_ for _ in ()).throw(RuntimeError("db locked"))
+        assert live._daily_hist() == {}
+        assert not live._DAILY_HIST          # the failure must NOT be memoised
+    finally:
+        live.data.load_eod = orig
+    live._DAILY_HIST.clear()
+
+
+def test_daily_timeframe_is_not_silently_hourly():
+    """REGRESSION: _RES had no '1D', so .get(tf,'60') fell through to SIXTY-MINUTE candles and
+    labelled them daily — the positional entry, ATR stop and targets were built on hourly bars
+    while the UI said 1D."""
+    from eqbtst import live
+    assert live._RES["1D"] == "D"
+    assert live._LOOKBACK["1D"] <= 366       # Fyers rejects a longer daily range outright
+    for tf in ("15m", "1h", "2h", "4h", "1D"):
+        assert tf in live._RES, tf

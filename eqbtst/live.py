@@ -560,10 +560,15 @@ def _live_action(pa: dict, day_ret: float, rs_cum, vsurge, risk_on: bool,
 
 
 # ── tier 2: per-symbol deep state (VWAP + RSI) ─────────────────────────────────
-_RES = {"4h": "240", "2h": "120", "1h": "60", "15m": "15", "5m": "5"}
+_RES = {"1D": "D", "4h": "240", "2h": "120", "1h": "60", "15m": "15", "5m": "5"}
 # lookback days per tf — coarse bars = fewer/day, need more days for ATR14/RSI14/structure(20).
 # 4h ≈ 1.5 bars/day → 30d ≈ 45 bars; 2h ≈ 3/day → fine at 15d; intraday minutes plenty at 10d.
-_LOOKBACK = {"4h": 30, "2h": 15}
+# 1D ≈ 0.68 bars/calendar-day → 300d ≈ 200 bars. NOT more: Fyers rejects a daily range beyond
+# ~1 year with "Invalid input" (verified), and the request fails CLOSED to an empty frame.
+# The "1D": "D" entry is load-bearing. Without it _RES.get(tf, "60") fell through to SIXTY-MINUTE
+# bars and labelled them daily — so a positional entry, its ATR stop and its targets were all
+# built on hourly candles while the UI said 1D. Silent, plausible-looking, and ~6x too tight.
+_LOOKBACK = {"1D": 300, "4h": 30, "2h": 15}
 
 
 def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -> pd.DataFrame:
@@ -740,7 +745,7 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
         atr_tf = ds.get("atr_tf", 0.0)
         ltp = s["ltp"]
         cndl = ds.get("candles")
-        _tfmin = {"4h": 240, "2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(tf, 60)
+        _tfmin = {"1D": 1440, "4h": 240, "2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(tf, 60)
         bar_time = None
         if cndl is not None and len(cndl):
             o = cndl["ts"].iloc[-1]
@@ -898,6 +903,13 @@ def _daily_hist() -> dict:
         out = {s: g.sort_values("ts").reset_index(drop=True) for s, g in df.groupby("symbol")}
     except Exception:
         out = {}
+    if not out:
+        # DO NOT CACHE A FAILED READ. The archive is DuckDB: one writer excludes readers, so a
+        # scan that lands while DCM is syncing raises here — and caching {} pinned EVERY name's
+        # 1D and 1W structure to 'n/a' for the WHOLE DAY, silently, with no retry and no signal.
+        # A transient lock must cost one scan, not a session. Returning uncached means the next
+        # call retries; the day-keyed cache still holds once a read genuinely succeeds.
+        return {}
     _DAILY_HIST.clear()                     # never hold two days of frames in memory
     _DAILY_HIST[key] = out
     return out
@@ -1166,7 +1178,7 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
     let through, so the heavy per-name deep_state fetch only runs on names you care about."""
     if board.empty:
         return board
-    _tfmin = {"4h": 240, "2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(ltf, 60)
+    _tfmin = {"1D": 1440, "4h": 240, "2h": 120, "1h": 60, "15m": 15, "5m": 5}.get(ltf, 60)
 
     def _one(r):
         sym, live_pc = r["symbol"], r["_pc"]
