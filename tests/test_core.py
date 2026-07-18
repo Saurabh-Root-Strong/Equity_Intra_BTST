@@ -529,3 +529,18 @@ def test_sr_levels_degenerate_inputs_return_empty_not_garbage():
     assert indicators.sr_levels(mk(np.zeros(40))) == {}            # zero price
     assert indicators.sr_levels(mk(np.arange(40.0) + 100)) == {}   # pure ramp: no pivots
     assert indicators.sr_levels(None) == {}
+
+
+def test_every_preset_frame_can_fill_the_sr_window():
+    """REGRESSION: the coarse frames are resampled from ONE 15m fetch, so its lookback decides
+    how many bars they get. At 20 calendar days the 4h frame held 30 bars — BELOW the 40-bar
+    S/R window — and 4h is the BTST preset's HTF and Swing's LTF, so two of four horizons were
+    finding levels on a starved frame."""
+    from eqbtst import live, mtf
+    bars_per_session = {"15m": 25, "1h": 6.25, "2h": 3.1, "4h": 1.5}
+    sessions = live._MTF_FETCH_DAYS * 5 / 7          # calendar days -> trading sessions
+    for k in mtf.PRESET_ORDER:
+        p = mtf.PRESETS[k]
+        for frame in (p["ltf"], p["htf"]):
+            if frame in bars_per_session:            # 1D/1W come from the archive, not this fetch
+                assert bars_per_session[frame] * sessions >= 40, f"{k}/{frame} starves S/R"

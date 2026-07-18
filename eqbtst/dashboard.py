@@ -779,8 +779,14 @@ if tf == "Intraday":
         # SETUP READ — free (pure arithmetic on boxes the scan already carried). Applied to the
         # WHOLE universe so the default view is already sorted best-context-first.
         _setup_on = False
+        _census = None
         if _P:
             light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"])
+            # CENSUS OF THE WHOLE TAPE — captured BEFORE the setup filter. Taken after, it
+            # reported "1 setup type across 7 names", which is a description of your filter,
+            # not of the market. The point of the census is to show what the other 236 names
+            # are doing, so you can tell a rare setup from an empty tape.
+            _census = light[["setup", "setup_read", "turn₹L", "symbol"]].copy()
             _keep = {"🎯 Textbook only": {"WITH-TREND CONTINUATION"},
                      "🟢 Long-side setups": mtf.LONG_TAGS}.get(_setup_f)
             if _keep is not None:
@@ -799,12 +805,12 @@ if tf == "Intraday":
 
         # WHAT THE TAPE LOOKS LIKE RIGHT NOW — the census of setups across the whole universe,
         # with the full read for each. A tag in a cell is a label; this is what it MEANS.
-        if _P and "setup" in light.columns and not light.empty:
-            _vc = light["setup"].value_counts()
+        if _P and _census is not None and not _census.empty:
+            _vc = _census["setup"].value_counts()
             with st.expander(f"🔭 What the {_P['ltf']} × {_P['htf']} tape says right now — "
-                             f"{len(_vc)} setup types across {len(light)} names"):
+                             f"{len(_vc)} setup types across all {len(_census)} scanned names"):
                 for _tag, _cnt in _vc.items():
-                    _r = light[light["setup"] == _tag]
+                    _r = _census[_census["setup"] == _tag]
                     _ex = ", ".join(_r.nlargest(min(4, len(_r)), "turn₹L")["symbol"])
                     st.markdown(f"**{mtf.TAG_ICON.get(_tag, '')} {_tag}** — {_cnt} names  \n"
                                 f"{_r['setup_read'].iloc[0]}  \n"

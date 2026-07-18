@@ -882,6 +882,7 @@ def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
 
 
 # ── multi-timeframe structure (one cheap fetch, five resamples, archive for D/W) ──
+_MTF_FETCH_DAYS = 60           # calendar days of 15m history behind every resampled frame
 _MTF_CACHE: dict = {}          # (sym, date, bucket5) -> {tf: structure}
 _DAILY_HIST: dict = {}         # date -> {sym: daily OHLC frame}  (one archive read per day)
 
@@ -1022,7 +1023,14 @@ def mtf_structure(sym: str) -> dict:
         out[f"wall{tf}"] = sr.get("levels", [])
 
     try:
-        f = fetch_intraday(sym, tf="15m", lookback_days=20)
+        # 60 CALENDAR DAYS, not 20. The coarse frames are resampled from this ONE fetch, so the
+        # lookback is what feeds them: at 20d the 4h frame held just 30 bars — BELOW the 40-bar
+        # S/R window — and 4h is the HTF of the BTST preset and the LTF of Swing, so two of the
+        # four horizons were finding levels on a starved frame. 60d gives 4h ~82 bars.
+        # Verified strictly additive: structure labels were IDENTICAL on 24/24 name-frames
+        # (the 20-bar window reads the same recent bars either way), while 4h wall counts rose
+        # (TRENT 5->9, KOTAKBANK 6->8). Same single API call, larger payload.
+        f = fetch_intraday(sym, tf="15m", lookback_days=_MTF_FETCH_DAYS)
         if not f.empty:
             _set("15m", f)
             for lab, freq in (("1h", "60min"), ("2h", "120min"), ("4h", "240min")):
