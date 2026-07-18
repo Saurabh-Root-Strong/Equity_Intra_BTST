@@ -61,7 +61,20 @@ def _fmt(df):
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")   # None -> NaN -> renders blank
     for c in _STRUCT_COLS:                                 # terse enum -> glyph+word (display only)
-        if c in d.columns:
+        if c not in d.columns:
+            continue
+        bcol = "bnd" + c                                  # s15m -> bnds15m (live ±band %)
+        if bcol in d.columns:
+            # append the LIVE, per-name band ±% to COIL/RANGE cells only (breakout/trend have
+            # no meaningful 'band'). Volatility-driven, so it auto-scales across timeframes.
+            d[c] = [
+                _struct_label(v) + (f"  ±{b:.1f}%"
+                                    if (v in ("CONSOLIDATION", "RANGE")
+                                        and isinstance(b, (int, float)) and pd.notna(b))
+                                    else "")
+                for v, b in zip(d[c], d[bcol])
+            ]
+        else:
             d[c] = d[c].map(_struct_label)
     return d
 
@@ -485,14 +498,30 @@ if tf == "Intraday":
                 "20 is the standard Kaufman window: long enough to define a range, short enough to "
                 "react. The 8 years of data feed the **validated overnight edge** + delivery "
                 "baselines — *not* the tape-reading structure label.\n\n"
+                "**How each label is decided (by SIZE of move, not just topology):**\n"
+                "- 🚀 **Breakout ↑ / 💥 Breakdown ↓** — close clears the prior 19-bar high/low "
+                "by **≥ 0.5×ATR** (a real break, ~1–1.5% beyond the range on a daily frame — not "
+                "a marginal poke). ATR = the frame's own volatility, so the rule stays sensible "
+                "on 15m *and* 1W.\n"
+                "- 📈 **Uptrend / 📉 Downtrend** — Kaufman efficiency **ER ≥ 0.40** *and* the "
+                "net move covers **≥ 1×ATR** — an efficient, real directional move (not a tiny "
+                "drift that happens to be smooth).\n"
+                "- 🌀 **Coiling** — recent 3-bar range **< 60%** of the prior range → volatility "
+                "contracting.\n"
+                "- ↔️ **Range** — none of the above: oscillating in its band.\n\n"
+                "*(All four thresholds are tunable in config: STRUCT_BREAKOUT_ATR, "
+                "STRUCT_TREND_ER, STRUCT_TREND_ATR, STRUCT_COIL. Want stronger, ~3% breakouts? "
+                "raise STRUCT_BREAKOUT_ATR toward 1.0.)*\n\n"
                 "**So your combo can read 0 matches and that's normal:** e.g. 4h 🚀 Breakout ↑ ∩ "
                 "1h 🌀 Coiling is rare — a breakout, then a pause, caught in the same snapshot. "
                 "Loosen one leg (4h 📈 Uptrend, or LTF = Any) to populate.")
         _TF_RANK = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440, "1W": 10080}
+        _NONE = "— none —"                     # disable this whole TF leg (TF + its structure)
         _STRUCTS = ["Any", "BREAKOUT_UP", "TREND_UP", "CONSOLIDATION", "RANGE",
                     "TREND_DOWN", "BREAKOUT_DOWN"]
         fc1, fc2, fc3, fc4 = st.columns(4)
-        f_htf = fc1.selectbox("Higher TF", ["1h", "2h", "4h", "1D", "1W"], index=2, key="mtf_htf",
+        f_htf = fc1.selectbox("Higher TF", [_NONE, "1h", "2h", "4h", "1D", "1W"], index=3,
+                              key="mtf_htf",
                               help=(
                                   "**HIGHER TIMEFRAME — the big picture.**\n\n"
                                   "Pick the LARGE timeframe you want to judge the trend on. This is "
@@ -505,24 +534,31 @@ if tf == "Intraday":
                                   "close. Rock-solid: they never change during the day (but they "
                                   "don't see today yet).\n\n"
                                   "This box picks the frame; the next box picks the SHAPE you want "
-                                  "on it."))
+                                  "on it. Pick **'— none —'** to switch the Higher-TF leg OFF "
+                                  "entirely (same as setting its structure to 'Any')."))
         f_hst = fc2.selectbox("HTF structure", _STRUCTS, index=0, key="mtf_hst",
                               format_func=_struct_label,
                               help=(
                                   "**What SHAPE must the Higher TF be in?** Keep only stocks whose "
                                   "big-frame structure matches this. `Any` = don't filter on the "
                                   "big frame.\n\n"
-                                  "The six shapes (from Kaufman trend-efficiency + range):\n"
-                                  "• 🚀 **Breakout ↑** — pushed ABOVE its recent range (fresh "
-                                  "up-move)\n"
-                                  "• 📈 **Uptrend** — steady, clean climb\n"
-                                  "• 🌀 **Coiling** — range TIGHTENING (energy building for a "
-                                  "move)\n"
-                                  "• ↔️ **Range** — choppy sideways, no clear direction\n"
-                                  "• 📉 **Downtrend** — steady, clean fall\n"
-                                  "• 💥 **Breakdown ↓** — broke BELOW its range (fresh "
-                                  "down-move)"))
-        f_ltf = fc3.selectbox("Lower TF", ["15m", "1h", "2h", "4h", "1D"], index=1, key="mtf_ltf",
+                                  "The six shapes — defined by the SIZE of the move (ATR = the "
+                                  "frame's own volatility unit, so the % auto-scales 15m→1W):\n"
+                                  "• 🚀 **Breakout ↑** — closed ABOVE its last-20-bar high by a "
+                                  "REAL margin (≥0.5×ATR ≈ 1–1.5% beyond the range on a daily "
+                                  "frame) — not a 0.1% poke\n"
+                                  "• 📈 **Uptrend** — already climbing efficiently (Kaufman "
+                                  "ER≥0.4) AND covered ≥1×ATR of ground — momentum in progress, "
+                                  "no fresh break needed\n"
+                                  "• 🌀 **Coiling** — range TIGHTENING (recent 3 bars < 60% of "
+                                  "the prior range) — volatility contracting, energy building\n"
+                                  "• ↔️ **Range** — oscillating sideways in its band: no "
+                                  "efficient direction, no break, not tightening\n"
+                                  "• 📉 **Downtrend** — efficient fall (mirror of Uptrend)\n"
+                                  "• 💥 **Breakdown ↓** — closed BELOW its 20-bar low by "
+                                  "≥0.5×ATR (mirror of Breakout)"))
+        f_ltf = fc3.selectbox("Lower TF", [_NONE, "15m", "1h", "2h", "4h", "1D"], index=2,
+                              key="mtf_ltf",
                               help=(
                                   "**LOWER TIMEFRAME — the zoom-in.**\n\n"
                                   "Pick the SMALL timeframe where you want to TIME the entry inside "
@@ -534,7 +570,10 @@ if tf == "Intraday":
                                   "frame** (its ATR sets the stop width). Smaller frame = tighter "
                                   "levels.\n\n"
                                   "Keep it BELOW the Higher TF (e.g. Higher 4h, Lower 1h). Intraday "
-                                  "frames can repaint until the bar closes."))
+                                  "frames can repaint until the bar closes.\n\n"
+                                  "**'— none —'** switches the Lower-TF FILTER off. Levels/RSI/verdict "
+                                  "still need a frame, so they fall back to your Higher TF (or 1h if "
+                                  "that is also none)."))
         f_lst = fc4.selectbox("LTF structure", _STRUCTS, index=0, key="mtf_lst",
                               format_func=_struct_label,
                               help=(
@@ -549,18 +588,25 @@ if tf == "Intraday":
                                   "match.\n\n"
                                   "⚠ This is tape-reading CONTEXT, not a proven edge — intraday "
                                   "alignment is unvalidated. The validated trade is BTST-CARRY."))
-        if (f_hst != "Any" and f_lst != "Any" and _TF_RANK[f_ltf] >= _TF_RANK[f_htf]):
+        # A leg is ON only if BOTH its TF is a real frame (not '— none —') AND its structure is a
+        # shape (not 'Any'). Either one off = that leg does not filter.
+        _htf_on = (f_htf != _NONE) and (f_hst != "Any")
+        _ltf_on = (f_ltf != _NONE) and (f_lst != "Any")
+        # LEVELS/RSI/verdict need a REAL frame even if the Lower TF is '— none —': fall back to
+        # the Higher TF, then to 1h. (The Lower TF is both a filter leg AND the entry frame.)
+        levels_tf = f_ltf if f_ltf != _NONE else (f_htf if f_htf != _NONE else "1h")
+
+        if (_htf_on and _ltf_on and _TF_RANK[f_ltf] >= _TF_RANK[f_htf]):
             st.warning(f"⚠ your 'lower' TF ({f_ltf}) is not below your 'higher' TF ({f_htf}) — "
                        "the filter still applies, but the HTF/LTF logic is inverted.")
 
-        # STATUS LINE — a TF pick does NOTHING until its structure box is a shape. Say so, so
-        # a selected "4h / 1h" next to "Any" never reads as an active-but-empty filter.
-        _htf_on, _ltf_on = f_hst != "Any", f_lst != "Any"
+        # STATUS LINE — a TF pick does NOTHING until its structure box is a shape (and the TF
+        # itself is not '— none —'). Say so, so a selected frame next to 'Any' never reads as an
+        # active-but-empty filter.
         if not (_htf_on or _ltf_on or min_wtd > 0 or min_vs > 0):
-            st.caption(f"⚪ **No filter active.** Higher **{f_htf}** / Lower **{f_ltf}** are "
-                       "selected but INERT — a timeframe filters only once its **structure** box "
-                       "is set to a shape (not 'Any'). Showing all names. When you do filter, "
-                       f"**Lower {f_ltf}** builds the levels/RSI/verdict.")
+            st.caption("⚪ **No filter active.** Showing all names. A timeframe filters only once "
+                       "BOTH its **frame** (not '— none —') AND its **structure** (not 'Any') are "
+                       f"set. When you do filter, **{levels_tf}** builds the levels/RSI/verdict.")
         else:
             _bits = []
             if _htf_on:
@@ -572,19 +618,19 @@ if tf == "Intraday":
             if min_vs > 0:
                 _bits.append(f"vs100D ≥ **{min_vs}%**")
             st.caption("🟢 **Active filter:** " + "  ·  ".join(_bits)
-                       + f"  →  levels/verdict on Lower **{f_ltf}**.")
+                       + f"  →  levels/verdict on **{levels_tf}**.")
 
         def _mtf_filter(df_):
             d_ = df_
-            if f_hst != "Any" and f"s{f_htf}" in d_.columns:
+            if _htf_on and f"s{f_htf}" in d_.columns:
                 d_ = d_[d_[f"s{f_htf}"] == f_hst]
-            if f_lst != "Any" and f"s{f_ltf}" in d_.columns:
+            if _ltf_on and f"s{f_ltf}" in d_.columns:
                 d_ = d_[d_[f"s{f_ltf}"] == f_lst]
             return d_
 
         after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
         filtered = _mtf_filter(after_deliv)
-        active = (f_hst != "Any") or (f_lst != "Any") or (min_wtd > 0) or (min_vs > 0)
+        active = _htf_on or _ltf_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = ["symbol", "sector", "ltp", "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                       "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"]
 
@@ -604,9 +650,11 @@ if tf == "Intraday":
             _funnel.append(f"price band → **{len(light)}**")
         if min_wtd > 0 or min_vs > 0:
             _funnel.append(f"delivery (wtd≥{min_wtd} · vs100D≥{min_vs}) → **{len(after_deliv)}**")
-        if f_hst != "Any" or f_lst != "Any":
-            _funnel.append(f"structure (HTF {f_htf}={_struct_label(f_hst)} · "
-                           f"LTF {f_ltf}={_struct_label(f_lst)}) → **{len(filtered)}**")
+        if _htf_on or _ltf_on:
+            _legs = " · ".join(
+                ([f"HTF {f_htf}={_struct_label(f_hst)}"] if _htf_on else [])
+                + ([f"LTF {f_ltf}={_struct_label(f_lst)}"] if _ltf_on else []))
+            _funnel.append(f"structure ({_legs}) → **{len(filtered)}**")
         st.caption("🔎 funnel:  " + "  →  ".join(_funnel))
         if filtered.empty:
             st.info("No name survives this combination right now. That is an answer, not an error "
@@ -623,8 +671,8 @@ if tf == "Intraday":
         if len(filtered) > _MAXE:
             st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by turnover "
                        "(most fillable) for levels/verdict. Tighten a leg to see the rest.")
-        with st.spinner(f"Reading {len(capped)} matches on {f_ltf} bars for levels & verdict…"):
-            enr = live.enrich_mtf(capped, ltf=f_ltf, risk_on=sc["risk_on"],
+        with st.spinner(f"Reading {len(capped)} matches on {levels_tf} bars for levels & verdict…"):
+            enr = live.enrich_mtf(capped, ltf=levels_tf, risk_on=sc["risk_on"],
                                   idx_ret=sc.get("idx_ret", 0.0))
         enr = price_filter(enr, "ltp")
         if enr.empty:
@@ -649,7 +697,7 @@ if tf == "Intraday":
             st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure/levels as-of "
                        f"{_sa:%H:%M}" if (_sa and live.market_open())
                        else "market closed — last-session values")
-            tb, tsh = st.tabs([f"🟢 LONG ({f_ltf} bars)", f"🔴 SHORT ({f_ltf} bars)"])
+            tb, tsh = st.tabs([f"🟢 LONG ({levels_tf} bars)", f"🔴 SHORT ({levels_tf} bars)"])
             with tb:
                 lo = bb[bb["action"] == "LONG"]
                 _lo = lo if not lo.empty else bb

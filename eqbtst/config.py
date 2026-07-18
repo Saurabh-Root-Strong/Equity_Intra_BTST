@@ -46,6 +46,18 @@ RS_LOOKBACK = 10      # window for cumulative relative strength (trading days)
 RS_MIN      = 0.0     # require 10d cumulative RS vs Nifty > 0 -> PERSISTENT leader
 LIQ_MIN_LACS = 2000.0 # >= Rs 20cr traded that day -> fillable without moving price
 LOOKBACK    = 20      # rolling window for the medians (trading days)
+
+# --- structure classifier (CONTEXT label; magnitude-gated, ATR-normalised) --------
+# The label is defined by SIZE of move, not just topology — a marginal new high is NOT
+# a breakout. Thresholds are in ATR (the frame's OWN volatility unit) so they auto-scale:
+# ~0.5xATR on a daily frame is ~1-1.5% above the range; the same rule on 15m or 1W stays
+# sensible. Raise STRUCT_BREAKOUT_ATR toward 1.0 to demand a stronger (~2.5-3% on daily)
+# break; lower it to catch earlier ones.
+STRUCT_LOOKBACK     = 20    # bars of history the label reads (per frame)
+STRUCT_BREAKOUT_ATR = 0.5   # close must clear the prior 19-bar range by >= this x ATR
+STRUCT_TREND_ER     = 0.40  # Kaufman efficiency ratio for a clean, low-noise trend
+STRUCT_TREND_ATR    = 1.0   # AND the window's net move must cover >= this x ATR (a REAL move)
+STRUCT_COIL         = 0.60  # recent 3-bar range < this x the prior range => contracting (coil)
 # LIQ_MIN_LACS is the REALISM floor. Stress test: the headline +30bps net was partly
 # flattered by thin names where the fill is not real. On genuinely liquid names
 # (>=Rs20cr turnover) the honest deployable edge is ~+16-19bps net, win ~62%. Thin

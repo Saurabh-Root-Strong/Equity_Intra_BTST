@@ -949,24 +949,32 @@ def mtf_structure(sym: str) -> dict:
     hit = _MTF_CACHE.get(key)
     if hit is not None:
         return hit
+    # out carries BOTH the label (s-key, used for filtering) and the live band ±% (b-key, used
+    # for display). Additive b-keys keep every existing caller working (they read only labels).
     out = {t: "n/a" for t in ("15m", "1h", "2h", "4h", "1D", "1W")}
+    out.update({f"b{t}": float("nan") for t in ("15m", "1h", "2h", "4h", "1D", "1W")})
+
+    def _set(tf, frame):
+        lab = indicators.structure(frame) if (frame is not None and len(frame) >= 5) else "n/a"
+        out[tf] = lab
+        out[f"b{tf}"] = indicators.band_pct(frame, lab) if lab != "n/a" else float("nan")
+
     try:
         f = fetch_intraday(sym, tf="15m", lookback_days=20)
         if not f.empty:
-            out["15m"] = indicators.structure(f)
+            _set("15m", f)
             for lab, freq in (("1h", "60min"), ("2h", "120min"), ("4h", "240min")):
-                r = _resample_ohlcv(f, freq)
-                out[lab] = indicators.structure(r) if len(r) >= 5 else "n/a"
+                _set(lab, _resample_ohlcv(f, freq))
     except Exception:
         pass
     try:
         d = _daily_hist().get(sym)
         if d is not None and len(d) >= 5:
-            out["1D"] = indicators.structure(d.tail(60))
+            _set("1D", d.tail(60))
             w = (d.set_index("ts").groupby(pd.Grouper(freq="W-FRI"))
                  .agg(open=("open", "first"), high=("high", "max"),
                       low=("low", "min"), close=("close", "last")).dropna().reset_index())
-            out["1W"] = indicators.structure(w) if len(w) >= 5 else "n/a"
+            _set("1W", w)
     except Exception:
         pass
     _MTF_CACHE[key] = out
@@ -1053,6 +1061,8 @@ def universe_mtf_scan(date=None) -> dict:
             "deliv_vs_100d": round(_dv, 1) if _dv == _dv else np.nan,
             "s15m": _mtf["15m"], "s1h": _mtf["1h"], "s2h": _mtf["2h"],
             "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
+            "bnds15m": _mtf["b15m"], "bnds1h": _mtf["b1h"], "bnds2h": _mtf["b2h"],
+            "bnds4h": _mtf["b4h"], "bnds1D": _mtf["b1D"], "bnds1W": _mtf["b1W"],
             # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
             "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
             "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
@@ -1112,6 +1122,8 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
             "s15m": r["s15m"], "s1h": r["s1h"], "s2h": r["s2h"],
             "s4h": r["s4h"], "s1D": r["s1D"], "s1W": r["s1W"],
+            "bnds15m": r.get("bnds15m"), "bnds1h": r.get("bnds1h"), "bnds2h": r.get("bnds2h"),
+            "bnds4h": r.get("bnds4h"), "bnds1D": r.get("bnds1D"), "bnds1W": r.get("bnds1W"),
             "sector": r["sector"], "ltp": ltp, "turn₹L": r.get("turn₹L"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],

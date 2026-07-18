@@ -179,36 +179,84 @@ def levels(ltp: float, atr_val: float, day_low: float | None = None,
     }
 
 
-def structure(candles: pd.DataFrame, lookback: int = 20) -> str:
-    """Market structure on this timeframe (CONTEXT, not a signal — intraday structure
-    has no validated edge). Kaufman efficiency ratio + range logic:
-      BREAKOUT_UP/DOWN  last close beyond the prior range extreme
-      TREND_UP/DOWN     efficient directional travel (ER >= 0.4)
-      CONSOLIDATION     range contracting (recent range < 0.6x prior)
-      RANGE             choppy, no direction
+def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
+    """Market structure on this timeframe (CONTEXT, not a signal — intraday structure has
+    no validated edge). MAGNITUDE-gated, ATR-normalised: the label is defined by the SIZE
+    of the move, not just topology, so a marginal new high is NOT called a breakout.
+
+      BREAKOUT_UP/DOWN  last close clears the prior 19-bar range by >= STRUCT_BREAKOUT_ATR x
+                        ATR (a real break, not a poke). On daily ATR that is ~1-1.5% beyond
+                        the range; the ATR unit auto-scales the same rule to 15m..1W.
+      TREND_UP/DOWN     efficient travel (Kaufman ER >= STRUCT_TREND_ER) AND the window's net
+                        move covers >= STRUCT_TREND_ATR x ATR (a REAL directional move, not
+                        micro-drift that happens to be efficient).
+      CONSOLIDATION     range TIGHTENING — recent 3-bar range < STRUCT_COIL x the prior range.
+      RANGE             oscillating sideways: no efficient direction, no break, not tightening.
     """
+    from . import config
+    lb = lookback if lookback is not None else config.STRUCT_LOOKBACK
     c = candles["close"].to_numpy(float)
     if len(c) < 5:
         return "n/a"
-    seg = c[-lookback:]
+    seg = c[-lb:]
     net = seg[-1] - seg[0]
     denom = np.abs(np.diff(seg)).sum()
     er = abs(net) / denom if denom > 0 else 0.0            # Kaufman efficiency ratio
-    hi = candles["high"].to_numpy(float)[-lookback:]
-    lo = candles["low"].to_numpy(float)[-lookback:]
-    last = c[-1]
-    if len(hi) > 1 and last > hi[:-1].max():
+    hi = candles["high"].to_numpy(float)[-lb:]
+    lo = candles["low"].to_numpy(float)[-lb:]
+    last = seg[-1]
+    # ATR = the frame's OWN volatility unit, so the % gates auto-scale across timeframes.
+    a = atr(candles, min(14, len(candles)))
+    if not a or a <= 0:                                    # flat/degenerate → fall back to span
+        a = (hi.max() - lo.min()) / lb if lb else 0.0
+    margin = config.STRUCT_BREAKOUT_ATR * a
+    prior_hi = hi[:-1].max() if len(hi) > 1 else last
+    prior_lo = lo[:-1].min() if len(lo) > 1 else last
+    # BREAKOUT — only if the close clears the range by a MEANINGFUL margin (not a 0.1% poke)
+    if last > prior_hi + margin:
         return "BREAKOUT_UP"
-    if len(lo) > 1 and last < lo[:-1].min():
+    if last < prior_lo - margin:
         return "BREAKOUT_DOWN"
-    if er >= 0.4:
+    # TREND — efficient AND a real distance covered
+    if er >= config.STRUCT_TREND_ER and abs(net) >= config.STRUCT_TREND_ATR * a:
         return "TREND_UP" if net > 0 else "TREND_DOWN"
-    if len(hi) >= 6:
-        recent = hi[-3:].max() - lo[-3:].min()
-        prior = hi[:-3].max() - lo[:-3].min()
-        if prior > 0 and recent < 0.6 * prior:
+    # COIL — the recent range is TIGHT vs its OWN typical range. Apples-to-apples: the latest
+    # 3-bar span against the MEDIAN 3-bar span (same window length). The old test compared 3
+    # bars to the other 17 — mechanically biased, since fewer bars always span less, so it fired
+    # on ~70% of random walks (labelled normal chop as "coiling"). This measures a REAL
+    # volatility contraction: the recent squeeze is < STRUCT_COIL x what this name usually does.
+    if len(hi) >= 8:
+        spans = np.array([hi[i:i + 3].max() - lo[i:i + 3].min() for i in range(len(hi) - 2)])
+        typ = float(np.median(spans[:-1]))                 # typical 3-bar span (excl. the latest)
+        if typ > 0 and spans[-1] < config.STRUCT_COIL * typ:
             return "CONSOLIDATION"
     return "RANGE"
+
+
+def band_pct(candles: pd.DataFrame, label: str | None = None,
+             lookback: int | None = None) -> float:
+    """The oscillation band half-width as ±% of price — the LIVE, per-name, per-frame
+    'how wide is this range' number (volatility-driven; auto-scales with timeframe because it
+    is measured from THAT frame's own bars). For a COIL it reports the CONTRACTED box (recent
+    3 bars — the tight squeeze); otherwise the full lookback range. NaN if too few bars."""
+    from . import config
+    lb = lookback if lookback is not None else config.STRUCT_LOOKBACK
+    if candles is None or len(candles) < 3:
+        return float("nan")
+    hi = candles["high"].to_numpy(float)
+    lo = candles["low"].to_numpy(float)
+    c = float(candles["close"].to_numpy(float)[-1])
+    if c <= 0:
+        return float("nan")
+    if label == "CONSOLIDATION" and len(hi) >= 3:
+        span = hi[-3:].max() - lo[-3:].min()          # the tight coil box (current squeeze)
+    else:
+        # the oscillation channel — ROBUST to a single spike/wick: a lone outlier bar would
+        # blow out a raw max-min and overstate how wide price actually swings. Trim the extreme
+        # ~1 bar each side (95th-pct high vs 5th-pct low) so the band is the TYPICAL channel.
+        h, l = hi[-lb:], lo[-lb:]
+        span = (np.percentile(h, 95) - np.percentile(l, 5)) if len(h) >= 8 else (h.max() - l.min())
+    return round(span / 2.0 / c * 100, 2)             # ± half-width, % of price
 
 
 def band(price: float, atr_val: float) -> dict:
