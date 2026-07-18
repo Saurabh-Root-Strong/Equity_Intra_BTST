@@ -179,6 +179,51 @@ def levels(ltp: float, atr_val: float, day_low: float | None = None,
     }
 
 
+_CORP_ACTION_GAP = 0.25        # |overnight move| above which a gap is a corporate action
+
+
+def adjust_corporate_actions(candles: pd.DataFrame,
+                             thresh: float = _CORP_ACTION_GAP) -> pd.DataFrame:
+    """BACK-ADJUST prices across splits / bonuses / demergers. Cash equity only — indices
+    never do this, which is why the logic this was modelled on had no need for it.
+
+    The EOD archive is UNADJUSTED: KOTAKBANK prints 2132.6 then 421.0 across its 1:5, and
+    BAJFINANCE 9331 -> 938 across its 1:10. Measured: 26 of 268 names in the universe carry
+    such a discontinuity, and 4 of the 5 with one inside the structure window were being
+    labelled a FAKE TREND_DOWN — TATAMOTORS read TREND_DOWN on a 1D frame whose entire
+    'decline' was a 40% demerger (post-event bars alone read RANGE). Any support/resistance
+    built on those bars inherits the same fiction, with walls at pre-split prices.
+
+    Back-adjustment (multiply every PRIOR bar by the close ratio) rather than truncation, so
+    the 20-bar window keeps its history instead of going 'n/a' for months after an event.
+
+    WHY 25% IS SAFE HERE: this universe is NSE F&O cash, where daily price bands cap real
+    moves well below that, so an overnight gap past 25% is a corporate action rather than a
+    trade. A genuine crash beyond the band cannot happen in one session. The threshold is
+    deliberately conservative — mis-adjusting a real move would erase it, so the bar is set
+    where real moves cannot reach."""
+    if candles is None or len(candles) < 3 or "close" not in candles.columns:
+        return candles
+    c = candles["close"].to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = c[1:] / c[:-1]
+    idx = np.where(np.isfinite(ratio) & (np.abs(ratio - 1.0) > thresh))[0]
+    if not len(idx):
+        return candles
+    out = candles.copy()
+    cols = [x for x in ("open", "high", "low", "close") if x in out.columns]
+    arr = {x: out[x].to_numpy(float).copy() for x in cols}
+    for i in idx:                       # i = last bar BEFORE the event; ratio applies onward
+        f = float(ratio[i])
+        if not np.isfinite(f) or f <= 0:
+            continue
+        for x in cols:
+            arr[x][:i + 1] *= f         # scale all prior bars onto the post-event scale
+    for x in cols:
+        out[x] = arr[x]
+    return out
+
+
 def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
     """Structure LABEL only — thin wrapper over struct_full (see it for the rules)."""
     return struct_full(candles, lookback)["struct"]
@@ -253,6 +298,100 @@ def struct_full(candles: pd.DataFrame, lookback: int | None = None) -> dict:
     if coil is not None and coil < config.STRUCT_COIL:
         return _r("CONSOLIDATION")
     return _r("RANGE")
+
+
+def pivots(h, l, w: int = 2):
+    """Swing highs / lows — a bar whose high (low) is the extreme of its +/-w neighbours.
+
+    The +/-w requirement is also what makes this SAFE ON A FORMING BAR: the last w bars can
+    never qualify, so a level cannot be invented from a candle that is still printing."""
+    h = np.asarray(h, float)
+    l = np.asarray(l, float)
+    his, los = [], []
+    for i in range(w, len(h) - w):
+        if h[i] >= h[i - w:i + w + 1].max() - 1e-9:
+            his.append(float(h[i]))
+        if l[i] <= l[i - w:i + w + 1].min() + 1e-9:
+            los.append(float(l[i]))
+    return his, los
+
+
+def walls(h, l, tol: float, w: int = 2) -> list[tuple[float, int]]:
+    """TOUCH-COUNTED dynamic support/resistance: cluster swing pivots that sit within `tol`
+    of each other, and carry HOW MANY times price turned there.
+
+    A 3-touch cluster is a level the market rejected three separate times; a 1-touch cluster
+    is just a pivot. That count is the whole point — it is the difference between a line
+    drawn on a chart and a level someone is actually defending.
+
+    `tol` MUST be volatility-scaled by the caller (a fraction of ATR), never a fixed rupee
+    amount: 2 rupees is a wide zone on a 90-rupee name and noise on a 9,000-rupee one.
+
+    Returns [(level, touches)] sorted by price. Levels are the touch-weighted mean of their
+    cluster, so a level drifts toward where price actually turned most often."""
+    his, los = pivots(h, l, w=w)
+    lv: list[list] = []
+    for x in sorted(his + los):
+        for c in lv:
+            if abs(x - c[0]) <= tol:
+                c[0] = (c[0] * c[1] + x) / (c[1] + 1)     # running touch-weighted mean
+                c[1] += 1
+                break
+        else:
+            lv.append([x, 1])
+    return [(round(x, 2), int(t)) for x, t in lv]
+
+
+def sr_levels(candles: pd.DataFrame, spot: float | None = None,
+              lookback: int = 40, tol_atr: float = 0.2,
+              min_dist_atr: float = 0.25) -> dict:
+    """Nearest touch-counted support and resistance around `spot`, plus headroom.
+
+    Deliberately reports the nearest wall on EACH side separately from the nearest
+    MULTI-TOUCH wall: a 1-touch pivot 0.1 ATR overhead is noise, a 3-touch wall in the same
+    place is the reason your target will not fill.
+
+      support / resistance      nearest cluster each side, beyond min_dist_atr (micro-swings
+                                hugging price are not levels)
+      sup_touches / res_touches rejection count = strength
+      head_up / head_dn         distance to the nearest >=2-touch wall each way, in ATR
+
+    Returns {} when there are too few bars to have structure at all."""
+    if candles is None or len(candles) < 12:
+        return {}
+    cd = adjust_corporate_actions(candles)               # phantom walls at pre-split prices
+    h = cd["high"].to_numpy(float)
+    l = cd["low"].to_numpy(float)
+    c = cd["close"].to_numpy(float)
+    px = float(spot) if spot else float(c[-1])
+    if px <= 0:
+        return {}
+    a = atr(cd, min(14, len(cd)))
+    if not a or a <= 0:
+        a = float(np.mean(h[-14:] - l[-14:])) if len(h) >= 14 else float(np.mean(h - l))
+    if not a or a <= 0:
+        return {}
+    hh, ll = h[-lookback:], l[-lookback:]
+    lv = walls(hh, ll, tol_atr * a)
+    if not lv:
+        return {}
+    md = min_dist_atr * a
+    above = [(x, t) for x, t in lv if x > px + md]
+    below = [(x, t) for x, t in lv if x < px - md]
+    res, res_t = min(above, key=lambda z: z[0]) if above else (None, 0)
+    sup, sup_t = max(below, key=lambda z: z[0]) if below else (None, 0)
+    # HEADROOM uses ALL >=2-touch walls with NO min-distance filter — that filter exists to
+    # keep the DISPLAY clean, and applying it here would hide the closest, most dangerous
+    # wall from the very warning meant to flag it.
+    up2 = [x for x, t in lv if t >= 2 and x > px]
+    dn2 = [x for x, t in lv if t >= 2 and x < px]
+    return {
+        "support": sup, "sup_touches": sup_t,
+        "resistance": res, "res_touches": res_t,
+        "head_up": round((min(up2) - px) / a, 2) if up2 else None,
+        "head_dn": round((px - max(dn2)) / a, 2) if dn2 else None,
+        "atr": a, "levels": lv,
+    }
 
 
 def band_pct(candles: pd.DataFrame, label: str | None = None,

@@ -900,7 +900,13 @@ def _daily_hist() -> dict:
         df = df.rename(columns={"trade_date": "ts", "open_price": "open",
                                 "high_price": "high", "low_price": "low",
                                 "close_price": "close"})
-        out = {s: g.sort_values("ts").reset_index(drop=True) for s, g in df.groupby("symbol")}
+        # BACK-ADJUST at the source. The archive is unadjusted, so a split/bonus/demerger is
+        # a raw price cliff — measured 26 of 268 names — and it manufactures fake TREND_DOWN
+        # labels plus phantom S/R at pre-split prices. Fixing it here means every downstream
+        # reader (1D structure, 1W structure, S/R walls) is clean by construction.
+        out = {s: indicators.adjust_corporate_actions(
+                   g.sort_values("ts").reset_index(drop=True))
+               for s, g in df.groupby("symbol")}
     except Exception:
         out = {}
     if not out:
@@ -987,6 +993,10 @@ def mtf_structure(sym: str) -> dict:
     out.update({f"h{t}": float("nan") for t in _TFS})
     out.update({f"l{t}": float("nan") for t in _TFS})
     out.update({f"n{t}": 0 for t in _TFS})
+    out.update({f"{p}{t}": float("nan") for t in _TFS for p in ("sup", "res")})
+    out.update({f"{p}{t}": 0 for t in _TFS for p in ("supt", "rest")})
+    out.update({f"{p}{t}": float("inf") for t in _TFS for p in ("hup", "hdn")})
+    out.update({f"wall{t}": [] for t in _TFS})
 
     def _set(tf, frame):
         sf = (indicators.struct_full(frame) if (frame is not None and len(frame) >= 5)
@@ -997,6 +1007,19 @@ def mtf_structure(sym: str) -> dict:
         out[f"h{tf}"] = float(sf.get("hi", float("nan")) or float("nan"))
         out[f"l{tf}"] = float(sf.get("lo", float("nan")) or float("nan"))
         out[f"n{tf}"] = int(sf.get("n", 0))
+        # TOUCH-COUNTED S/R on this frame — computed here because this is the one place the
+        # candles exist. Carrying the result means switching horizon later costs no fetch.
+        sr = indicators.sr_levels(frame) if lab != "n/a" else {}
+        out[f"sup{tf}"] = sr.get("support", float("nan")) or float("nan")
+        out[f"supt{tf}"] = int(sr.get("sup_touches", 0) or 0)
+        out[f"res{tf}"] = sr.get("resistance", float("nan")) or float("nan")
+        out[f"rest{tf}"] = int(sr.get("res_touches", 0) or 0)
+        # head_* is None when there is NO multi-touch wall that way — that means CLEAR ROAD,
+        # which is the opposite of "unknown". inf preserves the distinction through pandas.
+        _hu, _hd = sr.get("head_up"), sr.get("head_dn")
+        out[f"hup{tf}"] = float("inf") if _hu is None else float(_hu)
+        out[f"hdn{tf}"] = float("inf") if _hd is None else float(_hd)
+        out[f"wall{tf}"] = sr.get("levels", [])
 
     try:
         f = fetch_intraday(sym, tf="15m", lookback_days=20)
@@ -1123,6 +1146,9 @@ def universe_mtf_scan(date=None) -> dict:
             # the per-frame range BOX + bar count — feeds the HTFxLTF synthesis (mtf.py)
             **{f"box_{p}{t}": _mtf.get(f"{p}{t}", float("nan"))
                for t in _TFS for p in ("h", "l", "n")},
+            # touch-counted S/R per frame — feeds the level read (add_setup picks the pair)
+            **{f"sr_{p}{t}": _mtf.get(f"{p}{t}")
+               for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall")},
             # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
             "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
             "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
@@ -1167,6 +1193,38 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     b["setup_rank"] = ranks
     b["loc"] = locs                      # 0 = at HTF box low, 1 = at HTF box high
     b["setup_read"] = reads
+
+    # ── TOUCH-COUNTED S/R for the chosen pair ────────────────────────────────────────
+    # The HIGHER frame supplies the levels that matter (a 4h wall outranks a 1h one), but
+    # the LOWER frame is checked too: a coarse bar SWALLOWS several fine swings, so a level
+    # price rejected three times intraday can be invisible to the higher frame entirely.
+    def _g(col, default=np.nan):
+        return b[col] if col in b.columns else pd.Series(default, index=b.index)
+
+    b["sup"] = _g(f"sr_sup{htf}")
+    b["sup_t"] = _g(f"sr_supt{htf}", 0)
+    b["res"] = _g(f"sr_res{htf}")
+    b["res_t"] = _g(f"sr_rest{htf}", 0)
+    # HEADROOM = distance to the nearest MULTI-TOUCH wall overhead, in ATR, taking the
+    # TIGHTER of the two frames. inf = clear road (no defended level that way), which is a
+    # real answer, not a missing one.
+    b["headroom"] = np.minimum(_g(f"sr_hup{htf}", np.inf).astype(float),
+                               _g(f"sr_hup{ltf}", np.inf).astype(float))
+    # NO CONFLUENCE FLAG — DELIBERATELY. The sister project's one POSITIVE level result was
+    # pivot-meets-CALL-WALL confluence (+9.8pp, overhead only), and it is tempting to mirror
+    # it here as "a 1h wall sitting on a 4h wall". That mirror is broken, for a reason worth
+    # writing down: those two wall sets are derived from THE SAME PRICE SERIES (4h is a
+    # resample of the same candles as 1h), so a 4h swing high usually IS a 1h swing high.
+    # Agreement between them is close to tautological, not confirmatory.
+    # MEASURED, rather than argued: a 1h/4h "confluence" flag fired on 196 of 197 names at a
+    # 25bps tolerance, and a NULL version — one frame's walls randomly displaced 1-5% —
+    # still fired on 148. Tightening to 10bps and requiring proximity to price gave 70.6%
+    # real vs 31.0% null. A flag that fires on most names, and whose shuffled control also
+    # fires constantly, carries no information; it would have looked like confirmation on
+    # every chart you opened. The validated version worked because OPEN INTEREST is an
+    # INDEPENDENT source from price. Cash equity names here have no chain, so that second
+    # source does not exist, and the honest move is to ship no flag rather than a decorative
+    # one. Touch counts and headroom stay: those are descriptions, not claims.
     return b
 
 
@@ -1220,6 +1278,8 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             # carried through so the enriched table keeps the HTFxLTF read it was selected on
             "setup": r.get("setup"), "loc": r.get("loc"),
             "setup_rank": r.get("setup_rank"), "setup_read": r.get("setup_read"),
+            "sup": r.get("sup"), "sup_t": r.get("sup_t"), "res": r.get("res"),
+            "res_t": r.get("res_t"), "headroom": r.get("headroom"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],

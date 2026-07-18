@@ -324,6 +324,44 @@ SETUP_COLS = {
              "the range. Anywhere in the middle = the same break is a trap."),
 }
 
+# Touch-counted dynamic support/resistance (eqbtst/indicators.py :: walls).
+SR_COLS = {
+    "sup": st.column_config.NumberColumn(
+        "sup", format="%.2f",
+        help="Nearest SUPPORT below price on the higher timeframe — a cluster of swing LOWS "
+             "where price has actually turned, not a drawn line. Levels are back-adjusted for "
+             "splits/bonuses, so they are on today's price scale."),
+    "sup_t": st.column_config.NumberColumn(
+        "sup×", format="%d",
+        help="TOUCHES — how many separate times price rejected that support.\n\n"
+             "1 = a lone pivot (weak). 2–3 = a level being defended.\n\n"
+             "⚠ MORE IS NOT MONOTONICALLY BETTER: the sister-project level study found the "
+             "edge INVERTS at 5+ touches — a level tested that often is usually being worn "
+             "down, and breaks. Treat a high count as 'about to matter either way', not as "
+             "a stronger floor."),
+    "res": st.column_config.NumberColumn(
+        "res", format="%.2f",
+        help="Nearest RESISTANCE above price on the higher timeframe (clustered swing HIGHS). "
+             "Blank = no pivot cluster above — price is in open air (typical after a genuine "
+             "breakout)."),
+    "res_t": st.column_config.NumberColumn(
+        "res×", format="%d",
+        help="How many times price was rejected at that resistance. Same 5+ inversion caveat "
+             "as sup×."),
+    "headroom": st.column_config.NumberColumn(
+        "headroom", format="%.2f",
+        help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, in ATR, taking the "
+             "TIGHTER of your two timeframes — because a level rejected three times "
+             "intraday still matters when the higher frame looks clear.\n\n"
+             "• **∞** = CLEAR ROAD — no defended level above. That is an answer, not missing "
+             "data.\n"
+             "• **< 0.5** = you are buying INTO a wall. Your 1×ATR target sits on the far "
+             "side of a level the market has already defended twice; expect a fight, and "
+             "size or target accordingly.\n\n"
+             "Shown, never enforced: in the sister project near-wall trades did NOT bleed — "
+             "often the break IS the setup. This is the chartist's call, not a veto."),
+}
+
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
 DELIV_COLS = {
     "wtd_deliv7": st.column_config.NumberColumn(
@@ -755,7 +793,7 @@ if tf == "Intraday":
         filtered = _mtf_filter(after_deliv)
         active = _htf_on or _ltf_on or _setup_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = (["symbol", "sector", "ltp", "turn₹L", "day%"]
-                      + (["setup", "loc"] if _P else [])
+                      + (["setup", "loc", "sup", "sup_t", "res", "res_t", "headroom"] if _P else [])
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
@@ -782,7 +820,7 @@ if tf == "Intraday":
                     "RSI and a verdict on your Lower TF. Showing structure + delivery only until "
                     "you filter.")
             st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
-                         hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS})
+                         hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS})
             _tally(len(light), sc["n_scanned"], "names",
                    "no filter active" if len(light) == sc["n_scanned"]
                    else "price band is the only cut")
@@ -827,7 +865,7 @@ if tf == "Intraday":
                     "Try a coarser Lower TF.")
             st.stop()
 
-        _sc = ["setup", "loc"] if _P else []
+        _sc = ["setup", "loc", "sup", "sup_t", "res", "res_t", "headroom"] if _P else []
         long_cols = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
                      "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
@@ -850,7 +888,7 @@ if tf == "Intraday":
                 lo = bb[bb["action"] == "LONG"]
                 _lo = lo if not lo.empty else bb
                 st.dataframe(_fmt(_lo)[_cols(_lo, long_cols)], use_container_width=True,
-                             hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS})
+                             hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS})
                 _tally(len(_lo), sc["n_scanned"], "names",
                        f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}"
                        + ("" if lo.empty else f" · {len(lo)} LONG"))
@@ -866,7 +904,7 @@ if tf == "Intraday":
                 else:
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                  hide_index=True,
-                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SELL_COLS})
+                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS})
                     _tally(len(sh), sc["n_scanned"], "names",
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
 

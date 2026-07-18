@@ -476,3 +476,56 @@ def test_daily_timeframe_is_not_silently_hourly():
     assert live._LOOKBACK["1D"] <= 366       # Fyers rejects a longer daily range outright
     for tf in ("15m", "1h", "2h", "4h", "1D"):
         assert tf in live._RES, tf
+
+
+# ── touch-counted dynamic S/R + corporate actions ─────────────────────────────
+def test_corporate_action_back_adjustment():
+    """REGRESSION: the EOD archive is UNADJUSTED. 26 of 268 names carry a split/bonus cliff,
+    and 4 of the 5 with one inside the structure window were labelled a FAKE TREND_DOWN
+    (TATAMOTORS read TREND_DOWN on a 40% demerger; post-event bars alone read RANGE)."""
+    from eqbtst import indicators
+    pre, post = 1000.0, 200.0                       # a 1:5 split, INSIDE the 20-bar window
+    rng = np.random.default_rng(9)
+    c = np.r_[pre + rng.normal(0, 5, 12), post + rng.normal(0, 1, 10)]
+    df = pd.DataFrame({"open": c, "high": c * 1.01, "low": c * 0.99, "close": c, "volume": 1})
+    adj = indicators.adjust_corporate_actions(df)["close"].to_numpy(float)
+    assert adj.max() / adj.min() < 1.10             # cliff gone
+    assert abs(adj[-1] - c[-1]) < 1e-6              # scaled ONTO today's price, not away
+    # unadjusted, the split masquerades as directional structure; adjusted, it cannot
+    assert indicators.structure(df) in ("TREND_DOWN", "BREAKOUT_DOWN")
+    adj_df = pd.DataFrame({"open": adj, "high": adj * 1.01, "low": adj * 0.99,
+                           "close": adj, "volume": 1})
+    assert indicators.structure(adj_df) not in ("TREND_DOWN", "BREAKOUT_DOWN")
+    # a NORMAL move must never be "adjusted" away
+    n = 100 + np.cumsum(np.random.default_rng(2).normal(0, 1, 40))
+    nd = pd.DataFrame({"open": n, "high": n + 1, "low": n - 1, "close": n, "volume": 1})
+    assert np.allclose(indicators.adjust_corporate_actions(nd)["close"], n)
+
+
+def test_walls_count_touches_and_ignore_the_forming_bar():
+    from eqbtst import indicators
+    rng = np.random.default_rng(3)
+    c = 100 + np.cumsum(rng.normal(0, 1, 60))
+    h, l = c + rng.random(60), c - rng.random(60)
+    h[-1] = h.max() + 8                              # a still-forming bar at a new extreme
+    l[-1] = l.min() - 8
+    w = indicators.walls(h, l, 0.6)
+    assert not any(abs(x - h[-1]) < 0.6 for x, _ in w)   # cannot invent a level from it
+    assert not any(abs(x - l[-1]) < 0.6 for x, _ in w)
+    assert all(t >= 1 for _, t in w)
+    # a level touched repeatedly must accumulate touches
+    osc = np.tile([100.0, 110.0], 20)
+    w2 = indicators.walls(osc + 1, osc - 1, 0.5)
+    assert max(t for _, t in w2) >= 5
+
+
+def test_sr_levels_degenerate_inputs_return_empty_not_garbage():
+    from eqbtst import indicators
+    def mk(c):
+        c = np.asarray(c, float)
+        return pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1})
+    assert indicators.sr_levels(mk(np.arange(5.0))) == {}          # too few bars
+    assert indicators.sr_levels(mk(np.full(40, 100.0))) == {}      # flat: no ATR
+    assert indicators.sr_levels(mk(np.zeros(40))) == {}            # zero price
+    assert indicators.sr_levels(mk(np.arange(40.0) + 100)) == {}   # pure ramp: no pivots
+    assert indicators.sr_levels(None) == {}
