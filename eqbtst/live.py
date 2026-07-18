@@ -205,8 +205,17 @@ def archive_health(ref: pd.DataFrame, quotes: dict, tol: float = 0.005) -> dict:
     wrong session and every signal below them is silently corrupted.
 
     Holiday-proof by construction: no trading calendar needed — it tests the thing that
-    actually matters (does our baseline equal the broker's baseline?)."""
+    actually matters (does our baseline equal the broker's baseline?).
+
+    SESSION-PHASE AWARE (this matters): the broker's prev_close only ROLLS FORWARD when the
+    NEXT session opens. So once the nightly sync has run (every evening, and all weekend) the
+    archive's latest row is the just-completed session while the broker still reports the one
+    BEFORE it — a legitimate one-session offset, not corruption. Comparing only against the
+    archive's latest therefore fired a false "STALE — DO NOT TRADE" every evening/weekend.
+    So accept a match against EITHER the archive's latest close OR its prior close; alarm only
+    when the broker's baseline matches NEITHER (that is a genuinely mis-synced archive)."""
     n = mism = 0
+    has_prev = "prev_close" in getattr(ref, "columns", [])
     for fys, v in quotes.items():
         sym = fys.replace("NSE:", "").replace("-EQ", "")
         if sym not in ref.index:
@@ -216,7 +225,12 @@ def archive_health(ref: pd.DataFrame, quotes: dict, tol: float = 0.005) -> dict:
         if not bpc or apc != apc or float(apc) <= 0:
             continue
         n += 1
-        if abs(float(bpc) / float(apc) - 1.0) > tol:
+        ok = abs(float(bpc) / float(apc) - 1.0) <= tol            # broker == archive LATEST
+        if not ok and has_prev:                                   # …or archive PRIOR session
+            ppc = ref.loc[sym, "prev_close"]
+            if ppc == ppc and float(ppc) > 0:
+                ok = abs(float(bpc) / float(ppc) - 1.0) <= tol
+        if not ok:
             mism += 1
     pct = (mism / n) if n else 0.0
     return {"checked": n, "mismatch": mism, "pct": round(100 * pct, 1),
