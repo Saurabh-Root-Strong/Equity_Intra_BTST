@@ -998,6 +998,7 @@ def mtf_structure(sym: str) -> dict:
     out.update({f"{p}{t}": 0 for t in _TFS for p in ("supt", "rest")})
     out.update({f"{p}{t}": float("inf") for t in _TFS for p in ("hup", "hdn")})
     out.update({f"wall{t}": [] for t in _TFS})
+    out.update({f"atr{t}": float("nan") for t in _TFS})
 
     def _set(tf, frame):
         sf = (indicators.struct_full(frame) if (frame is not None and len(frame) >= 5)
@@ -1021,6 +1022,7 @@ def mtf_structure(sym: str) -> dict:
         out[f"hup{tf}"] = float("inf") if _hu is None else float(_hu)
         out[f"hdn{tf}"] = float("inf") if _hd is None else float(_hd)
         out[f"wall{tf}"] = sr.get("levels", [])
+        out[f"atr{tf}"] = sr.get("atr", float("nan"))
 
     try:
         # 60 CALENDAR DAYS, not 20. The coarse frames are resampled from this ONE fetch, so the
@@ -1156,7 +1158,7 @@ def universe_mtf_scan(date=None) -> dict:
                for t in _TFS for p in ("h", "l", "n")},
             # touch-counted S/R per frame — feeds the level read (add_setup picks the pair)
             **{f"sr_{p}{t}": _mtf.get(f"{p}{t}")
-               for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall")},
+               for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall", "atr")},
             # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
             "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
             "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
@@ -1173,6 +1175,64 @@ def universe_mtf_scan(date=None) -> dict:
         _UNISCAN_CACHE.clear()                  # never hold two buckets of full-universe boards
         _UNISCAN_CACHE[key] = out
     return {"ok": True, **out}
+
+
+_AT_WALL_ATR = 0.15        # within this fraction of ATR = price is ON the level right now
+
+
+def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
+    """Recompute WHICH wall is nearest each side, how far, and whether price is testing one
+    RIGHT NOW — against whatever `ltp` currently holds.
+
+    The walls themselves are past structure and only change when a bar closes, so they are
+    computed once per scan. But `nearest support`, `nearest resistance` and `headroom` are
+    all functions of the CURRENT price, and freezing them was actively misleading: as price
+    ticks toward a level headroom stayed wide, and once price traded THROUGH a level the
+    board still listed it as resistance overhead. On a 4h frame the scan can be hours old.
+
+    `at_wall` is the live-tape answer to 'is price being rejected here': price sitting within
+    0.15 ATR of a level that has already turned it >=2 times before. The touch COUNT is
+    deliberately not incremented — a touch is only a rejection once price actually turns, and
+    counting the test in progress would let a level inflate its own strength while breaking."""
+    if b is None or b.empty or "_wall_pair" not in b.columns:
+        return b
+    sup, sup_t, res, res_t, head, at_w = [], [], [], [], [], []
+    for _, r in b.iterrows():
+        wl = r.get("_wall_pair")
+        px = r.get("ltp")
+        a = r.get("_sr_atr")
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            px = 0.0
+        a = float(a) if (a is not None and a == a and float(a) > 0) else 0.0
+        if not isinstance(wl, list) or not wl or px <= 0:
+            sup.append(np.nan); sup_t.append(0); res.append(np.nan); res_t.append(0)
+            head.append(np.inf); at_w.append("")
+            continue
+        md = 0.25 * a                                  # ignore micro-swings hugging price
+        below = [(x, t) for x, t, _ in wl if x < px - md]
+        above = [(x, t) for x, t, _ in wl if x > px + md]
+        s_ = max(below, key=lambda z: z[0]) if below else (np.nan, 0)
+        r_ = min(above, key=lambda z: z[0]) if above else (np.nan, 0)
+        sup.append(round(s_[0], 2) if s_[0] == s_[0] else np.nan)
+        sup_t.append(int(s_[1]))
+        res.append(round(r_[0], 2) if r_[0] == r_[0] else np.nan)
+        res_t.append(int(r_[1]))
+        up2 = [x for x, t, _ in wl if t >= 2 and x > px]
+        head.append(round((min(up2) - px) / a, 2) if (up2 and a > 0) else np.inf)
+        # LIVE TEST IN PROGRESS — price is sitting on a previously-defended level right now
+        tol = _AT_WALL_ATR * a
+        on = [(x, t) for x, t, _ in wl if t >= 2 and abs(x - px) <= tol] if a > 0 else []
+        if on:
+            x, t = min(on, key=lambda z: abs(z[0] - px))
+            at_w.append(f"{'RES' if x >= px else 'SUP'} {x:.2f} x{t}")
+        else:
+            at_w.append("")
+    b["sup"], b["sup_t"] = sup, sup_t
+    b["res"], b["res_t"] = res, res_t
+    b["headroom"], b["at_wall"] = head, at_w
+    return b
 
 
 def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
@@ -1209,15 +1269,21 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     def _g(col, default=np.nan):
         return b[col] if col in b.columns else pd.Series(default, index=b.index)
 
-    b["sup"] = _g(f"sr_sup{htf}")
-    b["sup_t"] = _g(f"sr_supt{htf}", 0)
-    b["res"] = _g(f"sr_res{htf}")
-    b["res_t"] = _g(f"sr_rest{htf}", 0)
-    # HEADROOM = distance to the nearest MULTI-TOUCH wall overhead, in ATR, taking the
-    # TIGHTER of the two frames. inf = clear road (no defended level that way), which is a
-    # real answer, not a missing one.
-    b["headroom"] = np.minimum(_g(f"sr_hup{htf}", np.inf).astype(float),
-                               _g(f"sr_hup{ltf}", np.inf).astype(float))
+    # sup / res / headroom / at_wall are NOT set from the scan snapshot — they are derived
+    # from the merged wall list against LIVE price, below and again on every 5s tick.
+    # Carry the MERGED wall list (both frames, tagged) so the 5-second tick can recompute
+    # which level is nearest and how far away it is WITHOUT refetching a candle. The walls
+    # themselves only move when a bar closes; what is nearest is a function of live price.
+    pair = []
+    for _, r in b.iterrows():
+        wl, wh = r.get(f"sr_wall{ltf}"), r.get(f"sr_wall{htf}")
+        m = ([(float(x), int(t), htf) for x, t in wh] if isinstance(wh, list) else []) + \
+            ([(float(x), int(t), ltf) for x, t in wl] if isinstance(wl, list) else [])
+        pair.append(m)
+    b["_wall_pair"] = pair
+    b["_sr_atr"] = b[f"sr_atr{htf}"] if f"sr_atr{htf}" in b.columns else np.nan
+    b = _live_levels(b)                       # nearest/headroom against the price we have now
+
     # NO CONFLUENCE FLAG — DELIBERATELY. The sister project's one POSITIVE level result was
     # pivot-meets-CALL-WALL confluence (+9.8pp, overhead only), and it is tempting to mirror
     # it here as "a 1h wall sitting on a 4h wall". That mirror is broken, for a reason worth
@@ -1288,6 +1354,10 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             "setup_rank": r.get("setup_rank"), "setup_read": r.get("setup_read"),
             "sup": r.get("sup"), "sup_t": r.get("sup_t"), "res": r.get("res"),
             "res_t": r.get("res_t"), "headroom": r.get("headroom"),
+            "at_wall": r.get("at_wall"),
+            # the wall list + its ATR travel with the row so refresh_prices can re-derive
+            # nearest/headroom/at_wall on every tick without a fetch
+            "_wall_pair": r.get("_wall_pair"), "_sr_atr": r.get("_sr_atr"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
@@ -1392,7 +1462,11 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
         st_["rs_vs_index"] = rs
         b.at[i, "action"] = _tf_action(st_, risk_on)
         b.at[i, "sell"] = _tf_sell_action(st_, risk_on)
-    return b
+    # LEVELS FOLLOW THE TICK. The walls are past structure and stay put until a bar closes,
+    # but which one is nearest — and whether price is testing one right now — changes with
+    # every print. Leaving these frozen was the same failure the verdict rebuild above exists
+    # to prevent: a stale level beside a live price reads as current.
+    return _live_levels(b)
 
 
 _REPLAY_TF = {"15m": None, "1h": "60min", "2h": "120min", "4h": "240min"}

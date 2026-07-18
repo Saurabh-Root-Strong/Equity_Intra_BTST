@@ -544,3 +544,35 @@ def test_every_preset_frame_can_fill_the_sr_window():
         for frame in (p["ltf"], p["htf"]):
             if frame in bars_per_session:            # 1D/1W come from the archive, not this fetch
                 assert bars_per_session[frame] * sessions >= 40, f"{k}/{frame} starves S/R"
+
+
+def test_levels_track_live_price_and_flip_polarity():
+    """REGRESSION: sup/res/headroom were computed at SCAN time and frozen while price ticked
+    every 5s. As price approached a wall headroom stayed wide, and once price traded THROUGH
+    a level the board still listed it as resistance overhead — on a 4h frame the scan can be
+    hours old. The walls are past structure and rightly freeze; WHICH is nearest and HOW FAR
+    are functions of live price and must follow the tick."""
+    from eqbtst import live
+    w = [(100.0, 3, "4h"), (110.0, 2, "4h"), (95.0, 1, "1h")]
+    b = live._live_levels(pd.DataFrame(
+        [{"symbol": "T", "ltp": px, "_wall_pair": w, "_sr_atr": 2.0}
+         for px in (97.0, 99.8, 104.0, 112.0)]))
+    assert b.loc[0, "res"] == 100.0 and b.loc[0, "res_t"] == 3      # wall is overhead
+    assert b.loc[1, "at_wall"].startswith("RES 100.00")             # testing it RIGHT NOW
+    # POLARITY FLIP: once price is above it, the same level is support — with its touches
+    assert b.loc[2, "sup"] == 100.0 and b.loc[2, "sup_t"] == 3
+    assert b.loc[3, "sup"] == 110.0 and b.loc[3, "headroom"] == np.inf   # clear road above
+    # a live test must NOT inflate the touch count
+    assert b.loc[1, "res_t"] != 4
+
+
+def test_live_levels_survive_missing_inputs():
+    from eqbtst import live
+    b = live._live_levels(pd.DataFrame([
+        {"symbol": "A", "ltp": None, "_wall_pair": [(10.0, 2, "1h")], "_sr_atr": 1.0},
+        {"symbol": "B", "ltp": 100.0, "_wall_pair": [], "_sr_atr": 1.0},
+        {"symbol": "C", "ltp": 100.0, "_wall_pair": [(90.0, 2, "1h")], "_sr_atr": np.nan},
+    ]))
+    assert b["headroom"].tolist() == [np.inf, np.inf, np.inf]
+    assert (b["at_wall"] == "").all()
+    assert live._live_levels(pd.DataFrame()).empty

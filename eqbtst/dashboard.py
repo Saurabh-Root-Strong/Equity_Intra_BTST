@@ -348,6 +348,18 @@ SR_COLS = {
         "res×", format="%d",
         help="How many times price was rejected at that resistance. Same 5+ inversion caveat "
              "as sup×."),
+    "at_wall": st.column_config.TextColumn(
+        "at wall", width="small",
+        help="**LIVE — price is testing a defended level RIGHT NOW** (within 0.15 ATR of a "
+             "level that has already turned it ≥2 times).\n\n"
+             "`RES 2896.41 x3` = price is sitting on a resistance it was rejected from 3 times "
+             "before. This is the moment that decides the next move: it either turns again "
+             "(the 4th rejection) or breaks, and a break of a well-defended level is the more "
+             "meaningful event of the two.\n\n"
+             "The touch count deliberately does NOT increment while the test is happening — a "
+             "touch only becomes a rejection once price actually turns. Counting the test in "
+             "progress would let a level inflate its own strength on the way to breaking.\n\n"
+             "Blank = price is not near any multi-touch level."),
     "headroom": st.column_config.NumberColumn(
         "headroom", format="%.2f",
         help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, in ATR, taking the "
@@ -799,7 +811,7 @@ if tf == "Intraday":
         filtered = _mtf_filter(after_deliv)
         active = _htf_on or _ltf_on or _setup_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = (["symbol", "sector", "ltp", "turn₹L", "day%"]
-                      + (["setup", "loc", "sup", "sup_t", "res", "res_t", "headroom"] if _P else [])
+                      + (["setup", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else [])
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
@@ -871,7 +883,7 @@ if tf == "Intraday":
                     "Try a coarser Lower TF.")
             st.stop()
 
-        _sc = ["setup", "loc", "sup", "sup_t", "res", "res_t", "headroom"] if _P else []
+        _sc = ["setup", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else []
         long_cols = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
                      "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
