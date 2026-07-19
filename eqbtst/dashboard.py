@@ -671,6 +671,15 @@ if tf == "Intraday":
                                    "eats a far smaller share of a multi-day move than of a "
                                    "30-minute one. The intraday hunt in this stack is closed."))
         _P = mtf.PRESETS.get(preset)
+        if _P and preset != "intraday" and tf == "Intraday":
+            # NAME COLLISION: the sidebar radio picks WHICH BOARD you are on (validated
+            # BTST-carry board / this structure lane / replay); this dropdown picks the
+            # ANALYSIS HORIZON inside this lane. Both use the word "BTST", so the sidebar can
+            # read "Intraday" while the horizon reads "BTST" and look self-contradictory.
+            st.caption("ℹ️ Sidebar **Intraday** = which BOARD you are on (this structure lane). "
+                       f"**{_P['label'].split('·')[0].strip()}** above = the HORIZON this lane "
+                       "is analysing. Different questions: the sidebar is the page, the "
+                       "dropdown is the hold.")
         _setup_f = "All"
         if _P:
             _setup_f = pc2.selectbox(

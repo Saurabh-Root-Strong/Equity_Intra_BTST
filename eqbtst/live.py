@@ -975,7 +975,11 @@ def mtf_structure(sym: str) -> dict:
 
     HONESTY: the intraday TFs include today's forming bar, so they can REPAINT until that
     bar closes; 1D/1W are through the LAST CLOSE (they cannot repaint intraday, but also do
-    not see today). Cross-TF alignment (e.g. BREAKOUT on 4h while CONSOLIDATION on 1h) is
+    not see today). The WEEKLY frame drops an incomplete final week: a part-formed weekly
+    bar spans fewer sessions, so it reads narrower and faked coils (measured: Monday
+    CONSOLIDATION 15.3% -> 21.3% of the universe). Weekly structure is therefore as-of the
+    last COMPLETE week -- which is also the correct read: a weekly breakout is not one
+    until the week closes. Cross-TF alignment (e.g. BREAKOUT on 4h while CONSOLIDATION on 1h) is
     classic MTF tape-reading — the related validated evidence in this stack is Daily×Weekly
     breakout-from-tight-base (sister project); INTRADAY MTF alignment is unvalidated context,
     same as everything else in this lane."""
@@ -1046,6 +1050,16 @@ def mtf_structure(sym: str) -> dict:
             w = (d.set_index("ts").groupby(pd.Grouper(freq="W-FRI"))
                  .agg(open=("open", "first"), high=("high", "max"),
                       low=("low", "min"), close=("close", "last")).dropna().reset_index())
+            # DROP AN INCOMPLETE FINAL WEEK. A part-formed weekly bar spans fewer sessions, so
+            # its range is mechanically narrower — and the coil test compares the latest 3-bar
+            # span against the typical one. Measured: on a Monday (a 1-day "week") weekly
+            # CONSOLIDATION jumped 15.3% -> 21.3% of the universe, purely from the missing
+            # days. Same defect class as the original coil bug: a window comparison where one
+            # side holds fewer bars. Reading the weekly through the last COMPLETE week is also
+            # the correct chartist call — a weekly breakout is not a weekly breakout until the
+            # week closes. The live price still reaches the read through the daily frame.
+            if len(w) and d["ts"].max() < w["ts"].iloc[-1]:
+                w = w.iloc[:-1]
             _set("1W", w)
     except Exception:
         pass
@@ -1210,6 +1224,20 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
             sup.append(np.nan); sup_t.append(0); res.append(np.nan); res_t.append(0)
             head.append(np.inf); at_w.append("")
             continue
+        # RE-CLUSTER THE MERGED LIST. The two frames are resampled from the SAME series, so
+        # the same physical swing shows up in both — the raw merge is full of near-duplicates.
+        # Picking "nearest by price" then reported the DUPLICATE: a 3-touch wall at 100.00
+        # sitting 0.05 from a 1-touch at 100.05 was displayed as x1, understating the level
+        # that actually matters. Touches are MAXed, never summed: the two frames are seeing
+        # one swing twice, so adding them would manufacture strength that never happened.
+        if a > 0:
+            merged: list[list] = []
+            for x, t, _tf in sorted(wl, key=lambda z: z[0]):
+                if merged and abs(x - merged[-1][0]) <= 0.2 * a:
+                    merged[-1][1] = max(merged[-1][1], t)
+                else:
+                    merged.append([x, t])
+            wl = [(x, t, "") for x, t in merged]
         md = 0.25 * a                                  # ignore micro-swings hugging price
         below = [(x, t) for x, t, _ in wl if x < px - md]
         above = [(x, t) for x, t, _ in wl if x > px + md]

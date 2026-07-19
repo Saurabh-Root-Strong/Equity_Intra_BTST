@@ -632,3 +632,48 @@ def test_short_edge_decays_with_hold_length():
     assert all(v < 22.0 for v in e.values())
     # only the horizon that can actually be squared off same day is cash-shortable
     assert mtf.SHORTABLE_IN_CASH["intraday"] and not mtf.SHORTABLE_IN_CASH["swing"]
+
+
+def test_weekly_frame_drops_an_incomplete_week():
+    """REGRESSION: a part-formed weekly bar spans fewer sessions, so its range is mechanically
+    narrower — and the coil test compares the latest 3-bar span to the typical one. On a
+    Monday (a 1-day 'week') weekly CONSOLIDATION rose 15.3% -> 21.3% of the universe purely
+    from missing days. Same class as the original coil bug."""
+    import inspect
+    from eqbtst import live
+    src = inspect.getsource(live.mtf_structure)
+    assert 'w = w.iloc[:-1]' in src and 'd["ts"].max() < w["ts"].iloc[-1]' in src
+    # the guard must only fire when the week is genuinely unfinished
+    d = pd.DataFrame({"ts": pd.to_datetime(["2026-07-13", "2026-07-14"])})
+    w = pd.DataFrame({"ts": pd.to_datetime(["2026-07-17"])})          # week ENDS Friday
+    assert d["ts"].max() < w["ts"].iloc[-1]                            # mid-week -> drop
+    d2 = pd.DataFrame({"ts": pd.to_datetime(["2026-07-17"])})
+    assert not (d2["ts"].max() < w["ts"].iloc[-1])                     # Friday -> keep
+
+
+def test_merged_walls_do_not_hide_a_stronger_level():
+    """REGRESSION: the two frames are resampled from the SAME series, so the merged wall list
+    is full of near-duplicates. Picking 'nearest by price' reported the DUPLICATE — a 3-touch
+    wall at 100.00 sitting 0.05 from a 1-touch at 100.05 displayed as x1."""
+    from eqbtst import live
+    w = [(100.00, 3, "4h"), (100.05, 1, "1h"), (110.0, 2, "4h")]
+    r = live._live_levels(pd.DataFrame(
+        [{"symbol": "T", "ltp": 105.0, "_wall_pair": w, "_sr_atr": 2.0}]))
+    assert r.loc[0, "sup"] == 100.00 and r.loc[0, "sup_t"] == 3
+    # touches are MAXed, never summed — one swing seen twice is not two rejections
+    assert r.loc[0, "sup_t"] != 4
+
+
+def test_structure_label_is_scale_invariant():
+    """The 8-year short study back-adjusted prices using a ratio only known LATER. That is
+    leak-free only because a uniform rescale cannot change a label — ER, ATR and the breakout
+    comparison all scale together. Guard it, or the study's validity silently changes."""
+    from eqbtst import indicators
+    rng = np.random.default_rng(1)
+    for _ in range(100):
+        c = 100 + np.cumsum(rng.normal(0, 1, 60))
+        d = pd.DataFrame({"open": c, "high": c + rng.random(60),
+                          "low": c - rng.random(60), "close": c, "volume": 1})
+        d2 = d.copy()
+        d2[["open", "high", "low", "close"]] *= rng.uniform(0.1, 10)
+        assert indicators.structure(d) == indicators.structure(d2)
