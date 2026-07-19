@@ -627,6 +627,12 @@ def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -
         return pd.DataFrame()
     df = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    # The broker's coarse intraday series carries the same trailing session stub our own
+    # resample does (NSE's 375-minute session is not divisible by 60 or 120), so it gets the
+    # same treatment -- otherwise the board's structure label and the trade card's ATR stop are
+    # computed on two different definitions of '1h'. See merge_session_stubs.
+    if res.isdigit() and int(res) > 15:
+        df = merge_session_stubs(df, int(res))
     return df
 
 
@@ -1077,6 +1083,16 @@ def mtf_structure(sym: str) -> dict:
         # (TRENT 5->9, KOTAKBANK 6->8). Same single API call, larger payload.
         f = fetch_intraday(sym, tf="15m", lookback_days=_MTF_FETCH_DAYS)
         if not f.empty:
+            # ADJUST ONCE, HERE, SO EVERY READER SEES THE SAME SERIES. sr_levels back-adjusts
+            # internally but struct_full and band_pct do not, so a split inside the 60-day
+            # window would have put the LEVELS on the adjusted series and the STRUCTURE LABEL
+            # on the raw one -- a name whose chart is half at pre-split prices. The daily
+            # archive is already adjusted upstream (_daily_hist), which is why 1D/1W were
+            # never exposed; the intraday frames come straight from the broker and were.
+            # Currently latent: 0 of 70 sampled names had a >25% step inside 60 days. Latent
+            # is not fixed -- a 1:5 split lands whenever it lands. Adjusting at the source
+            # costs one pass per name and makes sr_levels' own pass a verified no-op.
+            f = indicators.adjust_corporate_actions(f)
             _set("15m", f)
             for lab, freq in (("1h", "60min"), ("2h", "120min"), ("4h", "240min")):
                 _set(lab, _resample_ohlcv(f, freq))
@@ -1086,24 +1102,41 @@ def mtf_structure(sym: str) -> dict:
         d = _daily_hist().get(sym)
         if d is not None and len(d) >= 5:
             _set("1D", d.tail(60))
-            w = (d.set_index("ts").groupby(pd.Grouper(freq="W-FRI"))
-                 .agg(open=("open", "first"), high=("high", "max"),
-                      low=("low", "min"), close=("close", "last")).dropna().reset_index())
-            # DROP AN INCOMPLETE FINAL WEEK. A part-formed weekly bar spans fewer sessions, so
-            # its range is mechanically narrower — and the coil test compares the latest 3-bar
-            # span against the typical one. Measured: on a Monday (a 1-day "week") weekly
-            # CONSOLIDATION jumped 15.3% -> 21.3% of the universe, purely from the missing
-            # days. Same defect class as the original coil bug: a window comparison where one
-            # side holds fewer bars. Reading the weekly through the last COMPLETE week is also
-            # the correct chartist call — a weekly breakout is not a weekly breakout until the
-            # week closes. The live price still reaches the read through the daily frame.
-            if len(w) and d["ts"].max() < w["ts"].iloc[-1]:
-                w = w.iloc[:-1]
-            _set("1W", w)
+            _set("1W", weekly_frame(d))
     except Exception:
         pass
     _MTF_CACHE[key] = out
     return out
+
+
+def weekly_frame(d: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Daily bars -> weekly (W-FRI), truncated to the last COMPLETE week.
+
+    DROP AN INCOMPLETE FINAL WEEK. A part-formed weekly bar spans fewer sessions, so its range
+    is mechanically narrower -- and the coil test compares the latest 3-bar span against the
+    typical one. Measured: on a Monday (a 1-day "week") weekly CONSOLIDATION jumped 15.3% ->
+    21.3% of the universe, purely from the missing days. Same defect class as the original coil
+    bug and as the intraday session stub: a window comparison where one side holds fewer bars.
+    It is also the correct chartist call -- a weekly breakout is not one until the week closes.
+    The live price still reaches the read through the daily frame.
+
+    BUT "the last daily bar is before the Friday label" is NOT the question "is this week
+    unfinished". W-FRI labels every group with its Friday date whether or not that Friday
+    traded, so on any FRIDAY HOLIDAY the old test fired on a week that was already over: last
+    daily bar Thursday < Friday label -> a COMPLETE Mon-Thu week silently discarded, and it
+    stayed discarded for the whole following week. Verified on a synthetic June-2026 calendar
+    with Friday the 26th removed. A week is finished once the CALENDAR has passed its Friday,
+    regardless of whether the exchange opened that day; only then does the daily-bar test
+    apply. `now` is injectable so the boundary is testable without waiting for a holiday."""
+    w = (d.set_index("ts").groupby(pd.Grouper(freq="W-FRI"))
+         .agg(open=("open", "first"), high=("high", "max"),
+              low=("low", "min"), close=("close", "last")).dropna().reset_index())
+    if len(w):
+        wk_end = w["ts"].iloc[-1]
+        today = (now or pd.Timestamp.now()).normalize()
+        if d["ts"].max() < wk_end and today <= wk_end:
+            w = w.iloc[:-1]
+    return w
 
 
 _UNISCAN_CACHE: dict = {}          # bucket5 -> {"board":..., "risk_on":..., "idx_ret":..., "scanned_at":...}
@@ -1583,13 +1616,73 @@ _REPLAY_TF = {"15m": None, "1h": "60min", "2h": "120min", "4h": "240min"}
 
 def _resample_ohlcv(df: pd.DataFrame, freq: str | None) -> pd.DataFrame:
     """Resample one symbol's intraday OHLCV (ts sorted) to a coarser bar `freq`,
-    aligned to the 09:15 session open. None -> unchanged (native fine bars)."""
+    aligned to the 09:15 session open. None -> unchanged (native fine bars).
+
+    THE TRAILING STUB. NSE trades 09:15-15:30 = 375 minutes, which 60 and 120 do not divide.
+    Binning from 09:15 therefore ends every single day with a bar built from ONE 15-minute
+    candle (15:15-15:30) that the rest of the pipeline treats as a full 1h or 2h bar. That is
+    not a cosmetic mismatch -- the structure classifier compares bar RANGES against each other
+    and normalises by ATR, so a bar with a quarter (or an eighth) of the usual span is a
+    different random variable wearing the same label. Measured over 70 names, 60 days:
+
+        1h : 24/70 names (34%) carry a DIFFERENT structure label once the stub is folded in;
+             ATR runs 6% low
+        2h : 26/70 (37%) change; ATR runs 26% low, and the dominant flip is
+             CONSOLIDATION -> RANGE (14 of 26) -- the stub was MANUFACTURING coils
+        4h : 0/70 change (its second bar holds 9 of 16 candles = a real 2h15m bar, which is
+             also what every charting package shows, so it is left alone)
+
+    Same defect family as the partial weekly bar and the original coil detector: a window
+    comparison where one side holds fewer bars. 1h is the confirmation frame of the Intraday
+    preset and the TRIGGER frame of BTST, so a third of those two boards was reading a label
+    produced by the last fifteen minutes of the day.
+
+    Fix: fold a bin holding less than half its nominal candles into the PREVIOUS bar (so the
+    day's last 1h bar spans 14:15-15:30). Nothing is discarded -- the close, the high/low and
+    the volume of those fifteen minutes all survive into the bar before it, which is also the
+    honest chartist reading: that stub is the tail of the 14:15 bar, not a bar of its own."""
     if not freq or df.empty:
         return df
     r = (df.set_index("ts").groupby(pd.Grouper(freq=freq, origin="start_day", offset="9h15min"))
          .agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
               close=("close", "last"), volume=("volume", "sum")).dropna().reset_index())
-    return r
+    return merge_session_stubs(r, int(pd.Timedelta(freq).total_seconds() // 60))
+
+
+_SESSION_END = pd.Timedelta("15h30min")     # NSE cash close
+_STUB_FRAC = 0.5                            # less than half a bar's worth of session = not a bar
+
+
+def merge_session_stubs(df: pd.DataFrame, freq_min: int) -> pd.DataFrame:
+    """Fold a bar that has less than half its nominal span of SESSION left into the bar before
+    it. Applies to any coarse intraday frame, however the bars were produced.
+
+    Whose bars these are matters less than what they are: the broker's own 60-minute series
+    has the identical defect, so this must run on both paths or the board and the trade card
+    disagree about what '1h' means. Measured on RELIANCE: broker 1h -> TREND_UP / ATR 7.84,
+    our resample -> BREAKOUT_UP / ATR 8.02, same name, same minute. Only 4h escapes, because
+    its second bar (13:15-15:30) holds 135 of 240 minutes and is a real bar -- which is also
+    what every charting package draws.
+
+    The rule is SPAN, not candle count, deliberately: a bar with missing candles but a full
+    span is a thin bar, and thinness is a liquidity fact worth seeing, not a reason to merge."""
+    if df is None or df.empty or freq_min <= 15:
+        return df
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        d = row.to_dict()
+        ts = d["ts"]
+        avail = (min(ts + pd.Timedelta(minutes=freq_min), ts.normalize() + _SESSION_END) - ts)
+        if rows and avail < pd.Timedelta(minutes=_STUB_FRAC * freq_min):
+            p = rows[-1]                                   # fold the stub into the bar before it
+            p["high"] = max(p["high"], d["high"])
+            p["low"] = min(p["low"], d["low"])
+            p["close"] = d["close"]
+            if "volume" in p and "volume" in d:
+                p["volume"] = p["volume"] + d["volume"]
+        else:
+            rows.append(d)
+    return pd.DataFrame(rows)
 
 
 def _index_intraday_5m() -> pd.Series:

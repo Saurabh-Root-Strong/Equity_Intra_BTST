@@ -1,6 +1,7 @@
 """Offline unit tests — no DB, no network. Guard the LOCKED logic + no-lookahead."""
 import io
 import re
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -637,21 +638,37 @@ def test_short_edge_decays_with_hold_length():
     assert mtf.SHORTABLE_IN_CASH["intraday"] and not mtf.SHORTABLE_IN_CASH["swing"]
 
 
-def test_weekly_frame_drops_an_incomplete_week():
-    """REGRESSION: a part-formed weekly bar spans fewer sessions, so its range is mechanically
-    narrower — and the coil test compares the latest 3-bar span to the typical one. On a
-    Monday (a 1-day 'week') weekly CONSOLIDATION rose 15.3% -> 21.3% of the universe purely
-    from missing days. Same class as the original coil bug."""
-    import inspect
+def test_weekly_frame_completeness_rule():
+    """A part-formed weekly bar spans fewer sessions, so its range is mechanically narrower —
+    and the coil test compares the latest 3-bar span to the typical one. On a Monday (a 1-day
+    'week') weekly CONSOLIDATION rose 15.3% -> 21.3% of the universe purely from missing days.
+
+    REGRESSION on the FIX itself: 'last daily bar is before the Friday label' is not the same
+    question as 'this week is unfinished'. W-FRI labels a group with its Friday whether or not
+    that Friday traded, so every FRIDAY HOLIDAY discarded a COMPLETE Mon-Thu week — and it
+    stayed discarded all of the following week."""
     from eqbtst import live
-    src = inspect.getsource(live.mtf_structure)
-    assert 'w = w.iloc[:-1]' in src and 'd["ts"].max() < w["ts"].iloc[-1]' in src
-    # the guard must only fire when the week is genuinely unfinished
-    d = pd.DataFrame({"ts": pd.to_datetime(["2026-07-13", "2026-07-14"])})
-    w = pd.DataFrame({"ts": pd.to_datetime(["2026-07-17"])})          # week ENDS Friday
-    assert d["ts"].max() < w["ts"].iloc[-1]                            # mid-week -> drop
-    d2 = pd.DataFrame({"ts": pd.to_datetime(["2026-07-17"])})
-    assert not (d2["ts"].max() < w["ts"].iloc[-1])                     # Friday -> keep
+
+    def daily(a, b, skip=()):
+        ds = [d for d in pd.date_range(a, b) if d.weekday() < 5 and d.date() not in skip]
+        return pd.DataFrame({"ts": ds, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5})
+
+    # mid-week -> the current week is genuinely unfinished, drop it
+    d = daily("2026-05-04", "2026-07-15")                       # ends Wednesday
+    w = live.weekly_frame(d, now=pd.Timestamp("2026-07-15"))
+    assert w["ts"].iloc[-1].date() == dt.date(2026, 7, 10), "unfinished week must be dropped"
+
+    # Friday traded -> that week is complete
+    d = daily("2026-05-04", "2026-07-17")
+    w = live.weekly_frame(d, now=pd.Timestamp("2026-07-17"))
+    assert w["ts"].iloc[-1].date() == dt.date(2026, 7, 17)
+
+    # FRIDAY HOLIDAY: last bar is Thursday, but by Monday the week is plainly over
+    hol = dt.date(2026, 7, 17)
+    d = daily("2026-05-04", "2026-07-17", skip=(hol,))          # last bar Thu 16 Jul
+    w = live.weekly_frame(d, now=pd.Timestamp("2026-07-20"))    # the following Monday
+    assert w["ts"].iloc[-1].date() == hol, "a complete Mon-Thu week must NOT be discarded"
+
 
 
 def test_merged_walls_do_not_hide_a_stronger_level():
@@ -788,3 +805,56 @@ def test_wall_merge_does_not_chain_away_the_stronger_level():
     out = _l._live_levels(b)
     assert out["sup"].iloc[0] == 1794.6, "the anchor must be the cluster's strongest member"
     assert out["sup_t"].iloc[0] == 2, "touches are MAXed across the cluster, never understated"
+
+
+def test_session_stub_is_folded_into_the_previous_bar():
+    """NSE trades 375 minutes, which 60 and 120 do not divide, so binning from 09:15 ends every
+    day with a bar built from ONE 15-minute candle (15:15-15:30) that the pipeline then treats
+    as a full 1h/2h bar. The structure classifier compares bar RANGES and normalises by ATR, so
+    a quarter-length bar is a different random variable wearing the same label. Measured over
+    70 names x 60 days: 1h 24/70 names changed structure label once folded (ATR 6% low); 2h
+    26/70 changed, ATR 26% low, and 14 of those flips were CONSOLIDATION -> RANGE — the stub
+    was MANUFACTURING coils. 4h is untouched: its 13:15 bar holds 135 of 240 minutes."""
+    from eqbtst import live
+    day = pd.Timestamp("2026-07-17 09:15")
+    ts = [day + pd.Timedelta(minutes=15 * i) for i in range(25)]      # a full 09:15-15:30 session
+    f = pd.DataFrame({"ts": ts, "open": 100.0, "high": 101.0, "low": 99.0,
+                      "close": 100.0, "volume": 10})
+    f.loc[24, ["high", "low", "close"]] = [110.0, 98.0, 109.0]        # the 15:15 candle
+    h1 = live._resample_ohlcv(f, "60min")
+    assert len(h1) == 6, "1h must be 6 bars/day, not 7 with a 15-minute impostor"
+    assert h1["ts"].iloc[-1].strftime("%H:%M") == "14:15"
+    assert h1["high"].iloc[-1] == 110.0 and h1["close"].iloc[-1] == 109.0, "stub data must survive"
+    assert h1["volume"].sum() == f["volume"].sum(), "no volume may be lost in the fold"
+    assert len(live._resample_ohlcv(f, "120min")) == 3
+    assert len(live._resample_ohlcv(f, "240min")) == 2, "4h's 13:15 bar is real — leave it alone"
+    # 15m is exact (375/15) and must pass through untouched
+    assert len(live.merge_session_stubs(f, 15)) == len(f)
+
+
+def test_broker_bars_get_the_same_stub_treatment_as_our_resample():
+    """The broker's own 60-minute series has the identical trailing stub. If only one path is
+    corrected, the board's structure label and the trade card's ATR stop are computed on two
+    different definitions of '1h' — measured on RELIANCE: broker TREND_UP / ATR 7.84 vs our
+    resample BREAKOUT_UP / ATR 8.02, same name, same minute."""
+    import inspect
+    from eqbtst import live
+    src = inspect.getsource(live.fetch_intraday)
+    assert "merge_session_stubs" in src, "broker bars must be folded too, or the paths diverge"
+
+
+def test_structure_and_levels_read_the_same_adjusted_series():
+    """sr_levels back-adjusts corporate actions internally; struct_full and band_pct do not. A
+    split inside the 60-day intraday window would therefore put the LEVELS on the adjusted
+    series and the STRUCTURE LABEL on the raw one. The daily archive is adjusted upstream,
+    which is why 1D/1W were never exposed and the intraday frames were. Adjust once at the
+    fetch instead — and double-adjustment must be a verified no-op, or fixing this breaks 1D."""
+    import inspect
+    from eqbtst import live, indicators
+    assert "adjust_corporate_actions" in inspect.getsource(live.mtf_structure)
+    raw = pd.DataFrame({"ts": pd.date_range("2026-01-01", periods=30, freq="D"),
+                        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000})
+    raw.loc[20:, ["open", "high", "low", "close"]] /= 2.0
+    a1 = indicators.adjust_corporate_actions(raw)
+    a2 = indicators.adjust_corporate_actions(a1)
+    assert np.allclose(a1["close"], a2["close"]), "adjusting twice must not re-scale"
