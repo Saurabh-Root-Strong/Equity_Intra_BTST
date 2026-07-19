@@ -399,29 +399,22 @@ SR_COLS = {
     "short_note": st.column_config.TextColumn(
         "short evidence", width="medium",
         help="WHAT THIS SETUP ACTUALLY DID ON THE SHORT SIDE — measured, not reasoned. "
-             "468,661 observations, 2018-2026, the board's own logic replayed causally over "
-             "the archive; the number is 20-day forward return as EXCESS over the universe.
-
-"
-             "A POSITIVE excess on a SHORT means the name ROSE more than the market — the "
-             "short lost. Three of the four directional tags measured that way:
-
-"
-             "• `WITH-TREND CONTINUATION` +0.47% (n=20,220) — a downtrend that COILS is a base "
-             "forming. Shorting it is selling the low.
-"
-             "• `PULLBACK vs HTF` +0.50% (n=753)
-"
-             "• `EXTENDED (aligned)` +1.62% (n=8,906) — the worst. An extended downtrend is an "
-             "oversold name at the END of its decline.
-"
-             "• `RANGE-FLOOR BREAK` −1.09% (n=4,464) — the ONLY one that works short, and the "
-             "smallest bucket.
-
-"
-             "The tab is sorted by THIS, not by chartist setup quality — on the short side that "
-             "ranking is upside down. Note the direction was NOT silently flipped: an inverted "
-             "signal is evidence the logic is wrong, not a free long signal."),
+             "468,661 observations, 2018-2026, the board's own logic replayed causally "
+             "over the archive; the number is 20-day forward return as EXCESS over the "
+             "universe. "
+             "A POSITIVE excess on a SHORT means the name ROSE more than the market — "
+             "the short lost. Three of the four directional tags measured that way. "
+             "`WITH-TREND CONTINUATION` +0.47% (n=20,220) — a downtrend that COILS is "
+             "a base forming, so shorting it is selling the low. "
+             "`PULLBACK vs HTF` +0.50% (n=753). "
+             "`EXTENDED (aligned)` +1.62% (n=8,906) — the worst; an extended downtrend "
+             "is an oversold name at the END of its decline. "
+             "`RANGE-FLOOR BREAK` −1.09% (n=4,464) — the ONLY one that works short, "
+             "and the smallest bucket. "
+             "The tab is sorted by THIS, not by chartist setup quality — on the short "
+             "side that ranking is upside down. Note the direction was NOT silently "
+             "flipped: an inverted signal is evidence the logic is wrong, not a free "
+             "long signal."),
     "headroom": st.column_config.TextColumn(
         "headroom",
         help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, measured in the ATR of "
