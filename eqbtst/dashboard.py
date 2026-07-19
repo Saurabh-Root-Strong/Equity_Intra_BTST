@@ -386,8 +386,10 @@ SR_COLS = {
              "Blank = price is not near any multi-touch level."),
     "headroom": st.column_config.NumberColumn(
         "headroom", format="%.2f",
-        help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, in ATR, taking the "
-             "TIGHTER of your two timeframes — because a level rejected three times "
+        help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, measured in the ATR of "
+             "your TRIGGER (lower) timeframe — the same unit your stop and 1×ATR target are "
+             "built from, so the two numbers are directly comparable.\n\n"
+             "The wall LIST still comes from BOTH timeframes: a level rejected three times "
              "intraday still matters when the higher frame looks clear.\n\n"
              "• **∞** = CLEAR ROAD — no defended level above. That is an answer, not missing "
              "data.\n"

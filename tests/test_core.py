@@ -1,5 +1,6 @@
 """Offline unit tests — no DB, no network. Guard the LOCKED logic + no-lookahead."""
 import io
+import re
 
 import numpy as np
 import pandas as pd
@@ -733,3 +734,57 @@ def test_universe_scan_has_no_ttl():
     m = re.search(r"@st\.cache_data\(([^)]*)\)\s*\ndef _uni_scan", src)
     assert m, "_uni_scan decorator not found"
     assert "ttl" not in m.group(1), "a TTL re-introduces surprise cold re-scans on filter edits"
+
+
+def test_history_fetch_is_rate_paced():
+    """REGRESSION: the universe scan issued ~250 /history calls at ~450 req/min and Fyers
+    replied HTTP 429 'request limit reached' for a slice of them. fetch_intraday turns a 429
+    into an EMPTY frame, which mtf_structure turns into 'n/a' — so 48 of 243 names (RELIANCE,
+    TCS — not thin names) had NO intraday structure and vanished from every HTF/LTF filter
+    while the board looked complete. Measured, 120 names, clean window each time:
+        6 workers unpaced -> 450 req/min -> 7 x 429
+        3 workers, 0.35s  -> 170 req/min -> 0 failures
+        2 workers, 0.25s  -> 174 req/min -> 0 failures
+    The budget is a ROLLING window a burst POISONS: paced run 65s after a burst failed 63/120,
+    the same run from a clean window failed 0 — which is why the 1s retry sweep never helped.
+    With the pacer the full scan returns 0 blanks (86s vs ~40s)."""
+    import inspect
+    from eqbtst import live as _l
+    assert hasattr(_l, "_hist_pace"), "the /history rate pacer is gone"
+    assert 0.3 <= _l._HIST_GAP <= 0.6, "gap must keep the scan under ~200 req/min"
+    src = inspect.getsource(_l.fetch_intraday)
+    assert "_hist_pace()" in src, "fetch_intraday must pace before every /history call"
+    # the retry sweep must wait for the rolling window to actually roll, not 1 second
+    scan = inspect.getsource(_l.universe_mtf_scan)
+    m = re.search(r"time\.sleep\(([\d.]+)\)", scan)
+    assert m and float(m.group(1)) >= 10, "retry sweep must outlast the poisoned rate window"
+
+
+def test_headroom_is_measured_in_the_trigger_frames_atr():
+    """headroom exists to answer 'does my 1xATR target sit beyond a defended level?'. That
+    target and its stop are built from the LOWER (trigger) frame's ATR, so normalising the
+    distance by the HIGHER frame's ATR quoted it in a unit 1.6x-2.4x too large and made every
+    distance read that much too small. Measured on the live board, the '< 0.5 = buying INTO a
+    wall' warning fired on 100/195 (intraday), 93/188 (BTST), 64/173 (swing), 100/183
+    (positional) — about half the universe; in the trigger frame's own ATR, ~a quarter."""
+    import inspect
+    from eqbtst import live as _l
+    src = inspect.getsource(_l.add_setup)
+    m = re.search(r'b\["_sr_atr"\]\s*=\s*b\[f"sr_atr\{(\w+)\}"\]', src)
+    assert m, "_sr_atr assignment not found"
+    assert m.group(1) == "ltf", "headroom/at_wall must use the TRIGGER frame's ATR"
+
+
+def test_wall_merge_does_not_chain_away_the_stronger_level():
+    """REGRESSION (DALBHARAT, Swing, live): walls 1794.6 x2, 1799.6 x2, 1804.0 x1 with a 5.6
+    tolerance. Comparing each candidate against the cluster ANCHOR absorbed the middle wall,
+    after which 1804.0 measured 9.4 from the anchor, survived as its own 'level', and was
+    displayed as support x1 — 4.4 away from a wall that had just been declared the same level.
+    Absorbing a member must not shrink the cluster's reach."""
+    import pandas as pd
+    from eqbtst import live as _l
+    b = pd.DataFrame([{"ltp": 1823.2, "_sr_atr": 27.94,
+                       "_wall_pair": [(1794.6, 2, "1D"), (1799.6, 2, "1D"), (1804.0, 1, "4h")]}])
+    out = _l._live_levels(b)
+    assert out["sup"].iloc[0] == 1794.6, "the anchor must be the cluster's strongest member"
+    assert out["sup_t"].iloc[0] == 2, "touches are MAXed across the cluster, never understated"

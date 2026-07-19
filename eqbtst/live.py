@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -571,9 +572,47 @@ _RES = {"1D": "D", "4h": "240", "2h": "120", "1h": "60", "15m": "15", "5m": "5"}
 _LOOKBACK = {"1D": 300, "4h": 30, "2h": 15}
 
 
+# ── /history RATE PACER ──────────────────────────────────────────────────────────────
+# MEASURED, not assumed. 120 names, identical symbols, three configurations, each after a
+# 70s cooldown, capturing the broker's own reply rather than an empty frame:
+#
+#     6 workers, unpaced   -> 450 req/min ->   7 x HTTP 429 "request limit reached"
+#     3 workers, 0.35s gap -> 170 req/min ->   0 failures
+#     2 workers, 0.25s gap -> 174 req/min ->   0 failures
+#
+# So the ceiling is a RATE, and ~180 req/min clears it completely. Worse, the budget is a
+# ROLLING window that a burst POISONS: a paced run started 65s after an unpaced burst failed
+# 63 of 120, while the same paced run from a clean window failed 0. That is exactly the
+# production bug -- the scan bursts, 43-48 names 429, and the retry sweep one second later is
+# still inside the window the burst poisoned, so it fails too and the blanks persist all day.
+#
+# A global token bucket in front of every /history call fixes both: no burst to poison the
+# window, and the retry has a clean one to run in. Cost is ~81s for 243 names instead of ~40s.
+# That is the right trade: a scan that takes twice as long is visibly slower, whereas a scan
+# missing 20% of the universe looks complete and silently drops those names out of EVERY
+# structure filter. Concurrency is kept (the pool still hides the ~0.7s round-trip); only the
+# ISSUE RATE is capped.
+_HIST_GAP = 0.33                       # seconds between /history calls -> ~180 req/min
+_HIST_LOCK = threading.Lock()
+_HIST_LAST = [0.0]
+
+
+def _hist_pace() -> None:
+    """Block until this thread may issue the next /history call. Global across the pool."""
+    with _HIST_LOCK:
+        wait = _HIST_LAST[0] + _HIST_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _HIST_LAST[0] = time.time()
+
+
 def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -> pd.DataFrame:
     """Candles for one symbol at timeframe tf ('4h','2h','1h','15m','5m') via /history.
-    Pulls a few days so ATR14/RSI14 have enough bars on the coarse (hourly+) frames."""
+    Pulls a few days so ATR14/RSI14 have enough bars on the coarse (hourly+) frames.
+
+    Rate-paced: see _hist_pace. An unpaced fan-out returns 429s that this function would
+    otherwise convert into an empty frame, i.e. into a silent 'n/a' structure label."""
+    _hist_pace()
     res = _RES.get(tf, "60")
     lb = lookback_days if lookback_days is not None else _LOOKBACK.get(tf, 10)
     d_to = dt.date.today()
@@ -1142,7 +1181,13 @@ def universe_mtf_scan(date=None) -> dict:
     # blanks once, slower and narrower, and report what still failed.
     _blank = [s for s in syms if (mtfs.get(s) or {}).get("15m", "n/a") == "n/a"]
     if _blank:
-        time.sleep(1.0)                                  # let the rate-limit window roll over
+        # 15s, not 1s. The old 1s was a guess and it was wrong: the rate window is ROLLING, so
+        # a retry issued one second after the burst that caused the 429s runs inside the very
+        # window those calls poisoned and 429s again. That is why the sweep never cleared the
+        # blanks. With fetch_intraday now paced there should be nothing left to sweep; this
+        # stays as the belt-and-braces path for a genuine transient (network blip, one slow
+        # symbol) and it now waits long enough for the window to actually roll.
+        time.sleep(15.0)
         for s in _blank:
             _MTF_CACHE.pop((s, dt.date.today(), _bucket5()), None)   # drop the cached blank
         with ThreadPoolExecutor(max_workers=2) as ex:    # gentler than the main fan-out
@@ -1231,13 +1276,30 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
         # that actually matters. Touches are MAXed, never summed: the two frames are seeing
         # one swing twice, so adding them would manufacture strength that never happened.
         if a > 0:
-            merged: list[list] = []
+            # SINGLE-LINKAGE, ANCHORED ON THE CLUSTER'S STRONGEST MEMBER.
+            # Comparing each candidate against the cluster ANCHOR alone chains badly: walls at
+            # 1794.6(x2), 1799.6(x2), 1804.0(x1) with a 5.6 tolerance absorbed the middle one
+            # into the first, after which 1804.0 measured 9.4 from the anchor and survived as
+            # its own "level" -- 4.4 away from a wall that had just been declared the same
+            # level. The board then showed support 1804.0 x1 while 1799.6 x2 sat inside the
+            # tolerance (DALBHARAT, Swing preset, live). Absorbing a member must not shrink the
+            # cluster's reach, so the tolerance is applied to the RUNNING EDGE (the last price
+            # taken in) and a width cap keeps single-linkage from drifting across the chart.
+            # The anchor -- the price displayed -- stays the strongest member, because that is
+            # the level the market actually defended. Touches are still MAXed, never summed:
+            # the two frames resample ONE price series, so the same swing appears in both.
+            merged: list[list] = []                      # [anchor_px, touches, edge_px, min, max]
             for x, t, _tf in sorted(wl, key=lambda z: z[0]):
-                if merged and abs(x - merged[-1][0]) <= 0.2 * a:
-                    merged[-1][1] = max(merged[-1][1], t)
+                if merged and abs(x - merged[-1][2]) <= 0.2 * a and \
+                        (x - merged[-1][3]) <= 0.6 * a:              # width cap
+                    m = merged[-1]
+                    if t > m[1]:
+                        m[0], m[1] = x, t                           # strongest takes the anchor
+                    m[2] = x                                        # running edge
+                    m[4] = max(m[4], x)
                 else:
-                    merged.append([x, t])
-            wl = [(x, t, "") for x, t in merged]
+                    merged.append([x, t, x, x, x])
+            wl = [(m[0], m[1], "") for m in merged]
         md = 0.25 * a                                  # ignore micro-swings hugging price
         below = [(x, t) for x, t, _ in wl if x < px - md]
         above = [(x, t) for x, t, _ in wl if x > px + md]
@@ -1314,7 +1376,21 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
             ([(float(x), int(t), ltf) for x, t in wl] if isinstance(wl, list) else [])
         pair.append(m)
     b["_wall_pair"] = pair
-    b["_sr_atr"] = b[f"sr_atr{htf}"] if f"sr_atr{htf}" in b.columns else np.nan
+    # THE ATR UNIT MUST BE THE TRIGGER FRAME'S, NOT THE CONFIRMATION FRAME'S.
+    # `headroom` exists to answer one question: does my 1xATR target sit on the far side of a
+    # defended level? That target, and the stop beside it, are built from the LOWER timeframe's
+    # ATR (enrich_mtf calls deep_state with tf=ltf). Normalising headroom by the HIGHER frame's
+    # ATR therefore quoted the distance in a unit ~2x larger than the target it is compared
+    # against, so every distance read ~2x too small. Measured across the live board, the
+    # "< 0.5 = you are buying INTO a wall" warning fired on 100/195 names on Intraday, 93/188
+    # BTST, 64/173 Swing, 100/183 Positional -- roughly half the universe. In the trigger
+    # frame's own ATR it fires on 41/50/45/43, i.e. about a quarter. The old numbers were not
+    # a stricter setting, they were the wrong unit: HTF ATR / LTF ATR runs 1.6x-2.4x by preset.
+    # The same `a` also sets the wall-merge tolerance and the at_wall test, and the trigger
+    # frame is the right resolution for both -- "price is ON this level" should mean on it at
+    # the resolution you are timing the entry, not within a weekly bar's noise.
+    # The WALL LIST still merges BOTH frames; only the yardstick changes.
+    b["_sr_atr"] = b[f"sr_atr{ltf}"] if f"sr_atr{ltf}" in b.columns else np.nan
     b = _live_levels(b)                       # nearest/headroom against the price we have now
 
     # NO CONFLUENCE FLAG — DELIBERATELY. The sister project's one POSITIVE level result was
