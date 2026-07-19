@@ -1031,3 +1031,24 @@ def test_long_side_is_ranked_at_the_selected_hold():
         assert ex == sorted(ex, reverse=True), f"{hold} long rank must follow the measurement"
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     assert "long_rank(t, preset)" in dash, "the LONG tab must rank at the SELECTED horizon"
+
+
+def test_a_dead_token_is_diagnosed_not_blamed_on_the_clock():
+    """The scan-failure branch used to choose its message from market_open() alone: open ->
+    "transient, just hit re-scan"; closed -> "your token may be stale". That is inverted for
+    the case that happens EVERY TRADING MORNING. The Fyers token expires ~06:00 IST, three
+    hours before the 09:15 open, so the normal first failure of the day is a DEAD TOKEN WHILE
+    THE MARKET IS OPEN — and the board told the user it was transient and to keep pressing a
+    button that can never fix it. The cause must be diagnosed from token_status(), not the
+    clock, and the auto-retry must not fire on a dead token."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    # anchor on the SCAN's failure branch specifically — the file has three `except _e` blocks
+    i = src.find("DIAGNOSE THE CAUSE, DO NOT INFER IT FROM THE CLOCK")
+    assert i > 0, "scan-failure branch not found"
+    blk = src[i:i + 2600]
+    tok = blk.find("live.token_status()")
+    retry = blk.find('st.session_state["_uni_retried"] = True')
+    assert tok > 0, "the failure branch must ask the token why it failed"
+    assert retry > tok, "the token must be checked BEFORE the auto-retry burns a rerun"
+    assert "re-authenticate" in blk, "a dead token must say re-authenticate"
+    assert "will not fix it" in blk, "must say that re-scanning cannot fix an expired token"

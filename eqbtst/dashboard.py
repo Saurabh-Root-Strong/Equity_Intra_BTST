@@ -572,22 +572,41 @@ if tf == "Intraday":
                 sc = _uni_scan(st.session_state["uni_nonce"])
             st.session_state.pop("_uni_retried", None)      # success — clear the retry guard
         except Exception as _e:
-            # An empty/failed scan is NOT cached (it raised). If the market is open this is almost
-            # always a transient first-seconds-of-session quote miss — auto-retry ONCE with a fresh
-            # nonce before bothering the user. Guarded so it can never loop.
-            if live.market_open() and not st.session_state.get("_uni_retried"):
+            # DIAGNOSE THE CAUSE, DO NOT INFER IT FROM THE CLOCK. This branch used to decide
+            # what to say purely from market_open(): open -> "transient, just hit re-scan";
+            # closed -> "your token may be stale, re-auth". Those are exactly inverted for the
+            # case that happens EVERY TRADING MORNING. The Fyers token expires ~06:00 IST, more
+            # than three hours BEFORE the 09:15 open, so the normal first failure of the day is
+            # a DEAD TOKEN while the market is OPEN — and the board would tell the user it was
+            # transient and to keep pressing ↻, which can never fix it. Ask the token.
+            _tok = live.token_status()
+            _open = live.market_open()
+            if not _tok["usable"]:
+                st.session_state.pop("_uni_retried", None)
+                st.error(
+                    f"🔑 **The Fyers token is not usable — re-authenticate.** `{_tok['describe']}`"
+                    "\n\nThe token expires around **06:00 IST every day**, which is before the "
+                    "09:15 open, so this is the normal state of the first scan each morning. "
+                    "**↻ re-scan will not fix it** — no number of retries will.\n\n"
+                    "**Fix:** close this, run `run_dashboard.bat` (it checks the token and walks "
+                    "you through re-auth), then come back. The BTST (overnight) tab still works "
+                    "meanwhile — it runs off the confirmed last close and needs no token.")
+                st.stop()
+            # Token is fine, so an empty scan really can be transient (the first seconds of the
+            # session, or a quote-fetch miss). Auto-retry ONCE. Guarded so it can never loop.
+            if _open and not st.session_state.get("_uni_retried"):
                 st.session_state["_uni_retried"] = True
                 st.session_state["uni_nonce"] += 1
                 live._UNISCAN_CACHE.clear()
                 st.rerun()
-            _open = live.market_open()
             st.session_state.pop("_uni_retried", None)
             st.info(
-                (f"Universe scan came back empty — {_e}. **Market is OPEN**, so this is a "
-                 "transient quote-fetch miss (or the very first seconds of the session). It is "
-                 "**not cached** — just hit **↻ re-scan universe**.") if _open else
-                (f"Universe scan unavailable — {_e}. Market is closed / pre-open, or the Fyers "
-                 "token is stale (~06:00 daily expiry). Re-auth, then hit **↻ re-scan**."))
+                (f"Universe scan came back empty — {_e}. Token is valid and the **market is "
+                 "OPEN**, so this is a transient quote-fetch miss (or the very first seconds of "
+                 "the session). It is **not cached** — just hit **↻ re-scan universe**.")
+                if _open else
+                (f"Universe scan unavailable — {_e}. The token is valid, so this is the market "
+                 "being closed / pre-open. The live scan runs Mon–Fri 09:15–15:30 IST."))
             st.stop()
         light = price_filter(sc["board"], "ltp")     # price band applies; no turnover floor
         _sa = sc.get("scanned_at")
