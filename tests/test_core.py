@@ -677,3 +677,23 @@ def test_structure_label_is_scale_invariant():
         d2 = d.copy()
         d2[["open", "high", "low", "close"]] *= rng.uniform(0.1, 10)
         assert indicators.structure(d) == indicators.structure(d2)
+
+
+def test_short_side_anti_predictive_tags_are_recorded():
+    """Measured by reconstructing the REAL pipeline (structure -> synthesize -> side_of)
+    causally over 468,661 daily observations, 2018-2026: the SHORT side OUTPERFORMED the
+    universe by +0.57% over 20 days. The side is inverted, not merely weak — in a rising
+    market an extended or coiling downtrend is a bottoming pattern, so shorting it sells the
+    low. Only RANGE-FLOOR BREAK underperformed (-1.09%)."""
+    from eqbtst import mtf
+    # every anti-predictive short tag must carry POSITIVE excess (positive = the short lost)
+    for tag in mtf.SHORT_ANTI_PREDICTIVE:
+        assert mtf.SIDE_EXCESS_20D[("SHORT", tag)] > 0, tag
+    for tag in mtf.SHORT_VALIDATED:
+        assert mtf.SIDE_EXCESS_20D[("SHORT", tag)] < 0, tag
+    # the two sets must partition the directional short tags — no tag may be silently unrated
+    short_tags = {t for (s, t) in mtf.SIDE_EXCESS_20D if s == "SHORT"}
+    assert short_tags == mtf.SHORT_ANTI_PREDICTIVE | mtf.SHORT_VALIDATED
+    assert not (mtf.SHORT_ANTI_PREDICTIVE & mtf.SHORT_VALIDATED)
+    # long side measured positive on every tag (average only — it is sign-unstable by year)
+    assert all(v > 0 for (s, _), v in mtf.SIDE_EXCESS_20D.items() if s == "LONG")

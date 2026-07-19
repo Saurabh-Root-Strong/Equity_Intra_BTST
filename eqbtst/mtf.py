@@ -235,6 +235,50 @@ SHORT_EDGE_BPS = {"intraday": +4.4, "btst": -5.1, "swing": -13.6, "positional": 
 # tradeable; the difference is between "not tradeable" and "structurally paying to hold".
 
 
+# ── DOES THE BOARD'S OWN SIDE LOGIC ACTUALLY SEPARATE WINNERS FROM LOSERS? ───────────
+# Ran the REAL pipeline over history rather than trusting it: daily structure -> weekly
+# structure (last COMPLETE week only) -> synthesize() -> side_of(), causally, on the
+# corporate-action-adjusted archive. 468,661 observations, 2018-2026. This reconstructs the
+# POSITIONAL preset exactly (1D trigger / 1W confirm); the intraday-frame presets cannot be
+# validated this way because the broker only serves ~60 days of intraday history.
+#
+# Forward 20-day return, as EXCESS over the same-period universe baseline (+1.74%):
+#
+#     side        n         excess
+#     LONG    81,129        +0.93%
+#     SHORT   34,343        +0.57%     <- shorts OUTPERFORM. The side is INVERTED.
+#     none   353,189        -0.27%
+#
+# Two things are true at once. The setup logic DOES find movers -- both sides beat the
+# do-nothing bucket, so the tags are not noise. But the DIRECTION assignment is right on the
+# long side and backwards on the short side. Per tag, on the short side:
+#
+#     EXTENDED (aligned) DOWN      n= 8,906   +1.62%   worst offender
+#     PULLBACK vs HTF    DOWN      n=   753   +0.50%
+#     WITH-TREND CONT.   DOWN      n=20,220   +0.47%
+#     RANGE-FLOOR BREAK            n= 4,464   -1.09%   the ONLY one that works short
+#
+# The chartist reading of why: in a structurally rising market, a downtrend that has become
+# EXTENDED is an oversold name at the end of its decline, and a downtrend that COILS is a
+# base forming. Both are bottoming patterns. Shorting them is selling the low. Only a fresh
+# break of the range FLOOR is genuinely bearish, and it is the smallest bucket.
+#
+# Long side for contrast (all four tags positive), but NOT stable: year-by-year LONG excess
+# runs -1.36, +0.63, -0.58, +0.31, +0.95, +1.05, +0.93, +0.01, -0.95 -- five up, four down.
+# Positive on average, sign-unstable in practice. Consistent with everything else in this
+# stack: structure is context, not an edge.
+SIDE_EXCESS_20D = {
+    ("LONG", "EXTENDED (aligned)"): +1.36, ("LONG", "PULLBACK vs HTF"): +1.01,
+    ("LONG", "WITH-TREND CONTINUATION"): +0.81, ("LONG", "RANGE-TOP BREAK"): +0.36,
+    ("SHORT", "EXTENDED (aligned)"): +1.62, ("SHORT", "PULLBACK vs HTF"): +0.50,
+    ("SHORT", "WITH-TREND CONTINUATION"): +0.47, ("SHORT", "RANGE-FLOOR BREAK"): -1.09,
+}
+# Short setups measured ANTI-PREDICTIVE (the name rose more than the market). Positive excess
+# on a SHORT means the trade lost. Only RANGE-FLOOR BREAK survived.
+SHORT_ANTI_PREDICTIVE = {"EXTENDED (aligned)", "PULLBACK vs HTF", "WITH-TREND CONTINUATION"}
+SHORT_VALIDATED = {"RANGE-FLOOR BREAK"}
+
+
 # Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no
 # overnight short — an unsold short must be squared off the same day (delivery you do not own
 # cannot be carried). Anything beyond intraday needs the futures leg, and the overnight short

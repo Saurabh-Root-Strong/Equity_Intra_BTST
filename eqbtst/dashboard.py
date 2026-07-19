@@ -913,6 +913,27 @@ if tf == "Intraday":
                             f"all. The overnight gap that IS the long edge here is a nightly toll "
                             f"for a short — with a tail that runs +438bps in the worst 1%.\n\n"
                             f"Read this list as **names to AVOID or EXIT**, never to short."))
+                    # PER-TAG EVIDENCE. The horizon warning above is about the INSTRUMENT;
+                    # this is about the SETUP itself, and it is the more damaging result.
+                    if not _sh.empty:
+                        _anti = _sh[_sh["setup"].isin(mtf.SHORT_ANTI_PREDICTIVE)]
+                        _ok = _sh[_sh["setup"].isin(mtf.SHORT_VALIDATED)]
+                        st.error(
+                            f"🔬 **{len(_anti)} of these {len(_sh)} names sit on a setup measured "
+                            f"ANTI-PREDICTIVE on the short side.** Reconstructing this exact "
+                            f"pipeline over 468,661 observations (2018–2026), shorts "
+                            f"OUTPERFORMED the universe by +0.57% over 20 days — the side is "
+                            f"inverted, not merely weak.\n\n"
+                            f"Per setup (excess vs market; **positive = the short LOST**):\n"
+                            f"• ⚠️ EXTENDED (aligned) **+1.62%** — an extended downtrend is an "
+                            f"OVERSOLD name; shorting it is selling the low\n"
+                            f"• ↩️ PULLBACK vs HTF **+0.50%**\n"
+                            f"• 🎯 WITH-TREND CONTINUATION **+0.47%** — a downtrend that COILS is "
+                            f"a base forming, not a continuation\n"
+                            f"• 🔻 RANGE-FLOOR BREAK **−1.09%** — the only short setup that "
+                            f"worked ({len(_ok)} here now)\n\n"
+                            f"In a structurally rising market, most 'bearish' structure is a "
+                            f"bottoming pattern.")
                     st.caption("Short P&L by hold, before the ~22bps cost floor (measured, "
                                "n=43,042): intraday **+4.4bps** · overnight **−5.1** · 5-day "
                                "**−13.6**. It decays monotonically with hold length — the exact "
