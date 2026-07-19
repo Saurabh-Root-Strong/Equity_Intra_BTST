@@ -255,8 +255,14 @@ def _tf_scan(tf: str):
     return live.tf_scan(tf)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(show_spinner=False)
 def _uni_scan(nonce: int):
+    # NO TTL — the nonce is the ONLY trigger. A 30-minute TTL directly contradicted the intent
+    # written below: once it expired, the next interaction of ANY kind paid a 30-60s cold
+    # re-scan, so typing in the price box could kick off a full universe fetch and leave the
+    # previous frame on screen looking like the filter had done nothing. Exactly the surprise
+    # this design set out to prevent, reintroduced by a timer. Freshness is handled where it
+    # belongs: the ↻ button, the opt-in bar-close auto-refresh, and an age stamp on screen.
     # Pinned by an explicit nonce, NOT by time: the ~270-fetch scan must re-run ONLY on the ↻
     # button (which bumps the nonce), never as a side effect of moving a filter widget. Without
     # this, a filter change that happens to land after the 5-min memo bucket rolls would trigger
@@ -561,9 +567,17 @@ if tf == "Intraday":
                     st.rerun()
             _auto_rescan()
 
-        if _sa and live.market_open() and _age > 300 and not auto_struct:
-            st.caption(f"🕒 structure as-of **{_sa:%H:%M:%S}** ({int(_age // 60)}m {int(_age % 60)}s "
-                       "ago) — ↻ re-scan to re-pull. Prices on matched names tick live below.")
+        # AGE IS ALWAYS SHOWN. With no TTL the board holds its scan until you re-scan, so the
+        # only thing that can mislead is not knowing how old it is. Off-hours this used to be
+        # hidden entirely, which is when the board sits stalest.
+        if _sa:
+            _amin = int(_age // 60)
+            _warn = _amin >= 30 and live.market_open() and not auto_struct
+            st.caption(("⚠️ " if _warn else "🕒 ")
+                       + f"structure as-of **{_sa:%H:%M:%S}** ({_amin}m {int(_age % 60)}s ago)"
+                       + (" — prices tick live, but STRUCTURE and LEVELS are this old. "
+                          "↻ re-scan universe." if _warn else
+                          " · filters re-apply instantly; ↻ re-scan universe to re-pull bars."))
         st.caption(f"scanned **{sc['n_scanned']}** liquid names · Nifty "
                    f"{sc.get('idx_ret', 0):+.2f}% · regime "
                    f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}"

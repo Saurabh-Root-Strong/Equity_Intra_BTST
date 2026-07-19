@@ -720,3 +720,16 @@ def test_price_band_default_is_user_owned_and_wired():
     # 0 must always mean 'no cap', whatever number the user picks
     import pandas as _pd
     assert float(_c.PRICE_MAX_DEFAULT) >= 0
+
+
+def test_universe_scan_has_no_ttl():
+    """REGRESSION: _uni_scan carried ttl=1800, which contradicted its own design comment. Once
+    the entry expired, the NEXT interaction of any kind paid a 30-60s cold re-scan — so typing
+    in the price box kicked off a full universe fetch while the previous frame stayed on
+    screen, making the filter look like it had done nothing (Max 900 -> 10000 should widen the
+    board from 106 to 229 names; it appeared unchanged). The nonce must be the ONLY trigger."""
+    import re
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    m = re.search(r"@st\.cache_data\(([^)]*)\)\s*\ndef _uni_scan", src)
+    assert m, "_uni_scan decorator not found"
+    assert "ttl" not in m.group(1), "a TTL re-introduces surprise cold re-scans on filter edits"
