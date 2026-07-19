@@ -164,37 +164,43 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
             # a live board, which makes the tag meaningless. Sideways is not coiled.
             if "CONSOLIDATION" not in (hs, ls):
                 return {"tag": "RANGE-BOUND (no setup)", "color": N, "loc": loc, "dir": "NONE",
-                        "read": "both timeframes are simply oscillating sideways — no trend, no "
-                                "break, and NO volatility contraction. Nothing is loading; this "
-                                "is the default resting state of a stock, not a setup."}
+                        "read": "GOING NOWHERE. Both timeframes are just drifting sideways — no "
+                                "trend, no breakout, and not even tightening up. This is what "
+                                "most stocks do most of the time. Nothing to trade here."}
             both = hs == ls == "CONSOLIDATION"
             return {"tag": "NESTED SQUEEZE", "color": A, "loc": loc, "dir": "NONE",
                     "read": ("volatility CONTRACTING on both timeframes — the tightest version "
                              "of this setup. " if both else
                              "volatility CONTRACTING on one timeframe while the other stays "
                              "range-bound — a coil building inside a bigger box. ")
-                            + "A move is loading but the DIRECTION IS UNKNOWN. Stand aside, mark "
-                              "the HTF box high/low, trade the break — do not predict it."}
+                            + "A big move is building, but NOBODY KNOWS WHICH WAY. Do not "
+                              "guess. Mark the high and the low of the bigger range, wait, and "
+                              "trade whichever side actually breaks."}
         if ls == "BREAKOUT_UP":
             if near_hi:
                 return {"tag": "RANGE-TOP BREAK", "color": G, "loc": loc, "dir": "UP",
-                        "read": "LTF breaking UP at the HTF ceiling — the ONLY location where an "
-                                "LTF breakout can be real. Needs to HOLD above, ideally with "
-                                "volume/delivery confirming, or it snaps back into the box."}
+                        "read": "A REAL BREAKOUT. Price broke UP right at the ceiling of the "
+                                "bigger range — the only place a breakout can mean anything. It "
+                                "now has to HOLD above that line, ideally on strong volume, or "
+                                "it snaps back in and becomes a trap."}
             return {"tag": "FALSE-BREAK TRAP", "color": R, "loc": loc, "dir": "NONE",
-                    "read": "LTF pop UP in the MIDDLE of the HTF range — statistically fades back "
-                            "into the box. Do not chase; the HTF HIGH is the line that matters."}
+                    "read": "FAKE BREAKOUT. It popped up in the MIDDLE of the range, not at "
+                            "the top — so there was nothing to break. These usually fall back "
+                            "in. Do not chase it. The range HIGH is the only line that counts."}
         if ls == "BREAKOUT_DOWN":
             if near_lo:
                 return {"tag": "RANGE-FLOOR BREAK", "color": R, "loc": loc, "dir": "DOWN",
-                        "read": "LTF breaking DOWN at the HTF floor — only here can it be real. "
-                                "Must hold below, else it snaps back up into the range."}
+                        "read": "A REAL BREAKDOWN. Price broke DOWN right at the floor of the "
+                                "bigger range — the only place a breakdown counts. It has to "
+                                "STAY below, or it snaps back up into the range."}
             return {"tag": "FALSE-BREAK TRAP", "color": R, "loc": loc, "dir": "NONE",
-                    "read": "LTF drop in the MIDDLE of the HTF range — statistically reverts. "
-                            "Do not chase; the HTF LOW is the line that matters."}
+                    "read": "FAKE BREAKDOWN. It dropped in the MIDDLE of the range, not at "
+                            "the floor — nothing was broken. These usually snap back. Do not "
+                            "chase it. The range LOW is the only line that counts."}
         return {"tag": "DRIFT-IN-RANGE", "color": N, "loc": loc, "dir": "NONE",
-                "read": "LTF drifting inside the HTF box — noise until it reaches an edge. "
-                        "Read the HTF high/low as the only levels that matter."}
+                "read": "DRIFTING IN THE MIDDLE. Price is wandering inside the bigger "
+                        "range, nowhere near either edge. It is noise until it reaches the top "
+                        "or the bottom. Those two lines are the only ones that matter."}
 
     # ── HTF is TRENDING / BROKEN OUT ─────────────────────────────────────────────
     htf_up = hs in _TREND_UP_S
@@ -229,29 +235,31 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
         if at_extreme:
             return {"tag": "COIL AT THE EXTREME", "color": A, "loc": loc,
                     "dir": "UP" if htf_up else "DOWN",
-                    "read": (f"HTF {d}, LTF coiling — but price is sitting at the "
-                             f"{'BOTTOM' if not htf_up else 'TOP'} of the higher-TF box, not "
-                             f"pulled back into it. Nothing retraced, so this is NOT the "
-                             f"continuation setup it looks like. "
-                             + ("A downtrend coiling ON ITS FLOOR is a BASE forming — measured "
-                                "-0.54% as a short (n=19,679, t=-7.47), the worst geometry on "
-                                "this board. Shorting here is selling the low."
+                    "read": (f"LOOKS LIKE A CONTINUATION SETUP, BUT IS NOT. The trend is "
+                             f"{d} and price is pausing — but it is pausing at the "
+                             f"{'BOTTOM' if not htf_up else 'TOP'} of the range, not back "
+                             f"inside it. Nothing pulled back, so there is no dip to buy or "
+                             f"rally to sell. "
+                             + ("A falling stock that goes quiet ON ITS LOWS is usually "
+                                "BUILDING A BASE, not about to fall further. Shorting it means "
+                                "selling the low — measured the worst thing on this board."
                                 if not htf_up else
-                                "An uptrend coiling at its HIGHS is a flag — still positive "
-                                "(+0.14%, n=35,565) but the WEAKEST long location; a deeper "
-                                "pullback pays ~6x more."))}
+                                "A rising stock going quiet at its HIGHS is a flag. Still "
+                                "slightly positive, but the WEAKEST place to buy — waiting for a "
+                                "real dip has paid about 6x more."))}
         return {"tag": "WITH-TREND CONTINUATION", "color": G if htf_up else R, "loc": loc,
                 "dir": "UP" if htf_up else "DOWN",
-                "read": f"HTF {d}, LTF coiling AFTER a genuine retracement into the box — a "
-                        f"pullback loading for CONTINUATION. The textbook with-trend setup, and "
-                        f"the location that measured best on the long side (+0.44 to +0.87%). "
-                        f"Trigger = the LTF breaking {d}; the idea is invalid if it breaks the "
-                        f"other way."}
+                "read": f"THE TEXTBOOK ONE. Trend is {d}, price pulled back into the "
+                        f"range, and is now going quiet — resting before it likely continues. "
+                        f"This is the pullback the other coil tag only pretends to be. Your "
+                        f"trigger is the smaller timeframe breaking {d}. If it breaks the OTHER "
+                        f"way, the idea is dead — get out."}
     ltf_up = ls in _TREND_UP_S
     if ltf_up == htf_up:
         return {"tag": "EXTENDED (aligned)", "color": A, "loc": loc, "dir": "UP" if htf_up else "DOWN",
-                "read": f"HTF and LTF BOTH {d} — aligned, but late. Entering here is chasing; "
-                        f"wait for the LTF to coil (a pullback) instead."}
+                "read": f"YOU ARE LATE. Both timeframes are already moving {d} together. "
+                        f"Getting in now is chasing a move that has run. Wait for it to pause "
+                        f"and pull back, then take the resumption."}
     return {"tag": "PULLBACK vs HTF", "color": A, "loc": loc, "dir": "UP" if htf_up else "DOWN",
             "read": f"LTF {'DOWN' if htf_up else 'UP'} against an HTF {d} — a dip/rally zone "
                     f"WITH the higher-TF trend IF that structure holds; an early REVERSAL "
@@ -489,21 +497,25 @@ def long_rank(tag: str, preset: str = "btst") -> int:
 
 
 def long_verdict(tag: str, preset: str = "btst") -> str:
-    """Per-row marker for the LONG tab, priced at the horizon the user selected."""
+    """Per-row marker for the LONG tab, in plain words, priced at the selected hold.
+
+    Written to be readable at a glance by someone deciding whether to click BUY. The number
+    is a PERCENT (bps/100) because that is the unit a trade is felt in, and it is always
+    stated as "better/worse than buying any random stock" -- the comparison that matters,
+    since this universe drifts up on its own and a raw positive number proves nothing."""
     hold = _LONG_HOLD.get(preset, "overnight")
     ex = LONG_EVIDENCE[hold].get(tag)
     if ex is None:
-        return "— unrated at this hold"
+        return "— not measured for this hold"
+    pct, yrs = ex / 100.0, _LONG_YRS.get(tag, "")
     if hold == "intraday":
-        absol = ex + _INTRADAY_BASE
-        return (f"⛔ the session GIVES BACK the gap ({absol:+.1f}bps absolute, "
-                f"{ex:+.1f} vs buying anything)")
-    yrs = _LONG_YRS.get(tag, "")
+        absol = (ex + _INTRADAY_BASE) / 100.0
+        return f"⛔ Gap is already gone — the day gives it back ({absol:+.2f}% on the day)"
     if ex >= 25:
-        return f"✅ strongest at this hold ({ex:+.1f}bps excess · {yrs} years)"
+        return f"✅ BEST for this hold — {pct:+.2f}% vs buying any stock · worked {yrs} years"
     if ex <= 0:
-        return f"⛔ LOSES at this hold ({ex:+.1f}bps vs buying anything)"
-    return f"⚠ barely beats buying at random ({ex:+.1f}bps · {yrs} years)"
+        return f"⛔ LOSES money if you hold this long ({pct:+.2f}% vs buying any stock)"
+    return f"⚠️ Weak here — only {pct:+.2f}% vs buying any stock · worked {yrs} years"
 
 
 def short_rank(tag: str, preset: str = "btst") -> int:
@@ -521,14 +533,15 @@ def short_verdict(tag: str, preset: str = "btst") -> str:
     hold = _LONG_HOLD.get(preset, "overnight")
     ex = SHORT_EVIDENCE[hold].get(tag)
     if ex is None:
-        return "— unrated at this hold"
+        return "— not measured for this hold"
+    pct = ex / 100.0
     if ex <= -35:
-        return f"⛔ BOUNCES — the worst short here ({ex:+.1f}bps vs shorting anything)"
+        return f"⛔ It BOUNCES — worst short here ({pct:+.2f}% vs shorting any stock)"
     if ex < 0:
-        return f"⛔ worse than shorting at random ({ex:+.1f}bps)"
+        return f"⛔ Worse than shorting a random stock ({pct:+.2f}%)"
     if hold in ("5d", "20d"):
-        return f"⛔ least-bad, but multi-day shorts all LOSE ({ex:+.1f}bps rel.)"
-    return f"⚠ beats shorting at random by {ex:+.1f}bps — still not an edge"
+        return f"⛔ Every multi-day short LOSES — this one loses least ({pct:+.2f}%)"
+    return f"⚠️ Only {pct:+.2f}% better than a random short — not an edge"
 
 
 # Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no

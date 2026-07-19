@@ -973,8 +973,8 @@ def test_short_side_is_ranked_by_measurement_not_by_textbook():
     # On the session AFTER the signal, NO structural short tag beats shorting at random:
     for t, v in _m.SHORT_EVIDENCE["intraday"].items():
         assert v < 0, f"{t} must not read as a tradeable intraday short"
-        assert "worse than shorting at random" in _m.short_verdict(t, "intraday") \
-            or "BOUNCES" in _m.short_verdict(t, "intraday")
+        _v = _m.short_verdict(t, "intraday")
+        assert "Worse than shorting" in _v or "BOUNCES" in _v
     # a fresh breakdown BOUNCES on the next session -- the one robust short-side result,
     # and it is a warning, not a trade (-41.3 excess, and it survived the proxy at -40.6)
     assert _m.SHORT_EVIDENCE["intraday"]["RANGE-FLOOR BREAK"] <= -35
@@ -986,7 +986,7 @@ def test_short_side_is_ranked_by_measurement_not_by_textbook():
     # every tag, because the baseline itself is -122bps. "Excess" over that is not profit.
     for p in ("swing", "positional"):
         for t, v in _m.SHORT_EVIDENCE[_m._LONG_HOLD[p]].items():
-            assert "LOSE" in _m.short_verdict(t, p) or v < 0
+            assert "LOSES" in _m.short_verdict(t, p) or v < 0
     for hold, preset in (("intraday", "intraday"), ("overnight", "btst"),
                          ("5d", "swing"), ("20d", "positional")):
         tags = sorted(_m.SHORT_EVIDENCE[hold], key=lambda t: _m.short_rank(t, preset))
@@ -1019,12 +1019,13 @@ def test_long_side_is_ranked_at_the_selected_hold():
     # against a negative baseline is exactly the trap that made the first short table wrong.
     for t, v in _m.LONG_EVIDENCE["intraday"].items():
         assert v + _m._INTRADAY_BASE <= 1.0, f"{t} must not read as a tradeable intraday long"
-        assert "GIVES BACK" in _m.long_verdict(t, "intraday")
-        assert "absolute" in _m.long_verdict(t, "intraday"), "must quote the absolute number"
+        _v = _m.long_verdict(t, "intraday")
+        assert "gives it back" in _v, "must say the gap is already gone"
+        assert "on the day" in _v, "must quote the ABSOLUTE day return, not the excess"
     # holding past the first night must never be sold as free: the 5d baseline IS the
     # overnight baseline (+17.4 vs +17.3), so RANGE-TOP BREAK goes outright negative there
     assert _m.LONG_EVIDENCE["5d"]["RANGE-TOP BREAK"] < 0
-    assert "LOSES" in _m.long_verdict("RANGE-TOP BREAK", "swing")
+    assert "LOSES money" in _m.long_verdict("RANGE-TOP BREAK", "swing")
     for hold, preset in (("overnight", "btst"), ("5d", "swing"), ("20d", "positional")):
         tags = sorted(_m.LONG_EVIDENCE[hold], key=lambda t: _m.long_rank(t, preset))
         ex = [_m.LONG_EVIDENCE[hold][t] for t in tags]
