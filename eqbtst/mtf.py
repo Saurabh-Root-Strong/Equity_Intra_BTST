@@ -111,21 +111,23 @@ G, R, A, B, N = "#22c55e", "#f87171", "#fbbf24", "#40c4ff", "#94a3b8"
 # Setup-quality rank (best chartist context -> worst). Sorting the board by this puts the
 # textbook setups on top and the traps at the bottom. It ranks CONTEXT, not expected return.
 TAG_RANK = {
-    "WITH-TREND CONTINUATION": 0,      # HTF trend + LTF coil = the textbook with-trend setup
+    "WITH-TREND CONTINUATION": 0,      # HTF trend + a REAL retracement coil = the textbook setup
     "RANGE-TOP BREAK": 1,              # resolution watch, at the only location it can be real
     "RANGE-FLOOR BREAK": 1,
     "PULLBACK vs HTF": 2,              # dip zone with the HTF trend
-    "EXTENDED (aligned)": 3,           # aligned but late -- chase risk
-    "DRIFT-IN-RANGE": 4,               # wait
-    "NESTED SQUEEZE": 5,               # wait, direction unknown, but energy IS building
-    "RANGE-BOUND (no setup)": 6,       # nothing happening at all
-    "FALSE-BREAK TRAP": 7,             # avoid
-    "HTF warming": 8, "LTF warming": 8, "n/a": 9,
+    "COIL AT THE EXTREME": 3,          # coiling at the far end of the box -- nothing retraced
+    "EXTENDED (aligned)": 4,           # aligned but late -- chase risk
+    "DRIFT-IN-RANGE": 5,               # wait
+    "NESTED SQUEEZE": 6,               # wait, direction unknown, but energy IS building
+    "RANGE-BOUND (no setup)": 7,       # nothing happening at all
+    "FALSE-BREAK TRAP": 8,             # avoid
+    "HTF warming": 9, "LTF warming": 9, "n/a": 10,
 }
 
 TAG_ICON = {
     "WITH-TREND CONTINUATION": "🎯", "RANGE-TOP BREAK": "🚀", "RANGE-FLOOR BREAK": "🔻",
     "PULLBACK vs HTF": "↩️", "EXTENDED (aligned)": "⚠️", "DRIFT-IN-RANGE": "〰️",
+    "COIL AT THE EXTREME": "🧱",
     "NESTED SQUEEZE": "🌀", "FALSE-BREAK TRAP": "🪤", "RANGE-BOUND (no setup)": "😴",
     "HTF warming": "⏳", "LTF warming": "⏳", "n/a": "—",
 }
@@ -198,11 +200,53 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
     htf_up = hs in _TREND_UP_S
     d = "UP" if htf_up else "DOWN"
     if ls in _RANGE_S:
+        # A PULLBACK IS A MOVE AGAINST THE TREND. THIS BRANCH USED TO ASSUME ONE HAPPENED.
+        # The tag fired on two LABELS alone -- HTF trending, LTF ranging -- and called the
+        # result "a pullback loading for CONTINUATION" without ever checking WHERE in the box
+        # the coil sat. In a downtrend a pullback is a RALLY, so a genuine continuation short
+        # needs price back UP inside the box. What the board actually served was the opposite:
+        # every short continuation on a live BTST board sat at loc 0.04-0.20, i.e. price
+        # pinned to the FLOOR. That is not a pullback, it is a base forming.
+        #
+        # Measured, weekly x daily, 24,813 cases (the trade's P&L, so sign-corrected):
+        #     SHORT, loc 0.0-0.2 (floor)   n=19,679   -0.54%   t=-7.47   <- 79% of them
+        #     SHORT, loc 0.2-0.4           n= 4,931   +0.20%   t= 1.30
+        #     SHORT, loc >0.4              too rare to rate
+        # The floor bucket IS the short-side inversion. It is not that the tag is backwards;
+        # one geometry inside it is backwards and that geometry is four-fifths of the sample.
+        # The textbook version barely exists -- once a downtrend rallies far enough to be a
+        # real retracement, the LTF stops reading as a range.
+        #
+        # The long side confirms it is about LOCATION, not direction (n=50,538):
+        #     LONG, loc 0.4-0.6 (real dip) n=   660   +0.87%   t=1.92
+        #     LONG, loc 0.6-0.8            n=14,277   +0.44%   t=4.59
+        #     LONG, loc 0.8-1.0 (ceiling)  n=35,565   +0.14%   t=2.18
+        # Monotone: the deeper the pullback, the better the long. Textbook, and the mirror of
+        # it is what the short side should have looked like.
+        #
+        # Split on the module's EXISTING 0.28/0.72 thresholds -- no new fitted parameter.
+        at_extreme = (near_lo if not htf_up else near_hi)
+        if at_extreme:
+            return {"tag": "COIL AT THE EXTREME", "color": A, "loc": loc,
+                    "dir": "UP" if htf_up else "DOWN",
+                    "read": (f"HTF {d}, LTF coiling — but price is sitting at the "
+                             f"{'BOTTOM' if not htf_up else 'TOP'} of the higher-TF box, not "
+                             f"pulled back into it. Nothing retraced, so this is NOT the "
+                             f"continuation setup it looks like. "
+                             + ("A downtrend coiling ON ITS FLOOR is a BASE forming — measured "
+                                "-0.54% as a short (n=19,679, t=-7.47), the worst geometry on "
+                                "this board. Shorting here is selling the low."
+                                if not htf_up else
+                                "An uptrend coiling at its HIGHS is a flag — still positive "
+                                "(+0.14%, n=35,565) but the WEAKEST long location; a deeper "
+                                "pullback pays ~6x more."))}
         return {"tag": "WITH-TREND CONTINUATION", "color": G if htf_up else R, "loc": loc,
                 "dir": "UP" if htf_up else "DOWN",
-                "read": f"HTF {d}, LTF coiling — a pullback loading for CONTINUATION. The "
-                        f"textbook with-trend setup. Trigger = the LTF breaking {d}; the idea "
-                        f"is invalid if it breaks the other way."}
+                "read": f"HTF {d}, LTF coiling AFTER a genuine retracement into the box — a "
+                        f"pullback loading for CONTINUATION. The textbook with-trend setup, and "
+                        f"the location that measured best on the long side (+0.44 to +0.87%). "
+                        f"Trigger = the LTF breaking {d}; the idea is invalid if it breaks the "
+                        f"other way."}
     ltf_up = ls in _TREND_UP_S
     if ltf_up == htf_up:
         return {"tag": "EXTENDED (aligned)", "color": A, "loc": loc, "dir": "UP" if htf_up else "DOWN",
@@ -222,7 +266,7 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
 # candidates (and pullbacks in a downtrend as dip-buys, which is precisely the trade that
 # catches a falling knife). Split on `dir`, which synthesize() now returns explicitly.
 DIRECTIONAL_TAGS = {"WITH-TREND CONTINUATION", "RANGE-TOP BREAK", "RANGE-FLOOR BREAK",
-                    "PULLBACK vs HTF", "EXTENDED (aligned)"}
+                    "PULLBACK vs HTF", "EXTENDED (aligned)", "COIL AT THE EXTREME"}
 AVOID_TAGS = {"FALSE-BREAK TRAP"}
 WAIT_TAGS = {"NESTED SQUEEZE", "DRIFT-IN-RANGE", "RANGE-BOUND (no setup)"}
 
@@ -298,12 +342,14 @@ SHORT_EDGE_BPS = {"intraday": +4.4, "btst": -5.1, "swing": -13.6, "positional": 
 SIDE_EXCESS_20D = {
     ("LONG", "EXTENDED (aligned)"): +1.36, ("LONG", "PULLBACK vs HTF"): +1.01,
     ("LONG", "WITH-TREND CONTINUATION"): +0.81, ("LONG", "RANGE-TOP BREAK"): +0.36,
+    ("SHORT", "COIL AT THE EXTREME"): +0.54, ("LONG", "COIL AT THE EXTREME"): +0.14,
     ("SHORT", "EXTENDED (aligned)"): +1.62, ("SHORT", "PULLBACK vs HTF"): +0.50,
     ("SHORT", "WITH-TREND CONTINUATION"): +0.47, ("SHORT", "RANGE-FLOOR BREAK"): -1.09,
 }
 # Short setups measured ANTI-PREDICTIVE (the name rose more than the market). Positive excess
 # on a SHORT means the trade lost. Only RANGE-FLOOR BREAK survived.
-SHORT_ANTI_PREDICTIVE = {"EXTENDED (aligned)", "PULLBACK vs HTF", "WITH-TREND CONTINUATION"}
+SHORT_ANTI_PREDICTIVE = {"EXTENDED (aligned)", "PULLBACK vs HTF", "WITH-TREND CONTINUATION",
+                         "COIL AT THE EXTREME"}
 SHORT_VALIDATED = {"RANGE-FLOOR BREAK"}
 
 

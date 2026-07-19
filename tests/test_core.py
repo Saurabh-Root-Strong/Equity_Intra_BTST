@@ -432,8 +432,20 @@ def test_sideways_is_not_a_squeeze():
 def test_with_trend_continuation_and_warming_guards():
     from eqbtst import mtf
     trend = {"struct": "TREND_UP", "hi": 110.0, "lo": 100.0, "n": 20}
-    assert mtf.synthesize(trend, {"struct": "CONSOLIDATION", "n": 20},
-                          108.0)["tag"] == "WITH-TREND CONTINUATION"
+    coil20 = {"struct": "CONSOLIDATION", "n": 20}
+    # A PULLBACK IS A MOVE AGAINST THE TREND, AND THE TAG NOW REQUIRES ONE TO HAVE HAPPENED.
+    # 105 in a 100-110 box = loc 0.50: price genuinely retraced into the box -> textbook.
+    assert mtf.synthesize(trend, coil20, 105.0)["tag"] == "WITH-TREND CONTINUATION"
+    # 108 = loc 0.80: coiling at the CEILING. Nothing retraced, so it is not a pullback.
+    assert mtf.synthesize(trend, coil20, 108.0)["tag"] == "COIL AT THE EXTREME"
+    # The short mirror is the one that mattered: a downtrend coiling ON ITS FLOOR is a BASE,
+    # and it measured -0.54% as a short (n=19,679, t=-7.47) -- 79% of every short the old
+    # loc-blind tag served. 101 in a 100-110 box = loc 0.10.
+    dn = {"struct": "TREND_DOWN", "hi": 110.0, "lo": 100.0, "n": 20}
+    s = mtf.synthesize(dn, coil20, 101.0)
+    assert s["tag"] == "COIL AT THE EXTREME" and s["dir"] == "DOWN"
+    # ...while a real rally back into the box IS the textbook continuation short.
+    assert mtf.synthesize(dn, coil20, 105.0)["tag"] == "WITH-TREND CONTINUATION"
     assert mtf.synthesize(trend, {"struct": "TREND_UP", "n": 20},
                           108.0)["tag"] == "EXTENDED (aligned)"
     assert mtf.synthesize(trend, {"struct": "TREND_DOWN", "n": 20},
