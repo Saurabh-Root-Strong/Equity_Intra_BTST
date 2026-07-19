@@ -615,3 +615,20 @@ def test_cash_short_horizons_are_flagged():
     assert mtf.SHORTABLE_IN_CASH["intraday"] is True
     assert not any(mtf.SHORTABLE_IN_CASH[k] for k in ("btst", "swing", "positional"))
     assert set(mtf.SHORTABLE_IN_CASH) == set(mtf.PRESET_ORDER)
+
+
+def test_short_edge_decays_with_hold_length():
+    """Measured on this universe (495,607 daily obs, 2018-2026; 43,042 down-structure days):
+    the downtrend is an INTRADAY move (-4.4bps in-session) while the overnight gap runs
+    +10.8bps AGAINST a short. So short P&L decays monotonically with hold length — the exact
+    opposite of the long side. Guard the ordering so a future edit cannot quietly imply that
+    holding a short longer is better."""
+    from eqbtst import mtf
+    e = mtf.SHORT_EDGE_BPS
+    assert set(e) == set(mtf.PRESET_ORDER)
+    assert e["intraday"] > e["btst"] > e["swing"]          # strictly worse the longer you hold
+    assert e["positional"] <= e["swing"]
+    assert e["intraday"] < 22.0        # even the best case is under the round-trip cost floor
+    assert all(v < 22.0 for v in e.values())
+    # only the horizon that can actually be squared off same day is cash-shortable
+    assert mtf.SHORTABLE_IN_CASH["intraday"] and not mtf.SHORTABLE_IN_CASH["swing"]

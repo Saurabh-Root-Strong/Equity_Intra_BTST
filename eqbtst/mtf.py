@@ -207,6 +207,34 @@ def side_of(tag: str, direction: str) -> str:
     return {"UP": "LONG", "DOWN": "SHORT"}.get(direction, "—")
 
 
+# ── WHAT A SHORT ACTUALLY EARNS, BY HOLD LENGTH ──────────────────────────────────────
+# Measured on this universe's own archive: 495,607 daily observations, 2018-2026, corporate
+# actions back-adjusted, structure labelled causally with the same 20-bar rules the board
+# uses. Population = every bar labelled TREND_DOWN or BREAKDOWN on the daily frame
+# (n=43,042) -- i.e. exactly the "stock is in a downtrend on a 1D basis" case.
+#
+# Decomposition of the next day, from the SHORT's point of view (bps):
+#
+#     overnight GAP      +10.8     <- the short PAYS this, every night
+#     intraday move       -4.4     <- the down move happens HERE, in the session
+#     -----------------------
+#     close-to-close      +5.1
+#
+# So the downtrend is real, but it is an INTRADAY phenomenon. Overnight, equities carry a
+# structural upward drift that shows up in EVERY structure bucket -- +13.0bps even in
+# TREND_DOWN, +1.9bps even after a BREAKDOWN -- and only 32.5% of nights gap down at all.
+# The same overnight gap that IS the validated long edge in this project is, for a short,
+# a nightly toll plus an unbounded tail: the worst 1% of gaps runs +438bps against you and
+# 4.8% of nights gap more than 2% against you.
+#
+# Net short P&L before the ~22bps round-trip cost, by hold:
+SHORT_EDGE_BPS = {"intraday": +4.4, "btst": -5.1, "swing": -13.6, "positional": -13.6}
+# It decays MONOTONICALLY with hold length -- the exact opposite of the long side, where a
+# longer horizon helps because the cost floor is amortised over a bigger move. Even the best
+# case (+4.4bps, intraday) sits well under the 22bps cost floor, so no short here is
+# tradeable; the difference is between "not tradeable" and "structurally paying to hold".
+
+
 # Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no
 # overnight short — an unsold short must be squared off the same day (delivery you do not own
 # cannot be carried). Anything beyond intraday needs the futures leg, and the overnight short

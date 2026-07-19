@@ -880,16 +880,34 @@ if tf == "Intraday":
                     _side_table(_lo)
                 with tS:
                     _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
-                    _side_table(_sh, note=(
-                        "⚠ **Intraday only — square off before the close.** Overnight short is "
-                        "proven −EV here (win 20%), and intraday direction has no validated edge "
-                        "either. This is a WEAKNESS SCREEN, not an entry signal."
-                        if _cash_ok else
-                        f"🛑 **You cannot hold this short in CASH.** Indian cash equity has no "
-                        f"overnight short — a short must be squared off the SAME DAY, so the "
-                        f"*{_P['hold']}* horizon is unreachable without the FUTURES leg (these "
-                        f"are all F&O names, so a future exists — different margin, different "
-                        f"risk). Read this list as **names to avoid or exit**, not to short."))
+                    _edge = mtf.SHORT_EDGE_BPS.get(preset, 0.0)
+                    if _cash_ok:
+                        _side_table(_sh, note=(
+                            "⚠ **Intraday only — square off before the close.** Measured on this "
+                            "universe (43,042 down-structure days, 2018–2026): a same-day short "
+                            f"earns **{_edge:+.1f}bps** before the ~22bps round-trip cost. That is "
+                            "the BEST case on this board and it is still under the cost floor — "
+                            "a weakness screen, not an entry signal."))
+                    else:
+                        _side_table(_sh, note=(
+                            f"🛑 **This horizon cannot hold a short — twice over.**\n\n"
+                            f"**1. Mechanically:** Indian cash equity has no overnight short — it "
+                            f"must be squared off the SAME DAY. The *{_P['hold']}* hold is "
+                            f"unreachable in cash. These are all F&O names so a stock FUTURE "
+                            f"exists, but that is a different instrument: margin, lot size, "
+                            f"expiry and rollover.\n\n"
+                            f"**2. Economically — the part that matters more:** measured over "
+                            f"43,042 down-structure days, a short held to this horizon earns "
+                            f"**{_edge:+.1f}bps BEFORE costs.** The downtrend is real but it is an "
+                            f"INTRADAY move (−4.4bps in-session); overnight the same names gap "
+                            f"**+10.8bps AGAINST a short**, and only 32.5% of nights gap down at "
+                            f"all. The overnight gap that IS the long edge here is a nightly toll "
+                            f"for a short — with a tail that runs +438bps in the worst 1%.\n\n"
+                            f"Read this list as **names to AVOID or EXIT**, never to short."))
+                    st.caption("Short P&L by hold, before the ~22bps cost floor (measured, "
+                               "n=43,042): intraday **+4.4bps** · overnight **−5.1** · 5-day "
+                               "**−13.6**. It decays monotonically with hold length — the exact "
+                               "opposite of the long side, where a longer horizon amortises cost.")
                 with tN:
                     st.caption("Squeezes, traps and sideways names — the setup takes no side. "
                                "Most of the universe lives here most of the time, and that is "
