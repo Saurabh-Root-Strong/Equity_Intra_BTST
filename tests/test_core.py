@@ -701,15 +701,22 @@ def test_short_side_anti_predictive_tags_are_recorded():
     assert all(v > 0 for (s, _), v in mtf.SIDE_EXCESS_20D.items() if s == "LONG")
 
 
-def test_price_band_is_off_by_default():
-    """REGRESSION: Max defaulted to Rs900 and silently removed 137 of 243 scanned names (56%)
-    — and the WRONG 137: RELIANCE, ICICIBANK, INFY, AXISBANK, TECHM, BAJFINANCE, i.e. the most
-    liquid names in the universe. It also cut LONG candidates from 9 to 2. A price cap is a
-    position-SIZING choice, not a selection one; applying it before selection biases the whole
-    board toward low-priced names for reasons unrelated to structure."""
+def test_price_band_default_is_user_owned_and_wired():
+    """The price band is a position-SIZING preference, so the NUMBER belongs to the user and
+    lives in config. What must not regress is the wiring and the visibility: the band cuts
+    BEFORE the structure logic, so it decides what the horizon dropdown may even consider.
+    Measured on a 243-name board, a Rs900 cap removed 137 names (56%) including RELIANCE /
+    ICICIBANK / INFY, taking LONG candidates from 9 to 2 — fine when intended, a trap when
+    forgotten. Hence: user owns the number, the board always states the cut."""
     import re
+    from eqbtst import config as _c
+    # the DEFAULT is the user's to choose — the test guards the WIRING, not the number
+    assert hasattr(_c, "PRICE_MAX_DEFAULT") and hasattr(_c, "PRICE_MIN_DEFAULT")
     src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     m = re.search(r'key="price_max"', src)
     assert m, "price_max widget missing"
-    line = src[max(0, m.start() - 200):m.end()]
-    assert "value=0.0" in line, "price band must default to NO CAP (Max 0 = all)"
+    blk = src[max(0, m.start() - 300):m.end()]
+    assert "config.PRICE_MAX_DEFAULT" in blk, "widget must read the user's config default"
+    # 0 must always mean 'no cap', whatever number the user picks
+    import pandas as _pd
+    assert float(_c.PRICE_MAX_DEFAULT) >= 0

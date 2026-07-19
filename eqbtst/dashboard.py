@@ -218,20 +218,20 @@ except Exception as _e:
 def render_price_band():
     """Compact price-band filter row, right-aligned above the table.
 
-    Max defaults to 0 = NO CAP, so every scanned name reaches the table and the horizon
-    dropdown decides what you see — not an affordability filter you forgot was on.
+    Defaults come from config.PRICE_MIN_DEFAULT / PRICE_MAX_DEFAULT — a position-SIZING
+    preference, so it belongs to the user, not to a measurement. Set them there.
 
-    It used to default to Rs900. Measured on a live board that silently removed 137 of 243
-    names (56%), and they were the WRONG 137: RELIANCE, ICICIBANK, INFY, AXISBANK, TECHM,
-    BAJFINANCE — the most liquid, most fillable names in the universe. It also gutted the
-    signal, cutting LONG candidates from 9 to 2. A price cap is a POSITION-SIZING concern
-    (how many shares fit your capital), not a selection concern, and applying it before
-    selection biases the board toward low-priced names for reasons that have nothing to do
-    with structure. Set a Max only when you actually want that cut."""
+    What the code owes you is VISIBILITY, not a decision: the band cuts BEFORE the structure
+    logic, so it silently decides what the horizon dropdown may even consider. Measured on a
+    243-name board, a Rs900 cap removed 137 names (56%) including RELIANCE / ICICIBANK / INFY
+    and took LONG candidates from 9 to 2. Perfectly reasonable if the cap reflects real
+    sizing; a trap only when forgotten. So the board always states the cut and the count."""
     sp, c1, c2 = st.columns([6, 1, 1])
     sp.markdown("**Price band (₹)** — sizing filter, off by default (Max 0 = no limit) →")
-    c1.number_input("Min ₹", min_value=0.0, value=0.0, step=50.0, key="price_min")
-    c2.number_input("Max ₹ (0 = all)", min_value=0.0, value=0.0, step=50.0, key="price_max")
+    c1.number_input("Min ₹", min_value=0.0, value=float(config.PRICE_MIN_DEFAULT),
+                    step=50.0, key="price_min")
+    c2.number_input("Max ₹ (0 = all)", min_value=0.0, value=float(config.PRICE_MAX_DEFAULT),
+                    step=50.0, key="price_max")
 
 
 def price_filter(df, col):

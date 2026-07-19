@@ -145,3 +145,22 @@ VOL_PROFILE = {
     "14:55": 0.8367, "15:00": 0.8608, "15:05": 0.8853, "15:10": 0.9115,
     "15:15": 0.9436, "15:20": 0.9742, "15:25": 1.0000,
 }
+
+
+# ── PRICE BAND DEFAULTS — YOURS TO SET ────────────────────────────────────────────────
+# What the board's Min/Max Rs boxes start at each session. This is a POSITION-SIZING
+# preference (how many shares fit your capital), so it is your call, not a derived value —
+# set either to whatever you want, or 0 to disable that side of the band.
+#
+#     PRICE_MAX_DEFAULT = 0      -> no cap, every scanned name reaches the table
+#     PRICE_MAX_DEFAULT = 900    -> only names <= Rs900
+#
+# ONE THING TO KNOW WHEN YOU PICK A NUMBER, because it is invisible otherwise: the band cuts
+# BEFORE the structure logic runs, so it decides what the horizon dropdown is even allowed to
+# consider. Measured on a live 243-name board, a Rs900 cap removed 137 names (56%) — and
+# those included RELIANCE, ICICIBANK, INFY, AXISBANK, TECHM, BAJFINANCE, the most liquid
+# names in the universe — taking LONG candidates from 9 to 2 and SHORT from 13 to 7. That is
+# a fine trade-off if the cap reflects real position sizing; it is only a problem when it is
+# forgotten. The board now states the cut and the count on screen whenever the band is on.
+PRICE_MIN_DEFAULT = 0.0
+PRICE_MAX_DEFAULT = 900.0        # your last stated preference — change freely
