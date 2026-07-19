@@ -1,4 +1,6 @@
 """Offline unit tests — no DB, no network. Guard the LOCKED logic + no-lookahead."""
+import io
+
 import numpy as np
 import pandas as pd
 
@@ -697,3 +699,17 @@ def test_short_side_anti_predictive_tags_are_recorded():
     assert not (mtf.SHORT_ANTI_PREDICTIVE & mtf.SHORT_VALIDATED)
     # long side measured positive on every tag (average only — it is sign-unstable by year)
     assert all(v > 0 for (s, _), v in mtf.SIDE_EXCESS_20D.items() if s == "LONG")
+
+
+def test_price_band_is_off_by_default():
+    """REGRESSION: Max defaulted to Rs900 and silently removed 137 of 243 scanned names (56%)
+    — and the WRONG 137: RELIANCE, ICICIBANK, INFY, AXISBANK, TECHM, BAJFINANCE, i.e. the most
+    liquid names in the universe. It also cut LONG candidates from 9 to 2. A price cap is a
+    position-SIZING choice, not a selection one; applying it before selection biases the whole
+    board toward low-priced names for reasons unrelated to structure."""
+    import re
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    m = re.search(r'key="price_max"', src)
+    assert m, "price_max widget missing"
+    line = src[max(0, m.start() - 200):m.end()]
+    assert "value=0.0" in line, "price band must default to NO CAP (Max 0 = all)"

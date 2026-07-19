@@ -218,12 +218,20 @@ except Exception as _e:
 def render_price_band():
     """Compact price-band filter row, right-aligned above the table.
 
-    Max defaults to ₹900 (user preference). price_filter reads Max=0 as 'no cap' (0 or 1e9), so
-    set Max to 0 to see every name above ₹900 (most index heavyweights)."""
+    Max defaults to 0 = NO CAP, so every scanned name reaches the table and the horizon
+    dropdown decides what you see — not an affordability filter you forgot was on.
+
+    It used to default to Rs900. Measured on a live board that silently removed 137 of 243
+    names (56%), and they were the WRONG 137: RELIANCE, ICICIBANK, INFY, AXISBANK, TECHM,
+    BAJFINANCE — the most liquid, most fillable names in the universe. It also gutted the
+    signal, cutting LONG candidates from 9 to 2. A price cap is a POSITION-SIZING concern
+    (how many shares fit your capital), not a selection concern, and applying it before
+    selection biases the board toward low-priced names for reasons that have nothing to do
+    with structure. Set a Max only when you actually want that cut."""
     sp, c1, c2 = st.columns([6, 1, 1])
-    sp.markdown("**Price band (₹)** — filter by stock price (Max 0 = no limit) →")
+    sp.markdown("**Price band (₹)** — sizing filter, off by default (Max 0 = no limit) →")
     c1.number_input("Min ₹", min_value=0.0, value=0.0, step=50.0, key="price_min")
-    c2.number_input("Max ₹ (0 = all)", min_value=0.0, value=900.0, step=50.0, key="price_max")
+    c2.number_input("Max ₹ (0 = all)", min_value=0.0, value=0.0, step=50.0, key="price_max")
 
 
 def price_filter(df, col):
@@ -856,10 +864,16 @@ if tf == "Intraday":
                            "selected by delivery + close-strength, not by these shapes.")
 
         if not active:
-            st.info(f"**{len(light)} names** in the universe. Pick a **HTF/LTF structure** or "
-                    "raise a **delivery** slider above to select — then the matches get levels, "
-                    "RSI and a verdict on your Lower TF. Showing structure + delivery only until "
-                    "you filter.")
+            _cut = sc["n_scanned"] - len(light)
+            st.info(
+                (f"**All {len(light)} scanned names** are in the tabs below, split by what the "
+                 f"**{_P['ltf']} × {_P['htf']}** read says about each one."
+                 if not _cut else
+                 f"**{len(light)} of {sc['n_scanned']} scanned names** shown — a **price band "
+                 f"is cutting {_cut}**. A price cap is a position-SIZING choice, not a "
+                 f"selection one; clear Max ₹ to 0 to see the whole universe.")
+                + " Raise a **delivery** slider or pick a **structure** to narrow further; "
+                  "levels, RSI and a verdict are added on your Lower TF once you filter.")
             _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
 
             def _side_table(df_, note=None):
@@ -871,7 +885,11 @@ if tf == "Intraday":
                     st.warning(note)
                 st.dataframe(_fmt(df_)[_cols(df_, light_cols)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
-                _tally(len(df_), sc["n_scanned"], "names")
+                # Denominator = the pool the SIDES were split from, not the raw scan. Quoting
+                # the scan made "3 of 243 (1%)" appear under tabs that summed to 106, implying
+                # the split ran over the whole universe when a price band had already cut it.
+                _tally(len(df_), len(light), "names",
+                       f"of {sc['n_scanned']} scanned" if len(light) != sc["n_scanned"] else "")
 
             # ── LONG / SHORT split by the setup's OWN direction, not by its tag ──────────
             # Only shown when a horizon preset is active, because without one there is no
@@ -939,9 +957,21 @@ if tf == "Intraday":
                                "**−13.6**. It decays monotonically with hold length — the exact "
                                "opposite of the long side, where a longer horizon amortises cost.")
                 with tN:
+                    # A DATA GAP IS NOT A MARKET READING. Names whose intraday candles failed
+                    # come back "HTF warming" and would otherwise sit here indistinguishable
+                    # from names the tape genuinely has nothing to say about. Measured: 34 of
+                    # 243 on the intraday-frame presets, and 0 on positional — the archive
+                    # feeds 1D/1W, so the gap is frame-specific, not name-specific.
+                    _warm = int(_no["setup"].astype(str).str.contains("warming").sum())
                     st.caption("Squeezes, traps and sideways names — the setup takes no side. "
                                "Most of the universe lives here most of the time, and that is "
                                "the honest default: no trade.")
+                    if _warm:
+                        st.info(f"⏳ **{_warm} of these {len(_no)} are UNREADABLE, not neutral** "
+                                f"— no candles came back for the {_P['ltf']}/{_P['htf']} frames "
+                                f"(broker rate-limit), so they could not be judged either way. "
+                                f"↻ refresh retries them. The **Positional** horizon reads "
+                                f"1D/1W from the EOD archive and can judge all of them.")
                     _side_table(_no)
             else:
                 st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
