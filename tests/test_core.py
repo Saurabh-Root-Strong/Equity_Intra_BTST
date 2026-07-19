@@ -892,3 +892,27 @@ def test_repaint_is_declared_per_preset():
     assert _m.REPAINT["swing"]["midday_differs"] == 0, "a closed daily bar cannot repaint"
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     assert "PROVISIONAL" in dash, "the UI must warn when the tag can still change"
+
+
+def test_census_describes_the_market_not_your_price_band():
+    """The census exists to show what the OTHER names are doing, so a rare setup is
+    distinguishable from an empty tape. It was already fixed once (it used to be taken after
+    the setup filter). But `light` is cut by the PRICE BAND the moment the board loads, so
+    with a Rs900 cap it read '6 setup types across all 106 scanned names' while 243 were
+    scanned — describing 44% of the market and calling it 'all'. A price cap is a
+    position-SIZING choice; it must not decide what the tape is doing."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    m = re.search(r"_census = live\.add_setup\((\w+(?:\[[^\]]*\])?)", src)
+    assert m, "census must be built with add_setup over an unfiltered board"
+    assert "sc[" in m.group(1), "census must come from the SCAN, not the price-filtered board"
+
+
+def test_clear_road_is_rendered_not_blank():
+    """live._set stores +inf when there is NO multi-touch wall overhead, precisely so 'nothing
+    above you' stays distinguishable from 'not computed'. A NumberColumn printed inf as an
+    empty cell — identical to missing — so the column's own tooltip promised a symbol the
+    table could never show. 51 of 243 names (21%) on the BTST preset were silently ambiguous."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "∞ clear" in src, "infinite headroom must render as an explicit answer"
+    m = re.search(r'"headroom": st\.column_config\.(\w+)', src)
+    assert m and m.group(1) == "TextColumn", "headroom must be text so ∞ survives to the screen"

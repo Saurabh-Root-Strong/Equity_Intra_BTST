@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -89,6 +90,17 @@ def _fmt(df):
     if "setup" in d.columns:                               # tag -> icon + tag (display only)
         d["setup"] = [f"{mtf.TAG_ICON.get(v, '')} {v}".strip() if isinstance(v, str) else "—"
                       for v in d["setup"]]
+    if "headroom" in d.columns:
+        # CLEAR ROAD IS AN ANSWER, AND IT WAS RENDERING AS AN EMPTY CELL. The scan stores
+        # +inf when there is NO multi-touch wall overhead, precisely so that "nothing above
+        # you" stays distinguishable from "not computed" (see the inf comment in live._set).
+        # A NumberColumn then printed inf as blank -- identical to a missing value -- so the
+        # column's own tooltip promised a symbol the table could never show. Measured 51 of
+        # 243 names on the BTST preset, i.e. 21% of the board, silently ambiguous. Rendered
+        # as text so the distinction survives to the screen.
+        _hv = pd.to_numeric(d["headroom"], errors="coerce")
+        d["headroom"] = ["∞ clear" if np.isinf(v) else ("—" if pd.isna(v) else f"{v:.2f}")
+                         for v in _hv]
     return d
 
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
@@ -384,8 +396,8 @@ SR_COLS = {
              "touch only becomes a rejection once price actually turns. Counting the test in "
              "progress would let a level inflate its own strength on the way to breaking.\n\n"
              "Blank = price is not near any multi-touch level."),
-    "headroom": st.column_config.NumberColumn(
-        "headroom", format="%.2f",
+    "headroom": st.column_config.TextColumn(
+        "headroom",
         help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, measured in the ATR of "
              "your TRIGGER (lower) timeframe — the same unit your stop and 1×ATR target are "
              "built from, so the two numbers are directly comparable.\n\n"
@@ -864,11 +876,17 @@ if tf == "Intraday":
         _census = None
         if _P:
             light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"])
-            # CENSUS OF THE WHOLE TAPE — captured BEFORE the setup filter. Taken after, it
-            # reported "1 setup type across 7 names", which is a description of your filter,
-            # not of the market. The point of the census is to show what the other 236 names
-            # are doing, so you can tell a rare setup from an empty tape.
-            _census = light[["setup", "setup_read", "turn₹L", "symbol"]].copy()
+            # CENSUS OF THE WHOLE TAPE — from the FULL SCAN, not from `light`. Taken after the
+            # setup filter it once reported "1 setup type across 7 names", which describes your
+            # filter and not the market; that was fixed. But `light` has ALREADY been cut by the
+            # PRICE BAND (applied the moment the board is loaded), so with a Rs900 cap the census
+            # read "6 setup types across all 106 scanned names" while 243 were scanned — it
+            # silently described 44% of the market and called that "all". A price cap is a
+            # position-SIZING choice; it must never decide what the tape is doing. The census is
+            # therefore built from sc["board"] directly. Cost is nil — add_setup is arithmetic
+            # over boxes the scan already carried.
+            _census = live.add_setup(sc["board"], ltf=_P["ltf"], htf=_P["htf"])[
+                ["setup", "setup_read", "turn₹L", "symbol"]].copy()
             if _setup_f == "🎯 Textbook only":
                 light, _setup_on = light[light["setup"] == "WITH-TREND CONTINUATION"], True
             elif _setup_f == "🟢 Long-side setups":
@@ -893,8 +911,11 @@ if tf == "Intraday":
         # with the full read for each. A tag in a cell is a label; this is what it MEANS.
         if _P and _census is not None and not _census.empty:
             _vc = _census["setup"].value_counts()
+            _band_cut = len(_census) - len(light) if not _setup_on else None
             with st.expander(f"🔭 What the {_P['ltf']} × {_P['htf']} tape says right now — "
-                             f"{len(_vc)} setup types across all {len(_census)} scanned names"):
+                             f"{len(_vc)} setup types across all {len(_census)} scanned names"
+                             + (f"  (incl. {_band_cut} your price band hides)"
+                                if _band_cut else "")):
                 for _tag, _cnt in _vc.items():
                     _r = _census[_census["setup"] == _tag]
                     _ex = ", ".join(_r.nlargest(min(4, len(_r)), "turn₹L")["symbol"])
