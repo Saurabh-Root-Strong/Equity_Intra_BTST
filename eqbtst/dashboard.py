@@ -997,8 +997,8 @@ if tf == "Intraday":
                 # worked at the bottom.
                 _sh = light[light["side"] == "SHORT"].copy()
                 if not _sh.empty:
-                    _sh["short_note"] = [mtf.short_verdict(t) for t in _sh["setup"]]
-                    _sh["_srank"] = [mtf.SHORT_RANK.get(t, 99) for t in _sh["setup"]]
+                    _sh["short_note"] = [mtf.short_verdict(t, preset) for t in _sh["setup"]]
+                    _sh["_srank"] = [mtf.short_rank(t, preset) for t in _sh["setup"]]
                     _sh = _sh.sort_values(["_srank", "turn₹L"], ascending=[True, False])
                 tL, tS, tN = st.tabs([f"🟢 LONG ({len(_lo)})", f"🔴 SHORT ({len(_sh)})",
                                       f"⚪ No side ({len(_no)})"])

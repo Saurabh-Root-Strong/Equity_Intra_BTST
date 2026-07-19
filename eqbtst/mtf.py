@@ -369,19 +369,62 @@ SHORT_VALIDATED = {"RANGE-FLOOR BREAK"}
 #
 # So the SHORT tab sorts by MEASURED short outcome (most negative excess = best short) and
 # every row carries its own verdict. Lower is better, same convention as TAG_RANK.
-SHORT_RANK = {t: i for i, t in enumerate(
-    sorted((t for t in DIRECTIONAL_TAGS if ("SHORT", t) in SIDE_EXCESS_20D),
-           key=lambda t: SIDE_EXCESS_20D[("SHORT", t)]))}
+# ── THE SHORT EVIDENCE IS HORIZON-SPECIFIC, AND IT INVERTS ───────────────────────────
+# The ranking above came from a 20-DAY forward study and was applied to all four presets.
+# Re-measured at the hold each preset actually trades, it reverses. Same universe, same
+# causal labelling, entry at the NEXT OPEN (the only price a signal at today's close can
+# actually get), 499,387 rows:
+#
+#   tag                        next-day (open->close)      20-day (relative)
+#   WITH-TREND CONTINUATION    +15.6 excess  n= 1,549      +7.8   <- WORST of the three
+#   COIL AT THE EXTREME         +3.7 excess  n=34,577      +20.3
+#   RANGE-FLOOR BREAK          -40.6 excess  n= 8,922      +33.0  <- BEST of the three
+#
+# Exactly reversed. A fresh breakdown is the best MULTI-WEEK short and the worst NEXT-DAY
+# short -- it BOUNCES, hard, and it is not close: 1 of 9 years positive next-day, -162.8bps
+# in 2020. The board was labelling it "works short" and sorting it FIRST on every preset,
+# including the two fastest ones where it is the single worst thing on the page.
+#
+# AND THE BIGGER POINT -- "EXCESS" IS NOT PROFIT. Over 20 days, shorting a random name in
+# this universe loses 122bps, because the market rises. Measured ABSOLUTE 20-day P&L:
+#     RANGE-FLOOR BREAK        -89.0 bps     still loses
+#     COIL AT THE EXTREME     -101.7 bps     still loses
+#     WITH-TREND CONTINUATION -114.2 bps     still loses
+# Every multi-day short loses money. The 20-day "excess" numbers measured which tag lost
+# LEAST while the market carried them up. That is a relative-strength read, not a trade.
+# Only the NEXT-DAY INTRADAY window has a positive base rate at all (+10.2bps, because
+# names gap up overnight and bleed down in-session), which is also the only window Indian
+# cash equity can hold a short in. The two facts agree, for once.
+SHORT_EVIDENCE = {
+    # what the preset actually holds -> {tag: excess bps over shorting a random name}
+    "nextday": {"WITH-TREND CONTINUATION": +15.6, "COIL AT THE EXTREME": +3.7,
+                "RANGE-FLOOR BREAK": -40.6},
+    "multiday": {"RANGE-FLOOR BREAK": +33.0, "COIL AT THE EXTREME": +20.3,
+                 "WITH-TREND CONTINUATION": +7.8},
+}
+_HOLD = {"intraday": "nextday", "btst": "nextday", "swing": "multiday", "positional": "multiday"}
 
 
-def short_verdict(tag: str) -> str:
-    """Per-row honesty marker for the SHORT tab, from the 468,661-observation study."""
-    ex = SIDE_EXCESS_20D.get(("SHORT", tag))
-    if tag in SHORT_VALIDATED:
-        return f"✅ works short ({ex:+.2f}%)"
-    if tag in SHORT_ANTI_PREDICTIVE:
-        return f"⛔ measured BACKWARDS ({ex:+.2f}% = the short lost)"
-    return "— unrated"
+def short_rank(tag: str, preset: str = "btst") -> int:
+    """Sort key for the SHORT tab AT THE HOLD THIS PRESET TRADES. Lower = better short."""
+    ev = SHORT_EVIDENCE[_HOLD.get(preset, "nextday")]
+    return -int(round(ev.get(tag, -999) * 10))          # most positive excess first
+
+
+def short_verdict(tag: str, preset: str = "btst") -> str:
+    """Per-row honesty marker, priced at the horizon the user actually selected."""
+    hold = _HOLD.get(preset, "nextday")
+    ex = SHORT_EVIDENCE[hold].get(tag)
+    if ex is None:
+        return "— unrated at this hold"
+    if hold == "multiday":
+        # every multi-day short loses in absolute terms; only say which loses least
+        return f"⛔ multi-day shorts all LOSE (this one least-bad, {ex:+.1f}bps rel.)"
+    if ex <= -20:
+        return f"⛔ BOUNCES next day ({ex:+.1f}bps vs shorting anything)"
+    if ex <= 5:
+        return f"⚠ barely beats shorting at random ({ex:+.1f}bps)"
+    return f"✅ best short geometry here ({ex:+.1f}bps excess)"
 
 
 # Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no

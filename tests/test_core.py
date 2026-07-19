@@ -956,14 +956,26 @@ def test_short_side_is_ranked_by_measurement_not_by_textbook():
     validated name buried underneath — while the warning box above said 'never short these'.
     People act on order, not on prose."""
     from eqbtst import mtf as _m
-    assert _m.SHORT_RANK["RANGE-FLOOR BREAK"] == 0, "the only validated short must sort first"
-    for t in _m.SHORT_ANTI_PREDICTIVE:
-        assert _m.SHORT_RANK[t] > _m.SHORT_RANK["RANGE-FLOOR BREAK"]
-    # ordering must follow the measurement, not the chartist rank
-    ranked = sorted(_m.SHORT_RANK, key=lambda t: _m.SHORT_RANK[t])
-    excess = [_m.SIDE_EXCESS_20D[("SHORT", t)] for t in ranked]
-    assert excess == sorted(excess), "short rank must ascend with measured excess"
-    assert "BACKWARDS" in _m.short_verdict("WITH-TREND CONTINUATION")
-    assert "works short" in _m.short_verdict("RANGE-FLOOR BREAK")
+    # THE EVIDENCE IS HORIZON-SPECIFIC AND IT INVERTS. Re-measured at the hold each preset
+    # actually trades (entry at the next open, 499,387 rows): RANGE-FLOOR BREAK is the BEST
+    # multi-day short (+33.0 relative) and the WORST next-day one (-40.6 excess, 1 of 9 years
+    # positive, -162.8bps in 2020) -- a fresh breakdown BOUNCES. WITH-TREND CONTINUATION is
+    # the exact mirror: best next-day (+15.6), worst multi-day (+7.8). Ranking every preset
+    # off the 20-day study put the single worst name on the page at the top of the two
+    # fastest boards.
+    for p in ("intraday", "btst"):
+        assert _m.short_rank("WITH-TREND CONTINUATION", p) < _m.short_rank("RANGE-FLOOR BREAK", p)
+        assert "BOUNCES" in _m.short_verdict("RANGE-FLOOR BREAK", p)
+    for p in ("swing", "positional"):
+        assert _m.short_rank("RANGE-FLOOR BREAK", p) < _m.short_rank("WITH-TREND CONTINUATION", p)
+        # and no multi-day short may ever be described as working: measured ABSOLUTE 20-day
+        # P&L is -89.0 / -101.7 / -114.2 bps. "Excess" over a -122bps baseline is not profit.
+        for t in _m.SHORT_EVIDENCE["multiday"]:
+            assert "LOSE" in _m.short_verdict(t, p)
+    # ordering must follow the measurement at each hold
+    for hold, preset in (("nextday", "btst"), ("multiday", "swing")):
+        tags = sorted(_m.SHORT_EVIDENCE[hold], key=lambda t: _m.short_rank(t, preset))
+        ex = [_m.SHORT_EVIDENCE[hold][t] for t in tags]
+        assert ex == sorted(ex, reverse=True), f"{hold} rank must descend with measured excess"
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
-    assert "SHORT_RANK" in dash, "the SHORT tab must sort by the measured rank"
+    assert "short_rank(t, preset)" in dash, "the SHORT tab must rank at the SELECTED horizon"
