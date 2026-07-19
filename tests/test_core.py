@@ -979,3 +979,36 @@ def test_short_side_is_ranked_by_measurement_not_by_textbook():
         assert ex == sorted(ex, reverse=True), f"{hold} rank must descend with measured excess"
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     assert "short_rank(t, preset)" in dash, "the SHORT tab must rank at the SELECTED horizon"
+
+
+def test_long_side_is_ranked_at_the_selected_hold():
+    """The long side inverts with the horizon the same way the short side does, in the
+    opposite direction. Measured, entry at the next open, 493,987 rows, as excess over
+    buying a random name:
+
+        tag                      overnight  intraday    5d      20d    yrs+ (overnight)
+        RANGE-TOP BREAK            +32.1     -13.1    -24.7    +28.0    9 of 9
+        WITH-TREND CONT. (dip)      +4.4      -4.6    +36.3    +69.8    5 of 9
+        COIL AT THE EXTREME         +2.3      -1.3     +9.8    +51.5    3 of 9
+
+    RANGE-TOP BREAK is the best OVERNIGHT long (+49.4bps absolute, positive in ALL NINE
+    YEARS) and the WORST 5-day one (-7.3bps absolute — it loses money if held). TAG_RANK
+    ranks continuation first, which is right for Swing/Positional and backwards for BTST."""
+    from eqbtst import mtf as _m
+    assert _m.long_rank("RANGE-TOP BREAK", "btst") < _m.long_rank("WITH-TREND CONTINUATION", "btst")
+    for p in ("swing", "positional"):
+        assert _m.long_rank("WITH-TREND CONTINUATION", p) < _m.long_rank("RANGE-TOP BREAK", p)
+    # the session AFTER the gap gives it back — no long may look good on the intraday hold
+    for t in _m.LONG_EVIDENCE["intraday"]:
+        assert _m.LONG_EVIDENCE["intraday"][t] < 0
+        assert "GIVES BACK" in _m.long_verdict(t, "intraday")
+    # holding past the first night must never be sold as free: the 5d baseline IS the
+    # overnight baseline (+17.4 vs +17.3), so RANGE-TOP BREAK goes outright negative there
+    assert _m.LONG_EVIDENCE["5d"]["RANGE-TOP BREAK"] < 0
+    assert "LOSES" in _m.long_verdict("RANGE-TOP BREAK", "swing")
+    for hold, preset in (("overnight", "btst"), ("5d", "swing"), ("20d", "positional")):
+        tags = sorted(_m.LONG_EVIDENCE[hold], key=lambda t: _m.long_rank(t, preset))
+        ex = [_m.LONG_EVIDENCE[hold][t] for t in tags]
+        assert ex == sorted(ex, reverse=True), f"{hold} long rank must follow the measurement"
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "long_rank(t, preset)" in dash, "the LONG tab must rank at the SELECTED horizon"

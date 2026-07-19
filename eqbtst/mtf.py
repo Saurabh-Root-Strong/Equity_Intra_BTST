@@ -405,6 +405,77 @@ SHORT_EVIDENCE = {
 _HOLD = {"intraday": "nextday", "btst": "nextday", "swing": "multiday", "positional": "multiday"}
 
 
+# ── THE LONG SIDE INVERTS TOO, AND IN THE OPPOSITE DIRECTION ─────────────────────────
+# Same archive, same causal labels, entry at the next open. Buying a RANDOM name:
+#
+#     overnight (close -> next open)   +17.3 bps
+#     intraday  (next open -> close)   -10.2 bps      <- the session GIVES BACK
+#     5-day                            +17.4 bps
+#     20-day                          +122.0 bps
+#
+# Two things fall out of that column. First, the 5-day baseline (+17.4) is the overnight
+# baseline (+17.3): on average, holding four more sessions adds NOTHING beyond the first
+# night. That is the "sell next day, early in it" rule, arrived at from the drift rather
+# than from the backtest. Second, the session after the gap is NEGATIVE -- the same fact
+# that makes intraday SHORTS mildly positive. The long edge is a gap, not a trend.
+#
+# Per tag, as EXCESS over buying a random name (absolute in the comment beneath):
+#
+#   tag                      overnight   intraday      5d       20d     yrs+ (overnight)
+#   RANGE-TOP BREAK             +32.1      -13.1     -24.7     +28.0     9 of 9
+#   WITH-TREND CONT. (dip)       +4.4       -4.6     +36.3     +69.8     5 of 9
+#   COIL AT THE EXTREME          +2.3       -1.3      +9.8     +51.5     3 of 9
+#
+# RANGE-TOP BREAK is the best OVERNIGHT long by a distance -- +49.4bps absolute, POSITIVE
+# IN ALL NINE YEARS, the only unanimous result anywhere in this stack -- and the WORST
+# 5-day long (-7.3bps absolute: it loses money if you hold it). WITH-TREND CONTINUATION is
+# its mirror, weak overnight and best at 20 days. TAG_RANK puts CONTINUATION first and
+# RANGE-TOP BREAK second, which is right for Swing/Positional and backwards for BTST.
+#
+# AND THE ASYMMETRY WITH THE SHORT SIDE IS THE REAL LESSON. Shorts only paid on FAILURE
+# patterns (bull trap +14.0 excess, 8 of 9 years) while trend continuation was dead. Longs
+# are the exact reverse: the breakout pays, and the failure patterns do not mirror at all --
+# BEAR TRAP measured -7.4 excess overnight (3 of 9 years; -199.4bps in 2020 with the
+# "quality" filters on) and GAP-DOWN REVERSAL +8.4 but only 5 of 9. In a market that drifts
+# up, strength CARRIES overnight and weakness gets ABSORBED. You are paid to buy strength
+# and paid to short breakage, and not the other way round in either case.
+LONG_EVIDENCE = {
+    "intraday":  {"COIL AT THE EXTREME": -1.3, "WITH-TREND CONTINUATION": -4.6,
+                  "RANGE-TOP BREAK": -13.1},
+    "overnight": {"RANGE-TOP BREAK": +32.1, "WITH-TREND CONTINUATION": +4.4,
+                  "COIL AT THE EXTREME": +2.3},
+    "5d":        {"WITH-TREND CONTINUATION": +36.3, "COIL AT THE EXTREME": +9.8,
+                  "RANGE-TOP BREAK": -24.7},
+    "20d":       {"WITH-TREND CONTINUATION": +69.8, "COIL AT THE EXTREME": +51.5,
+                  "RANGE-TOP BREAK": +28.0},
+}
+_LONG_HOLD = {"intraday": "intraday", "btst": "overnight", "swing": "5d", "positional": "20d"}
+_LONG_YRS = {"RANGE-TOP BREAK": "9 of 9", "WITH-TREND CONTINUATION": "5 of 9",
+             "COIL AT THE EXTREME": "3 of 9"}
+
+
+def long_rank(tag: str, preset: str = "btst") -> int:
+    """Sort key for the LONG tab AT THE HOLD THIS PRESET TRADES. Lower = better."""
+    ev = LONG_EVIDENCE[_LONG_HOLD.get(preset, "overnight")]
+    return -int(round(ev.get(tag, -999) * 10))
+
+
+def long_verdict(tag: str, preset: str = "btst") -> str:
+    """Per-row marker for the LONG tab, priced at the horizon the user selected."""
+    hold = _LONG_HOLD.get(preset, "overnight")
+    ex = LONG_EVIDENCE[hold].get(tag)
+    if ex is None:
+        return "— unrated at this hold"
+    if hold == "intraday":
+        return f"⛔ the session GIVES BACK the gap ({ex:+.1f}bps vs buying anything)"
+    yrs = _LONG_YRS.get(tag, "")
+    if ex >= 25:
+        return f"✅ strongest at this hold ({ex:+.1f}bps excess · {yrs} years)"
+    if ex <= 0:
+        return f"⛔ LOSES at this hold ({ex:+.1f}bps vs buying anything)"
+    return f"⚠ barely beats buying at random ({ex:+.1f}bps · {yrs} years)"
+
+
 def short_rank(tag: str, preset: str = "btst") -> int:
     """Sort key for the SHORT tab AT THE HOLD THIS PRESET TRADES. Lower = better short."""
     ev = SHORT_EVIDENCE[_HOLD.get(preset, "nextday")]

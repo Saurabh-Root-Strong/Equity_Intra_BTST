@@ -396,6 +396,21 @@ SR_COLS = {
              "touch only becomes a rejection once price actually turns. Counting the test in "
              "progress would let a level inflate its own strength on the way to breaking.\n\n"
              "Blank = price is not near any multi-touch level."),
+    "long_note": st.column_config.TextColumn(
+        "long evidence", width="medium",
+        help="WHAT THIS SETUP DID ON THE LONG SIDE AT THE HOLD YOU SELECTED — measured, "
+             "entry at the next open, 493,987 rows. Buying a RANDOM name earns +17.3bps "
+             "overnight, -10.2 in the session after the gap, +17.4 over 5 days and +122 over "
+             "20. Read the first two together: the long edge is a GAP, and the session that "
+             "follows gives most of it back. Read the 5-day number against the overnight one: "
+             "they are the SAME, so four more sessions add nothing on average — which is why "
+             "the rule is sell next day, early in it. Per tag, as excess over that baseline: "
+             "RANGE-TOP BREAK +32.1 overnight (POSITIVE IN ALL NINE YEARS, the only unanimous "
+             "result in this stack) but -24.7 at 5 days, where it loses money outright. "
+             "WITH-TREND CONTINUATION is the mirror: +4.4 overnight, +36.3 at 5 days, +69.8 at "
+             "20. COIL AT THE EXTREME +2.3 overnight (3 of 9 years) — a flag at the highs is "
+             "the weakest long location. The tab sorts by THIS, not by chartist setup quality, "
+             "because the right order changes with the hold."),
     "short_note": st.column_config.TextColumn(
         "short evidence", width="medium",
         help="WHAT THIS SETUP ACTUALLY DID ON THE SHORT SIDE — measured, not reasoned. "
@@ -988,7 +1003,16 @@ if tf == "Intraday":
             # HTF x LTF read to take a side from — and inventing a side from a single
             # timeframe label is how a downtrend gets bought.
             if _P and "side" in light.columns:
-                _lo = light[light["side"] == "LONG"]
+                # THE LONG SIDE IS RE-SORTED BY HOLD TOO. Measured: RANGE-TOP BREAK is the
+                # best OVERNIGHT long (+32.1bps excess, 9 of 9 years) and the WORST 5-day one
+                # (-24.7, and negative in absolute terms). WITH-TREND CONTINUATION is its
+                # mirror. TAG_RANK ranks continuation first, which is right for Swing and
+                # Positional and backwards for BTST.
+                _lo = light[light["side"] == "LONG"].copy()
+                if not _lo.empty:
+                    _lo["long_note"] = [mtf.long_verdict(t, preset) for t in _lo["setup"]]
+                    _lo["_lrank"] = [mtf.long_rank(t, preset) for t in _lo["setup"]]
+                    _lo = _lo.sort_values(["_lrank", "turn₹L"], ascending=[True, False])
                 _no = light[light["side"] == "—"]
                 # THE SHORT SIDE IS RE-SORTED BY WHAT WAS MEASURED, NOT BY TEXTBOOK QUALITY.
                 # setup_rank is a chartist ranking; on the short side it is inverted (see
@@ -1005,7 +1029,7 @@ if tf == "Intraday":
                 with tL:
                     st.caption("Setups pointing UP: an uptrend coiling for continuation, a break "
                                "at the top of the higher-TF range, or a pullback INTO an uptrend.")
-                    _side_table(_lo)
+                    _side_table(_lo, extra_cols=("long_note",))
                 with tS:
                     _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
                     _edge = mtf.SHORT_EDGE_BPS.get(preset, 0.0)
