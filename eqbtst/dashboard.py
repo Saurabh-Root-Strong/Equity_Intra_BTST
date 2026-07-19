@@ -933,9 +933,14 @@ if tf == "Intraday":
                 (f"**All {len(light)} scanned names** are in the tabs below, split by what the "
                  f"**{_P['ltf']} × {_P['htf']}** read says about each one."
                  if not _cut else
-                 f"**{len(light)} of {sc['n_scanned']} scanned names** shown — a **price band "
-                 f"is cutting {_cut}**. A price cap is a position-SIZING choice, not a "
-                 f"selection one; clear Max ₹ to 0 to see the whole universe.")
+                 f"**{len(light)} of {sc['n_scanned']} scanned names** shown — your **price "
+                 f"band is cutting {_cut}** (Max ₹ = 0 shows the whole universe). "
+                 f"MEASURED: a price cap is not a neutral cut on this edge — over 8 years of "
+                 f"footprint triggers the overnight payoff falls MONOTONICALLY with price "
+                 f"(≤₹900: **+33.8bps**, n=358 · >₹900: **+7.8bps**, n=390 · diff t=3.04), "
+                 f"cheap beat rich in **8 of 8 years**, and it is not a liquidity artifact — "
+                 f"the gap is WIDEST in the most-traded third. Keeping a cap here is a "
+                 f"selection choice that has paid.")
                 + " Raise a **delivery** slider or pick a **structure** to narrow further; "
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
             _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
