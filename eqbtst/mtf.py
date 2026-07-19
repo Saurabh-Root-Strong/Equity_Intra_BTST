@@ -395,14 +395,33 @@ SHORT_VALIDATED = {"RANGE-FLOOR BREAK"}
 # Only the NEXT-DAY INTRADAY window has a positive base rate at all (+10.2bps, because
 # names gap up overnight and bleed down in-session), which is also the only window Indian
 # cash equity can hold a short in. The two facts agree, for once.
+# CORRECTED. The first version of this table was measured with a PROXY for the board's tags
+# -- one frame's label plus loc against a prior-20-day range -- instead of the board's own
+# synthesize(). Those are different populations: the real RANGE-TOP BREAK additionally
+# requires the HIGHER frame to be a range with price at its top, and turned out to be only
+# 43% of the proxy's rows. Re-measured through the ACTUAL synthesize() branches, two of the
+# three short numbers CHANGED SIGN, and the board was telling the user that WITH-TREND
+# CONTINUATION was the best short geometry when it is not.
+#
+#   short P&L, excess bps over shorting a random name    PROXY (shipped)   FAITHFUL
+#     RANGE-FLOOR BREAK, next-day intraday                   -40.6          -41.3
+#     WITH-TREND CONTINUATION, next-day intraday             +15.6           -8.7  <- flipped
+#     COIL AT THE EXTREME, next-day intraday                  +3.7           -9.1  <- flipped
+#
+# The corrected reading is simpler AND more damning: on the session that follows the signal,
+# NO structural short tag beats shorting a random name. The only short-side result that
+# survived contact with the real pipeline is that a fresh breakdown BOUNCES (-41.3), which
+# was never a trade -- it is a warning.
 SHORT_EVIDENCE = {
-    # what the preset actually holds -> {tag: excess bps over shorting a random name}
-    "nextday": {"WITH-TREND CONTINUATION": +15.6, "COIL AT THE EXTREME": +3.7,
-                "RANGE-FLOOR BREAK": -40.6},
-    "multiday": {"RANGE-FLOOR BREAK": +33.0, "COIL AT THE EXTREME": +20.3,
-                 "WITH-TREND CONTINUATION": +7.8},
+    "intraday":  {"WITH-TREND CONTINUATION": -8.7, "COIL AT THE EXTREME": -9.1,
+                  "RANGE-FLOOR BREAK": -41.3},
+    "overnight": {"RANGE-FLOOR BREAK": +13.4, "WITH-TREND CONTINUATION": -1.3,
+                  "COIL AT THE EXTREME": -1.9},
+    "5d":        {"RANGE-FLOOR BREAK": +14.0, "WITH-TREND CONTINUATION": +5.8,
+                  "COIL AT THE EXTREME": -37.2},
+    "20d":       {"RANGE-FLOOR BREAK": +89.6, "WITH-TREND CONTINUATION": -23.1,
+                  "COIL AT THE EXTREME": -70.8},
 }
-_HOLD = {"intraday": "nextday", "btst": "nextday", "swing": "multiday", "positional": "multiday"}
 
 
 # ── THE LONG SIDE INVERTS TOO, AND IN THE OPPOSITE DIRECTION ─────────────────────────
@@ -439,16 +458,25 @@ _HOLD = {"intraday": "nextday", "btst": "nextday", "swing": "multiday", "positio
 # "quality" filters on) and GAP-DOWN REVERSAL +8.4 but only 5 of 9. In a market that drifts
 # up, strength CARRIES overnight and weakness gets ABSORBED. You are paid to buy strength
 # and paid to short breakage, and not the other way round in either case.
+# CORRECTED alongside SHORT_EVIDENCE -- same proxy defect, but the long side SURVIVED it:
+# every ordering held and only the magnitudes moved (RANGE-TOP BREAK overnight +32.1 proxy
+# -> +25.5 faithful, still the best by a distance, still 9 of 9 years). One real change: on
+# the session AFTER the gap, WITH-TREND CONTINUATION is +10.5 excess faithfully, not the
+# -4.6 the proxy gave -- though in ABSOLUTE terms that is only +0.3bps, i.e. flat, so the
+# "the session gives the gap back" reading stands for every geometry.
 LONG_EVIDENCE = {
-    "intraday":  {"COIL AT THE EXTREME": -1.3, "WITH-TREND CONTINUATION": -4.6,
-                  "RANGE-TOP BREAK": -13.1},
-    "overnight": {"RANGE-TOP BREAK": +32.1, "WITH-TREND CONTINUATION": +4.4,
-                  "COIL AT THE EXTREME": +2.3},
-    "5d":        {"WITH-TREND CONTINUATION": +36.3, "COIL AT THE EXTREME": +9.8,
-                  "RANGE-TOP BREAK": -24.7},
-    "20d":       {"WITH-TREND CONTINUATION": +69.8, "COIL AT THE EXTREME": +51.5,
-                  "RANGE-TOP BREAK": +28.0},
+    "intraday":  {"WITH-TREND CONTINUATION": +10.5, "COIL AT THE EXTREME": -3.8,
+                  "RANGE-TOP BREAK": -12.4},
+    "overnight": {"RANGE-TOP BREAK": +25.5, "COIL AT THE EXTREME": +5.2,
+                  "WITH-TREND CONTINUATION": +3.1},
+    "5d":        {"WITH-TREND CONTINUATION": +41.0, "COIL AT THE EXTREME": +7.4,
+                  "RANGE-TOP BREAK": -7.3},
+    "20d":       {"WITH-TREND CONTINUATION": +93.2, "COIL AT THE EXTREME": +57.9,
+                  "RANGE-TOP BREAK": +24.4},
 }
+# ABSOLUTE long P&L for the intraday hold, so nothing here can be read as a green light:
+# baseline -10.2bps, so +10.5 excess is +0.3 absolute. Flat, not an edge.
+_INTRADAY_BASE = -10.2
 _LONG_HOLD = {"intraday": "intraday", "btst": "overnight", "swing": "5d", "positional": "20d"}
 _LONG_YRS = {"RANGE-TOP BREAK": "9 of 9", "WITH-TREND CONTINUATION": "5 of 9",
              "COIL AT THE EXTREME": "3 of 9"}
@@ -467,7 +495,9 @@ def long_verdict(tag: str, preset: str = "btst") -> str:
     if ex is None:
         return "— unrated at this hold"
     if hold == "intraday":
-        return f"⛔ the session GIVES BACK the gap ({ex:+.1f}bps vs buying anything)"
+        absol = ex + _INTRADAY_BASE
+        return (f"⛔ the session GIVES BACK the gap ({absol:+.1f}bps absolute, "
+                f"{ex:+.1f} vs buying anything)")
     yrs = _LONG_YRS.get(tag, "")
     if ex >= 25:
         return f"✅ strongest at this hold ({ex:+.1f}bps excess · {yrs} years)"
@@ -478,24 +508,27 @@ def long_verdict(tag: str, preset: str = "btst") -> str:
 
 def short_rank(tag: str, preset: str = "btst") -> int:
     """Sort key for the SHORT tab AT THE HOLD THIS PRESET TRADES. Lower = better short."""
-    ev = SHORT_EVIDENCE[_HOLD.get(preset, "nextday")]
+    ev = SHORT_EVIDENCE[_LONG_HOLD.get(preset, "overnight")]
     return -int(round(ev.get(tag, -999) * 10))          # most positive excess first
 
 
 def short_verdict(tag: str, preset: str = "btst") -> str:
-    """Per-row honesty marker, priced at the horizon the user actually selected."""
-    hold = _HOLD.get(preset, "nextday")
+    """Per-row honesty marker, priced at the horizon the user actually selected.
+
+    NOTHING here may read as a green light. Corrected measurement: no structural short tag
+    beats shorting a random name on the session after the signal, and every MULTI-DAY short
+    loses in absolute terms because the baseline itself is -122bps over 20 days."""
+    hold = _LONG_HOLD.get(preset, "overnight")
     ex = SHORT_EVIDENCE[hold].get(tag)
     if ex is None:
         return "— unrated at this hold"
-    if hold == "multiday":
-        # every multi-day short loses in absolute terms; only say which loses least
-        return f"⛔ multi-day shorts all LOSE (this one least-bad, {ex:+.1f}bps rel.)"
-    if ex <= -20:
-        return f"⛔ BOUNCES next day ({ex:+.1f}bps vs shorting anything)"
-    if ex <= 5:
-        return f"⚠ barely beats shorting at random ({ex:+.1f}bps)"
-    return f"✅ best short geometry here ({ex:+.1f}bps excess)"
+    if ex <= -35:
+        return f"⛔ BOUNCES — the worst short here ({ex:+.1f}bps vs shorting anything)"
+    if ex < 0:
+        return f"⛔ worse than shorting at random ({ex:+.1f}bps)"
+    if hold in ("5d", "20d"):
+        return f"⛔ least-bad, but multi-day shorts all LOSE ({ex:+.1f}bps rel.)"
+    return f"⚠ beats shorting at random by {ex:+.1f}bps — still not an edge"
 
 
 # Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no

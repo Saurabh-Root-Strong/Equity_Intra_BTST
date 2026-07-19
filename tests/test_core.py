@@ -963,17 +963,32 @@ def test_short_side_is_ranked_by_measurement_not_by_textbook():
     # the exact mirror: best next-day (+15.6), worst multi-day (+7.8). Ranking every preset
     # off the 20-day study put the single worst name on the page at the top of the two
     # fastest boards.
-    for p in ("intraday", "btst"):
-        assert _m.short_rank("WITH-TREND CONTINUATION", p) < _m.short_rank("RANGE-FLOOR BREAK", p)
-        assert "BOUNCES" in _m.short_verdict("RANGE-FLOOR BREAK", p)
+    # CORRECTED after auditing my own numbers: the first table was measured with a PROXY for
+    # the board's tags (one frame's label + loc vs a prior-20-day range) rather than the real
+    # synthesize(). The real RANGE-TOP BREAK also requires the HIGHER frame to be a range and
+    # turned out to be only 43% of the proxy's rows. Re-measured faithfully, TWO OF THREE
+    # SHORT NUMBERS CHANGED SIGN and the board was calling WITH-TREND CONTINUATION the best
+    # short geometry (+15.6) when it is -8.7. Guard the corrected facts.
+    #
+    # On the session AFTER the signal, NO structural short tag beats shorting at random:
+    for t, v in _m.SHORT_EVIDENCE["intraday"].items():
+        assert v < 0, f"{t} must not read as a tradeable intraday short"
+        assert "worse than shorting at random" in _m.short_verdict(t, "intraday") \
+            or "BOUNCES" in _m.short_verdict(t, "intraday")
+    # a fresh breakdown BOUNCES on the next session -- the one robust short-side result,
+    # and it is a warning, not a trade (-41.3 excess, and it survived the proxy at -40.6)
+    assert _m.SHORT_EVIDENCE["intraday"]["RANGE-FLOOR BREAK"] <= -35
+    assert "BOUNCES" in _m.short_verdict("RANGE-FLOOR BREAK", "intraday")
+    # ...yet it is the LEAST-BAD short at every longer hold, which is the horizon inversion
+    for p in ("btst", "swing", "positional"):
+        assert _m.short_rank("RANGE-FLOOR BREAK", p) < _m.short_rank("COIL AT THE EXTREME", p)
+    # no multi-day short may be described as working: ABSOLUTE 20-day P&L is negative for
+    # every tag, because the baseline itself is -122bps. "Excess" over that is not profit.
     for p in ("swing", "positional"):
-        assert _m.short_rank("RANGE-FLOOR BREAK", p) < _m.short_rank("WITH-TREND CONTINUATION", p)
-        # and no multi-day short may ever be described as working: measured ABSOLUTE 20-day
-        # P&L is -89.0 / -101.7 / -114.2 bps. "Excess" over a -122bps baseline is not profit.
-        for t in _m.SHORT_EVIDENCE["multiday"]:
-            assert "LOSE" in _m.short_verdict(t, p)
-    # ordering must follow the measurement at each hold
-    for hold, preset in (("nextday", "btst"), ("multiday", "swing")):
+        for t, v in _m.SHORT_EVIDENCE[_m._LONG_HOLD[p]].items():
+            assert "LOSE" in _m.short_verdict(t, p) or v < 0
+    for hold, preset in (("intraday", "intraday"), ("overnight", "btst"),
+                         ("5d", "swing"), ("20d", "positional")):
         tags = sorted(_m.SHORT_EVIDENCE[hold], key=lambda t: _m.short_rank(t, preset))
         ex = [_m.SHORT_EVIDENCE[hold][t] for t in tags]
         assert ex == sorted(ex, reverse=True), f"{hold} rank must descend with measured excess"
@@ -998,10 +1013,14 @@ def test_long_side_is_ranked_at_the_selected_hold():
     assert _m.long_rank("RANGE-TOP BREAK", "btst") < _m.long_rank("WITH-TREND CONTINUATION", "btst")
     for p in ("swing", "positional"):
         assert _m.long_rank("WITH-TREND CONTINUATION", p) < _m.long_rank("RANGE-TOP BREAK", p)
-    # the session AFTER the gap gives it back — no long may look good on the intraday hold
-    for t in _m.LONG_EVIDENCE["intraday"]:
-        assert _m.LONG_EVIDENCE["intraday"][t] < 0
+    # The session AFTER the gap gives it back. Guard the ABSOLUTE number, not the excess:
+    # re-measured faithfully, WITH-TREND CONTINUATION is +10.5 EXCESS on that window, which
+    # sounds like an edge until you add the -10.2bps baseline and get +0.3 absolute. Excess
+    # against a negative baseline is exactly the trap that made the first short table wrong.
+    for t, v in _m.LONG_EVIDENCE["intraday"].items():
+        assert v + _m._INTRADAY_BASE <= 1.0, f"{t} must not read as a tradeable intraday long"
         assert "GIVES BACK" in _m.long_verdict(t, "intraday")
+        assert "absolute" in _m.long_verdict(t, "intraday"), "must quote the absolute number"
     # holding past the first night must never be sold as free: the 5d baseline IS the
     # overnight baseline (+17.4 vs +17.3), so RANGE-TOP BREAK goes outright negative there
     assert _m.LONG_EVIDENCE["5d"]["RANGE-TOP BREAK"] < 0
