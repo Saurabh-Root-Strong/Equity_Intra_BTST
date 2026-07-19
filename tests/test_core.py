@@ -1052,3 +1052,46 @@ def test_a_dead_token_is_diagnosed_not_blamed_on_the_clock():
     assert retry > tok, "the token must be checked BEFORE the auto-retry burns a rerun"
     assert "re-authenticate" in blk, "a dead token must say re-authenticate"
     assert "will not fix it" in blk, "must say that re-scanning cannot fix an expired token"
+
+
+def test_a_forming_bar_cannot_manufacture_a_coil():
+    """A coil is a COMPLETED observation. "The range is contracting" cannot be said from a bar
+    five minutes old — and the coil test is exactly a span comparison, so a part-printed newest
+    bar makes the latest 3-bar span mechanically narrow. Measured by replaying a session at
+    wall-clock checkpoints (4h frame, 60 names): coil fired on 7% of the board at 12:20, then
+    30% at 13:20 the moment the 13:15 bar opened holding ONE candle, decaying 30->28->23->20%
+    as it filled. Excluding the forming bar it is a flat 7%. A 4x spike out of nothing, and the
+    fourth instance of one defect family here after the original coil detector, the partial
+    weekly bar and the trailing session stub."""
+    import pandas as pd
+    from eqbtst import indicators
+    # The mechanism is DISPLACEMENT: the window keeps the last 20 bars, so a brand-new sliver
+    # pushes a full-width bar OUT of the trailing 3-bar span. Build exactly that — a wide
+    # history, two recent narrower bars, then a bar that has barely printed.
+    def bar(i, hi, lo):
+        return {"ts": pd.Timestamp("2026-07-20 09:15") + pd.Timedelta(hours=i),
+                "open": 100.0, "high": hi, "low": lo, "close": 100.0, "volume": 1000}
+    rows = [bar(i, 104.0, 96.0) for i in range(18)]          # typical span 8
+    rows += [bar(18, 101.0, 99.0), bar(19, 101.0, 99.0)]     # two narrower bars, span 2
+    rows.append(bar(20, 100.1, 99.9) | {"volume": 10})       # the forming bar: barely printed
+    c = pd.DataFrame(rows)
+    live_read = indicators.struct_full(c, forming=True)
+    naive = indicators.struct_full(c, forming=False)
+    assert naive["struct"] == "CONSOLIDATION", "the sliver bar should fool the naive test"
+    assert live_read["struct"] != "CONSOLIDATION", "a forming bar must not manufacture a coil"
+    # the BREAKOUT/TREND tests must still see the live bar — that is the point of a live board
+    up = c.copy()
+    up.loc[up.index[-1], ["high", "low", "close"]] = [130.0, 129.0, 129.5]
+    assert indicators.struct_full(up, forming=True)["struct"] == "BREAKOUT_UP"
+
+
+def test_only_live_intraday_frames_are_marked_forming():
+    """1D/1W come from the EOD archive and are complete by construction, so they must never be
+    truncated; and off-hours even the intraday frames are closed."""
+    import inspect
+    from eqbtst import live as _l
+    src = inspect.getsource(_l.mtf_structure)
+    assert "_live_bar = market_open()" in src, "the flag must be gated on the session"
+    assert 'forming=True' in src
+    i1d = src.find('_set("1D"')
+    assert i1d > 0 and "forming" not in src[i1d:i1d + 120], "the daily frame is never forming"

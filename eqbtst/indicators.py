@@ -229,7 +229,8 @@ def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
     return struct_full(candles, lookback)["struct"]
 
 
-def struct_full(candles: pd.DataFrame, lookback: int | None = None) -> dict:
+def struct_full(candles: pd.DataFrame, lookback: int | None = None,
+                forming: bool = False) -> dict:
     """Structure label PLUS the context a multi-timeframe synthesis needs: the window's
     range hi/lo (the BOX price lives in), Kaufman ER, coil ratio, bar count, last close.
 
@@ -240,6 +241,10 @@ def struct_full(candles: pd.DataFrame, lookback: int | None = None) -> dict:
     Market structure on this timeframe (CONTEXT, not a signal — intraday structure has
     no validated edge). MAGNITUDE-gated, ATR-normalised: the label is defined by the SIZE
     of the move, not just topology, so a marginal new high is NOT called a breakout.
+
+    `forming=True` says the LAST bar has not closed yet (a live intraday frame). Only the
+    COIL test changes: it then reads closed bars only, because a span comparison against a
+    part-printed bar manufactures squeezes. Breakout/trend still see the live bar.
 
       BREAKOUT_UP/DOWN  last close clears the prior 19-bar range by >= STRUCT_BREAKOUT_ATR x
                         ATR (a real break, not a poke). On daily ATR that is ~1-1.5% beyond
@@ -272,8 +277,26 @@ def struct_full(candles: pd.DataFrame, lookback: int | None = None) -> dict:
     prior_hi = hi[:-1].max() if len(hi) > 1 else last
     prior_lo = lo[:-1].min() if len(lo) > 1 else last
     coil = None
-    if len(hi) >= 8:
-        _sp = np.array([hi[i:i + 3].max() - lo[i:i + 3].min() for i in range(len(hi) - 2)])
+    # A COIL IS A COMPLETED OBSERVATION. "The range is contracting" cannot be said from a bar
+    # that is five minutes old, and the coil test is precisely a span comparison — so a
+    # part-printed newest bar makes the latest 3-bar span mechanically narrow and manufactures
+    # a squeeze. Measured by replaying a session at wall-clock checkpoints, 4h frame, 60 names:
+    #
+    #     clock    coil fires INCL forming bar    EXCL forming bar
+    #     12:20            7%                          17%
+    #     13:20           30%   <- the 13:15 bar         7%
+    #     13:35           28%      opens with ONE        7%
+    #     15:20           20%      candle in it          7%
+    #
+    # A 4x spike the moment a coarse bar opens, decaying as it fills. Fourth instance of one
+    # defect family in this codebase — after the original coil detector, the partial weekly
+    # bar and the trailing session stub — all of them a window comparison where one side holds
+    # fewer bars. The BREAKOUT and TREND tests deliberately keep the forming bar: detecting a
+    # break as it happens is the point of a live board, and those tests compare a CLOSE to a
+    # prior range rather than one span to another, so a young bar does not bias them.
+    _h, _l = (hi[:-1], lo[:-1]) if (forming and len(hi) > 8) else (hi, lo)
+    if len(_h) >= 8:
+        _sp = np.array([_h[i:i + 3].max() - _l[i:i + 3].min() for i in range(len(_h) - 2)])
         _typ = float(np.median(_sp[:-1]))
         coil = round(float(_sp[-1]) / _typ, 2) if _typ > 0 else None
     ctx = {"hi": float(hi.max()), "lo": float(lo.min()), "er": round(float(er), 2),

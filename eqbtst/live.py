@@ -1072,9 +1072,14 @@ def mtf_structure(sym: str) -> dict:
     out.update({f"wall{t}": [] for t in _TFS})
     out.update({f"atr{t}": float("nan") for t in _TFS})
 
-    def _set(tf, frame):
-        sf = (indicators.struct_full(frame) if (frame is not None and len(frame) >= 5)
-              else {"struct": "n/a", "n": 0})
+    # Which frames have a bar that has NOT closed yet? Only the intraday ones, and only while
+    # the session is running. 1D/1W come from the EOD archive, which is complete by
+    # construction. The flag reaches only the COIL test (see indicators.struct_full).
+    _live_bar = market_open()
+
+    def _set(tf, frame, forming=False):
+        sf = (indicators.struct_full(frame, forming=forming and _live_bar)
+              if (frame is not None and len(frame) >= 5) else {"struct": "n/a", "n": 0})
         lab = sf["struct"]
         out[tf] = lab
         out[f"b{tf}"] = indicators.band_pct(frame, lab) if lab != "n/a" else float("nan")
@@ -1116,9 +1121,9 @@ def mtf_structure(sym: str) -> dict:
             # is not fixed -- a 1:5 split lands whenever it lands. Adjusting at the source
             # costs one pass per name and makes sr_levels' own pass a verified no-op.
             f = indicators.adjust_corporate_actions(f)
-            _set("15m", f)
+            _set("15m", f, forming=True)
             for lab, freq in (("1h", "60min"), ("2h", "120min"), ("4h", "240min")):
-                _set(lab, _resample_ohlcv(f, freq))
+                _set(lab, _resample_ohlcv(f, freq), forming=True)   # already stub-merged
     except Exception:
         pass
     try:
