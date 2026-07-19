@@ -112,10 +112,10 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
     hs = (htf or {}).get("struct", "n/a")
     ls = (ltf or {}).get("struct", "n/a")
     if hs == "n/a" or (htf or {}).get("n", 0) < 6:
-        return {"tag": "HTF warming", "color": N, "loc": None,
+        return {"tag": "HTF warming", "color": N, "loc": None, "dir": "NONE",
                 "read": "higher timeframe has too few closed bars — no multi-TF read yet."}
     if ls == "n/a":
-        return {"tag": "LTF warming", "color": N, "loc": None,
+        return {"tag": "LTF warming", "color": N, "loc": None, "dir": "NONE",
                 "read": "lower timeframe has too few closed bars — no trigger frame."}
 
     hi, lo = htf.get("hi"), htf.get("lo")
@@ -133,12 +133,12 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
             # stamp "NESTED SQUEEZE" on every quietly sideways name — measured at 85 of 140 on
             # a live board, which makes the tag meaningless. Sideways is not coiled.
             if "CONSOLIDATION" not in (hs, ls):
-                return {"tag": "RANGE-BOUND (no setup)", "color": N, "loc": loc,
+                return {"tag": "RANGE-BOUND (no setup)", "color": N, "loc": loc, "dir": "NONE",
                         "read": "both timeframes are simply oscillating sideways — no trend, no "
                                 "break, and NO volatility contraction. Nothing is loading; this "
                                 "is the default resting state of a stock, not a setup."}
             both = hs == ls == "CONSOLIDATION"
-            return {"tag": "NESTED SQUEEZE", "color": A, "loc": loc,
+            return {"tag": "NESTED SQUEEZE", "color": A, "loc": loc, "dir": "NONE",
                     "read": ("volatility CONTRACTING on both timeframes — the tightest version "
                              "of this setup. " if both else
                              "volatility CONTRACTING on one timeframe while the other stays "
@@ -147,22 +147,22 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
                               "the HTF box high/low, trade the break — do not predict it."}
         if ls == "BREAKOUT_UP":
             if near_hi:
-                return {"tag": "RANGE-TOP BREAK", "color": G, "loc": loc,
+                return {"tag": "RANGE-TOP BREAK", "color": G, "loc": loc, "dir": "UP",
                         "read": "LTF breaking UP at the HTF ceiling — the ONLY location where an "
                                 "LTF breakout can be real. Needs to HOLD above, ideally with "
                                 "volume/delivery confirming, or it snaps back into the box."}
-            return {"tag": "FALSE-BREAK TRAP", "color": R, "loc": loc,
+            return {"tag": "FALSE-BREAK TRAP", "color": R, "loc": loc, "dir": "NONE",
                     "read": "LTF pop UP in the MIDDLE of the HTF range — statistically fades back "
                             "into the box. Do not chase; the HTF HIGH is the line that matters."}
         if ls == "BREAKOUT_DOWN":
             if near_lo:
-                return {"tag": "RANGE-FLOOR BREAK", "color": R, "loc": loc,
+                return {"tag": "RANGE-FLOOR BREAK", "color": R, "loc": loc, "dir": "DOWN",
                         "read": "LTF breaking DOWN at the HTF floor — only here can it be real. "
                                 "Must hold below, else it snaps back up into the range."}
-            return {"tag": "FALSE-BREAK TRAP", "color": R, "loc": loc,
+            return {"tag": "FALSE-BREAK TRAP", "color": R, "loc": loc, "dir": "NONE",
                     "read": "LTF drop in the MIDDLE of the HTF range — statistically reverts. "
                             "Do not chase; the HTF LOW is the line that matters."}
-        return {"tag": "DRIFT-IN-RANGE", "color": N, "loc": loc,
+        return {"tag": "DRIFT-IN-RANGE", "color": N, "loc": loc, "dir": "NONE",
                 "read": "LTF drifting inside the HTF box — noise until it reaches an edge. "
                         "Read the HTF high/low as the only levels that matter."}
 
@@ -171,21 +171,45 @@ def synthesize(htf: dict, ltf: dict, spot: float) -> dict:
     d = "UP" if htf_up else "DOWN"
     if ls in _RANGE_S:
         return {"tag": "WITH-TREND CONTINUATION", "color": G if htf_up else R, "loc": loc,
+                "dir": "UP" if htf_up else "DOWN",
                 "read": f"HTF {d}, LTF coiling — a pullback loading for CONTINUATION. The "
                         f"textbook with-trend setup. Trigger = the LTF breaking {d}; the idea "
                         f"is invalid if it breaks the other way."}
     ltf_up = ls in _TREND_UP_S
     if ltf_up == htf_up:
-        return {"tag": "EXTENDED (aligned)", "color": A, "loc": loc,
+        return {"tag": "EXTENDED (aligned)", "color": A, "loc": loc, "dir": "UP" if htf_up else "DOWN",
                 "read": f"HTF and LTF BOTH {d} — aligned, but late. Entering here is chasing; "
                         f"wait for the LTF to coil (a pullback) instead."}
-    return {"tag": "PULLBACK vs HTF", "color": A, "loc": loc,
+    return {"tag": "PULLBACK vs HTF", "color": A, "loc": loc, "dir": "UP" if htf_up else "DOWN",
             "read": f"LTF {'DOWN' if htf_up else 'UP'} against an HTF {d} — a dip/rally zone "
                     f"WITH the higher-TF trend IF that structure holds; an early REVERSAL "
                     f"warning if the HTF level breaks. Watch the HTF pivot, not the LTF bar."}
 
 
-# Long-side setups (a cash-equity board has no overnight short — proven -EV).
-LONG_TAGS = {"WITH-TREND CONTINUATION", "RANGE-TOP BREAK", "PULLBACK vs HTF"}
+# Setups that argue for a SIDE at all. Everything else is wait/avoid.
+#
+# DIRECTION IS NOT IN THE TAG. "WITH-TREND CONTINUATION" is the textbook setup in EITHER
+# direction — a downtrend coiling for continuation is a SHORT, and the tag reads identically.
+# Splitting long/short on the tag alone therefore served bearish continuations as long
+# candidates (and pullbacks in a downtrend as dip-buys, which is precisely the trade that
+# catches a falling knife). Split on `dir`, which synthesize() now returns explicitly.
+DIRECTIONAL_TAGS = {"WITH-TREND CONTINUATION", "RANGE-TOP BREAK", "RANGE-FLOOR BREAK",
+                    "PULLBACK vs HTF", "EXTENDED (aligned)"}
 AVOID_TAGS = {"FALSE-BREAK TRAP"}
 WAIT_TAGS = {"NESTED SQUEEZE", "DRIFT-IN-RANGE", "RANGE-BOUND (no setup)"}
+
+
+def side_of(tag: str, direction: str) -> str:
+    """LONG / SHORT / — for one row. A setup only takes a side when it is BOTH directional
+    and pointing somewhere; traps and squeezes take none."""
+    if tag in AVOID_TAGS or tag not in DIRECTIONAL_TAGS:
+        return "—"
+    return {"UP": "LONG", "DOWN": "SHORT"}.get(direction, "—")
+
+
+# Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no
+# overnight short — an unsold short must be squared off the same day (delivery you do not own
+# cannot be carried). Anything beyond intraday needs the futures leg, and the overnight short
+# was separately measured -EV in this project. So the short side is a WEAKNESS SCREEN whose
+# execution constraint changes with the horizon, and the UI must say which.
+SHORTABLE_IN_CASH = {"intraday": True, "btst": False, "swing": False, "positional": False}

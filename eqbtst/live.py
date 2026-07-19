@@ -1247,6 +1247,7 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
         return board
     b = board.copy()
     tags, reads, ranks, locs = [], [], [], []
+    dirs, sides = [], []
     for _, r in b.iterrows():
         def _side(tf):
             return {"struct": r.get(f"s{tf}", "n/a"),
@@ -1255,12 +1256,16 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
         s = _mtf_mod.synthesize(_side(htf), _side(ltf), r.get("ltp"))
         tags.append(s["tag"])
         reads.append(s["read"])
+        dirs.append(s.get("dir", "NONE"))
+        sides.append(_mtf_mod.side_of(s["tag"], s.get("dir", "NONE")))
         ranks.append(_mtf_mod.TAG_RANK.get(s["tag"], 9))
         locs.append(round(s["loc"], 2) if s.get("loc") is not None else np.nan)
     b["setup"] = tags
     b["setup_rank"] = ranks
     b["loc"] = locs                      # 0 = at HTF box low, 1 = at HTF box high
     b["setup_read"] = reads
+    b["dir"] = dirs
+    b["side"] = sides
 
     # ── TOUCH-COUNTED S/R for the chosen pair ────────────────────────────────────────
     # The HIGHER frame supplies the levels that matter (a 4h wall outranks a 1h one), but

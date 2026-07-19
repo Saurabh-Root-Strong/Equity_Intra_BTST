@@ -348,6 +348,16 @@ SR_COLS = {
         "res×", format="%d",
         help="How many times price was rejected at that resistance. Same 5+ inversion caveat "
              "as sup×."),
+    "side": st.column_config.TextColumn(
+        "side", width="small",
+        help="Which side the HTF × LTF setup argues for — read off the setup's DIRECTION, "
+             "not its name.\n\n"
+             "This distinction matters: `WITH-TREND CONTINUATION` is the textbook setup in "
+             "EITHER direction. A downtrend coiling for continuation is a **SHORT**, and it "
+             "carries the identical tag to the bullish version. Same for `PULLBACK vs HTF` — "
+             "a pullback inside a downtrend is a short entry, not a dip to buy.\n\n"
+             "**—** = the setup takes no side (squeeze, trap, or sideways). Most of the "
+             "universe sits here most of the time."),
     "at_wall": st.column_config.TextColumn(
         "at wall", width="small",
         help="**LIVE — price is testing a defended level RIGHT NOW** (within 0.15 ATR of a "
@@ -799,10 +809,14 @@ if tf == "Intraday":
             # not of the market. The point of the census is to show what the other 236 names
             # are doing, so you can tell a rare setup from an empty tape.
             _census = light[["setup", "setup_read", "turn₹L", "symbol"]].copy()
-            _keep = {"🎯 Textbook only": {"WITH-TREND CONTINUATION"},
-                     "🟢 Long-side setups": mtf.LONG_TAGS}.get(_setup_f)
-            if _keep is not None:
-                light, _setup_on = light[light["setup"].isin(_keep)], True
+            if _setup_f == "🎯 Textbook only":
+                light, _setup_on = light[light["setup"] == "WITH-TREND CONTINUATION"], True
+            elif _setup_f == "🟢 Long-side setups":
+                # DIRECTION, not tag: a continuation/pullback tag reads identically in a
+                # downtrend, so filtering on the tag alone served short setups as longs.
+                light, _setup_on = light[light["side"] == "LONG"], True
+            elif _setup_f == "🔴 Short-side setups":
+                light, _setup_on = light[light["side"] == "SHORT"], True
             elif _setup_f == "🪤 Exclude traps":
                 light, _setup_on = light[~light["setup"].isin(mtf.AVOID_TAGS)], True
             light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
@@ -811,7 +825,7 @@ if tf == "Intraday":
         filtered = _mtf_filter(after_deliv)
         active = _htf_on or _ltf_on or _setup_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = (["symbol", "sector", "ltp", "turn₹L", "day%"]
-                      + (["setup", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else [])
+                      + (["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else [])
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
@@ -837,11 +851,56 @@ if tf == "Intraday":
                     "raise a **delivery** slider above to select — then the matches get levels, "
                     "RSI and a verdict on your Lower TF. Showing structure + delivery only until "
                     "you filter.")
-            st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
-                         hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS})
-            _tally(len(light), sc["n_scanned"], "names",
-                   "no filter active" if len(light) == sc["n_scanned"]
-                   else "price band is the only cut")
+            _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
+
+            def _side_table(df_, note=None):
+                if df_.empty:
+                    st.caption("No name is on this side right now. That is a reading of the "
+                               "tape, not an error — in a one-way market one side empties.")
+                    return
+                if note:
+                    st.warning(note)
+                st.dataframe(_fmt(df_)[_cols(df_, light_cols)], use_container_width=True,
+                             hide_index=True, column_config=_cfg)
+                _tally(len(df_), sc["n_scanned"], "names")
+
+            # ── LONG / SHORT split by the setup's OWN direction, not by its tag ──────────
+            # Only shown when a horizon preset is active, because without one there is no
+            # HTF x LTF read to take a side from — and inventing a side from a single
+            # timeframe label is how a downtrend gets bought.
+            if _P and "side" in light.columns:
+                _lo = light[light["side"] == "LONG"]
+                _sh = light[light["side"] == "SHORT"]
+                _no = light[light["side"] == "—"]
+                tL, tS, tN = st.tabs([f"🟢 LONG ({len(_lo)})", f"🔴 SHORT ({len(_sh)})",
+                                      f"⚪ No side ({len(_no)})"])
+                with tL:
+                    st.caption("Setups pointing UP: an uptrend coiling for continuation, a break "
+                               "at the top of the higher-TF range, or a pullback INTO an uptrend.")
+                    _side_table(_lo)
+                with tS:
+                    _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
+                    _side_table(_sh, note=(
+                        "⚠ **Intraday only — square off before the close.** Overnight short is "
+                        "proven −EV here (win 20%), and intraday direction has no validated edge "
+                        "either. This is a WEAKNESS SCREEN, not an entry signal."
+                        if _cash_ok else
+                        f"🛑 **You cannot hold this short in CASH.** Indian cash equity has no "
+                        f"overnight short — a short must be squared off the SAME DAY, so the "
+                        f"*{_P['hold']}* horizon is unreachable without the FUTURES leg (these "
+                        f"are all F&O names, so a future exists — different margin, different "
+                        f"risk). Read this list as **names to avoid or exit**, not to short."))
+                with tN:
+                    st.caption("Squeezes, traps and sideways names — the setup takes no side. "
+                               "Most of the universe lives here most of the time, and that is "
+                               "the honest default: no trade.")
+                    _side_table(_no)
+            else:
+                st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
+                             hide_index=True, column_config=_cfg)
+                _tally(len(light), sc["n_scanned"], "names",
+                       "no filter active" if len(light) == sc["n_scanned"]
+                       else "price band is the only cut")
             st.stop()
 
         # ── FILTER FUNNEL — show WHERE names drop, so a 0 is diagnosable (which stage killed
@@ -883,7 +942,7 @@ if tf == "Intraday":
                     "Try a coarser Lower TF.")
             st.stop()
 
-        _sc = ["setup", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else []
+        _sc = ["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else []
         long_cols = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
                      "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",

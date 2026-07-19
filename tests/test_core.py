@@ -576,3 +576,42 @@ def test_live_levels_survive_missing_inputs():
     assert b["headroom"].tolist() == [np.inf, np.inf, np.inf]
     assert (b["at_wall"] == "").all()
     assert live._live_levels(pd.DataFrame()).empty
+
+
+def test_setup_side_is_direction_not_tag():
+    """REGRESSION: setup tags are DIRECTION-BLIND. 'WITH-TREND CONTINUATION' is the textbook
+    setup in either direction — a downtrend coiling for continuation is a SHORT and carries
+    the identical tag. The long-side filter split on the tag, so on a live board it returned
+    15 names of which 8 were actually short setups (53% wrong): bearish continuations served
+    as buys, and pullbacks inside downtrends served as dips to buy."""
+    from eqbtst import mtf
+    up = {"struct": "TREND_UP", "hi": 110.0, "lo": 100.0, "n": 20}
+    dn = {"struct": "TREND_DOWN", "hi": 110.0, "lo": 100.0, "n": 20}
+    coil = {"struct": "CONSOLIDATION", "n": 20}
+    su, sd = mtf.synthesize(up, coil, 105.0), mtf.synthesize(dn, coil, 105.0)
+    assert su["tag"] == sd["tag"] == "WITH-TREND CONTINUATION"      # tag cannot tell them apart
+    assert su["dir"] == "UP" and sd["dir"] == "DOWN"                # direction can
+    assert mtf.side_of(su["tag"], su["dir"]) == "LONG"
+    assert mtf.side_of(sd["tag"], sd["dir"]) == "SHORT"
+    # a pullback inside a DOWNtrend is a short entry, never a dip-buy
+    pb = mtf.synthesize(dn, {"struct": "TREND_UP", "n": 20}, 105.0)
+    assert pb["tag"] == "PULLBACK vs HTF" and mtf.side_of(pb["tag"], pb["dir"]) == "SHORT"
+    # traps and squeezes take no side at all
+    for tag in mtf.AVOID_TAGS | mtf.WAIT_TAGS:
+        assert mtf.side_of(tag, "UP") == "—", tag
+    # every directional outcome must resolve to a side
+    rng = {"struct": "RANGE", "hi": 110.0, "lo": 100.0, "n": 20}
+    for h, l, spot in [(rng, {"struct": "BREAKOUT_UP", "n": 20}, 109.5),
+                       (rng, {"struct": "BREAKOUT_DOWN", "n": 20}, 100.5),
+                       (up, {"struct": "TREND_UP", "n": 20}, 105.0)]:
+        s = mtf.synthesize(h, l, spot)
+        assert mtf.side_of(s["tag"], s["dir"]) in ("LONG", "SHORT"), s["tag"]
+
+
+def test_cash_short_horizons_are_flagged():
+    """Indian cash equity has no overnight short — it must be squared off same day. Only the
+    intraday horizon is reachable in cash; the rest need the futures leg."""
+    from eqbtst import mtf
+    assert mtf.SHORTABLE_IN_CASH["intraday"] is True
+    assert not any(mtf.SHORTABLE_IN_CASH[k] for k in ("btst", "swing", "positional"))
+    assert set(mtf.SHORTABLE_IN_CASH) == set(mtf.PRESET_ORDER)
