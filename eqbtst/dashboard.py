@@ -396,6 +396,32 @@ SR_COLS = {
              "touch only becomes a rejection once price actually turns. Counting the test in "
              "progress would let a level inflate its own strength on the way to breaking.\n\n"
              "Blank = price is not near any multi-touch level."),
+    "short_note": st.column_config.TextColumn(
+        "short evidence", width="medium",
+        help="WHAT THIS SETUP ACTUALLY DID ON THE SHORT SIDE — measured, not reasoned. "
+             "468,661 observations, 2018-2026, the board's own logic replayed causally over "
+             "the archive; the number is 20-day forward return as EXCESS over the universe.
+
+"
+             "A POSITIVE excess on a SHORT means the name ROSE more than the market — the "
+             "short lost. Three of the four directional tags measured that way:
+
+"
+             "• `WITH-TREND CONTINUATION` +0.47% (n=20,220) — a downtrend that COILS is a base "
+             "forming. Shorting it is selling the low.
+"
+             "• `PULLBACK vs HTF` +0.50% (n=753)
+"
+             "• `EXTENDED (aligned)` +1.62% (n=8,906) — the worst. An extended downtrend is an "
+             "oversold name at the END of its decline.
+"
+             "• `RANGE-FLOOR BREAK` −1.09% (n=4,464) — the ONLY one that works short, and the "
+             "smallest bucket.
+
+"
+             "The tab is sorted by THIS, not by chartist setup quality — on the short side that "
+             "ranking is upside down. Note the direction was NOT silently flipped: an inverted "
+             "signal is evidence the logic is wrong, not a free long signal."),
     "headroom": st.column_config.TextColumn(
         "headroom",
         help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, measured in the ATR of "
@@ -945,14 +971,18 @@ if tf == "Intraday":
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
             _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
 
-            def _side_table(df_, note=None):
+            def _side_table(df_, note=None, extra_cols=()):
                 if df_.empty:
                     st.caption("No name is on this side right now. That is a reading of the "
                                "tape, not an error — in a one-way market one side empties.")
                     return
                 if note:
                     st.warning(note)
-                st.dataframe(_fmt(df_)[_cols(df_, light_cols)], use_container_width=True,
+                _c = list(light_cols)
+                for _e in extra_cols:                 # per-side columns (e.g. the short verdict)
+                    if _e in df_.columns and _e not in _c:
+                        _c.insert(_c.index("side") + 1 if "side" in _c else 1, _e)
+                st.dataframe(_fmt(df_)[_cols(df_, _c)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
                 # Denominator = the pool the SIDES were split from, not the raw scan. Quoting
                 # the scan made "3 of 243 (1%)" appear under tabs that summed to 106, implying
@@ -966,8 +996,17 @@ if tf == "Intraday":
             # timeframe label is how a downtrend gets bought.
             if _P and "side" in light.columns:
                 _lo = light[light["side"] == "LONG"]
-                _sh = light[light["side"] == "SHORT"]
                 _no = light[light["side"] == "—"]
+                # THE SHORT SIDE IS RE-SORTED BY WHAT WAS MEASURED, NOT BY TEXTBOOK QUALITY.
+                # setup_rank is a chartist ranking; on the short side it is inverted (see
+                # mtf.SHORT_RANK). Sorting the SHORT tab by it put the tag that measured
+                # +0.47% AGAINST a short at the top of every list, and the one tag that
+                # worked at the bottom.
+                _sh = light[light["side"] == "SHORT"].copy()
+                if not _sh.empty:
+                    _sh["short_note"] = [mtf.short_verdict(t) for t in _sh["setup"]]
+                    _sh["_srank"] = [mtf.SHORT_RANK.get(t, 99) for t in _sh["setup"]]
+                    _sh = _sh.sort_values(["_srank", "turn₹L"], ascending=[True, False])
                 tL, tS, tN = st.tabs([f"🟢 LONG ({len(_lo)})", f"🔴 SHORT ({len(_sh)})",
                                       f"⚪ No side ({len(_no)})"])
                 with tL:
@@ -978,14 +1017,14 @@ if tf == "Intraday":
                     _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
                     _edge = mtf.SHORT_EDGE_BPS.get(preset, 0.0)
                     if _cash_ok:
-                        _side_table(_sh, note=(
+                        _side_table(_sh, extra_cols=("short_note",), note=(
                             "⚠ **Intraday only — square off before the close.** Measured on this "
                             "universe (43,042 down-structure days, 2018–2026): a same-day short "
                             f"earns **{_edge:+.1f}bps** before the ~22bps round-trip cost. That is "
                             "the BEST case on this board and it is still under the cost floor — "
                             "a weakness screen, not an entry signal."))
                     else:
-                        _side_table(_sh, note=(
+                        _side_table(_sh, extra_cols=("short_note",), note=(
                             f"🛑 **This horizon cannot hold a short — twice over.**\n\n"
                             f"**1. Mechanically:** Indian cash equity has no overnight short — it "
                             f"must be squared off the SAME DAY. The *{_P['hold']}* hold is "

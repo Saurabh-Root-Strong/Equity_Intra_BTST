@@ -916,3 +916,42 @@ def test_clear_road_is_rendered_not_blank():
     assert "∞ clear" in src, "infinite headroom must render as an explicit answer"
     m = re.search(r'"headroom": st\.column_config\.(\w+)', src)
     assert m and m.group(1) == "TextColumn", "headroom must be text so ∞ survives to the screen"
+
+
+def test_at_wall_and_the_sr_columns_cannot_contradict():
+    """at_wall deliberately has NO min-distance filter — its job is 'price is ON a level right
+    now'. sup/res applied 0.25*ATR to EVERY wall. So the instant at_wall fired, the level it
+    named was BY CONSTRUCTION excluded from sup/res and the table showed the next level back.
+    Measured: they disagreed on 100% of firings on every preset (28/28, 29/29, 27/27, 31/31),
+    which on screen reads as two columns contradicting each other while the hidden one is the
+    level that matters most. A >=2-touch wall is never a micro-swing, however close it sits."""
+    import pandas as pd
+    from eqbtst import live as _l
+    b = pd.DataFrame([{"ltp": 100.0, "_sr_atr": 4.0,
+                       "_wall_pair": [(99.9, 3, "1h"), (95.0, 2, "4h"), (104.0, 2, "4h")]}])
+    out = _l._live_levels(b)
+    assert out["sup"].iloc[0] == 99.9, "a 3-touch wall 0.025 ATR away is the support, not noise"
+    assert out["sup_t"].iloc[0] == 3
+    assert out["at_wall"].iloc[0].startswith("SUP 99.9"), "at_wall must name that same level"
+
+
+def test_short_side_is_ranked_by_measurement_not_by_textbook():
+    """TAG_RANK is a CHARTIST ranking and on the short side it is inverted. WITH-TREND
+    CONTINUATION is TAG_RANK 0 — the best-looking setup — and measured +0.47% excess against
+    a short (n=20,220): it LOST. RANGE-FLOOR BREAK, the only tag that worked short (-1.09%),
+    sorted BELOW it. On the live board 88/95/100/50% of SHORT names were anti-predictive tags
+    and the top ten rows were 10-of-10 WITH-TREND CONTINUATION on three presets, with the one
+    validated name buried underneath — while the warning box above said 'never short these'.
+    People act on order, not on prose."""
+    from eqbtst import mtf as _m
+    assert _m.SHORT_RANK["RANGE-FLOOR BREAK"] == 0, "the only validated short must sort first"
+    for t in _m.SHORT_ANTI_PREDICTIVE:
+        assert _m.SHORT_RANK[t] > _m.SHORT_RANK["RANGE-FLOOR BREAK"]
+    # ordering must follow the measurement, not the chartist rank
+    ranked = sorted(_m.SHORT_RANK, key=lambda t: _m.SHORT_RANK[t])
+    excess = [_m.SIDE_EXCESS_20D[("SHORT", t)] for t in ranked]
+    assert excess == sorted(excess), "short rank must ascend with measured excess"
+    assert "BACKWARDS" in _m.short_verdict("WITH-TREND CONTINUATION")
+    assert "works short" in _m.short_verdict("RANGE-FLOOR BREAK")
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "SHORT_RANK" in dash, "the SHORT tab must sort by the measured rank"

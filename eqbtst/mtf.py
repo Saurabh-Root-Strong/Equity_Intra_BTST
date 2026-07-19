@@ -307,6 +307,37 @@ SHORT_ANTI_PREDICTIVE = {"EXTENDED (aligned)", "PULLBACK vs HTF", "WITH-TREND CO
 SHORT_VALIDATED = {"RANGE-FLOOR BREAK"}
 
 
+# ── THE SHORT SIDE MUST NOT BE SORTED BY TAG_RANK ────────────────────────────────────
+# TAG_RANK encodes CHARTIST textbook quality, and on the short side the measurement says
+# that ordering is upside down. WITH-TREND CONTINUATION is TAG_RANK 0 -- the best-looking
+# setup on the board -- and it measured +0.47% excess against a short (n=20,220), i.e. it
+# LOST. RANGE-FLOOR BREAK, the only tag that actually worked short (-1.09%), sits at rank 1
+# and therefore sorted BELOW it.
+#
+# On the live board that produced an inverted list: of the SHORT names, 88% / 95% / 100% /
+# 50% were anti-predictive tags (intraday / BTST / swing / positional), and the top TEN rows
+# as sorted were 10 of 10 WITH-TREND CONTINUATION on three of the four presets, with the
+# single validated RANGE-FLOOR BREAK buried underneath. The warning box above the table said
+# "these are names to AVOID, never to short" while the table beneath it ranked the worst ones
+# first -- and people act on order, not on prose.
+#
+# So the SHORT tab sorts by MEASURED short outcome (most negative excess = best short) and
+# every row carries its own verdict. Lower is better, same convention as TAG_RANK.
+SHORT_RANK = {t: i for i, t in enumerate(
+    sorted((t for t in DIRECTIONAL_TAGS if ("SHORT", t) in SIDE_EXCESS_20D),
+           key=lambda t: SIDE_EXCESS_20D[("SHORT", t)]))}
+
+
+def short_verdict(tag: str) -> str:
+    """Per-row honesty marker for the SHORT tab, from the 468,661-observation study."""
+    ex = SIDE_EXCESS_20D.get(("SHORT", tag))
+    if tag in SHORT_VALIDATED:
+        return f"✅ works short ({ex:+.2f}%)"
+    if tag in SHORT_ANTI_PREDICTIVE:
+        return f"⛔ measured BACKWARDS ({ex:+.2f}% = the short lost)"
+    return "— unrated"
+
+
 # Can this horizon actually be SHORTED in the cash segment? No: Indian cash equity has no
 # overnight short — an unsold short must be squared off the same day (delivery you do not own
 # cannot be carried). Anything beyond intraday needs the futures leg, and the overnight short

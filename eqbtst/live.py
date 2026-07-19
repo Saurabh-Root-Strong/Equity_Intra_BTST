@@ -1360,9 +1360,21 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
                 else:
                     merged.append([x, t, x, x, x])
             wl = [(m[0], m[1], "") for m in merged]
-        md = 0.25 * a                                  # ignore micro-swings hugging price
-        below = [(x, t) for x, t, _ in wl if x < px - md]
-        above = [(x, t) for x, t, _ in wl if x > px + md]
+        # THE MIN-DISTANCE FILTER MUST NOT SWALLOW A DEFENDED LEVEL. It exists to stop a
+        # 1-touch micro-swing hugging price from being called "the level" -- fine. But it was
+        # applied to EVERY wall, including multi-touch ones, and at_wall (which deliberately
+        # has NO such filter, because its whole job is "price is ON a level right now") uses
+        # the same list. Result: the instant at_wall fired, the level it named was BY
+        # CONSTRUCTION excluded from the sup/res column, so the table showed the NEXT level
+        # back. Measured: at_wall and sup/res disagreed on 100% of firings, every preset --
+        # 28/28, 29/29, 27/27, 31/31. On screen that reads as two columns contradicting each
+        # other (CROMPTON: "at wall RES 256.77" beside "res 257.83"; PFC: "at wall SUP 404.42"
+        # beside "sup 400.00"), and the hidden one is the level that matters MOST: a wall the
+        # market has defended twice, that price is testing this second. A >=2-touch wall is
+        # never noise, however close it sits, so the filter now applies only to 1-touch pivots.
+        md = 0.25 * a
+        below = [(x, t) for x, t, _ in wl if x < px and (t >= 2 or x < px - md)]
+        above = [(x, t) for x, t, _ in wl if x > px and (t >= 2 or x > px + md)]
         s_ = max(below, key=lambda z: z[0]) if below else (np.nan, 0)
         r_ = min(above, key=lambda z: z[0]) if above else (np.nan, 0)
         sup.append(round(s_[0], 2) if s_[0] == s_[0] else np.nan)
