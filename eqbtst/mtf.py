@@ -74,6 +74,34 @@ PRESETS: dict[str, dict] = {
 }
 PRESET_ORDER = ["intraday", "btst", "swing", "positional"]
 
+# ── HOW PROVISIONAL IS THE READ? (measured, not asserted) ────────────────────────────
+# The trigger bar is still PRINTING, so its label can change until it closes. Measured by
+# replaying a full session on 49 names: at every 15-minute checkpoint both frames were
+# rebuilt from candles TRUNCATED to that instant -- exactly what a scan fired at that moment
+# would have seen -- and the tag re-derived.
+#
+#   preset      distinct tags per name per session    midday tag != closing tag   settles at
+#   Intraday    3-5 for 44 of 49 names                57%                         92% of session
+#   BTST        2-3 for 40 of 49 names                53%                         79% of session
+#   Swing       1 (the daily trigger bar cannot repaint intraday -- the archive has no
+#   Positional   bar for today at all, so these two frames are FIXED all session)
+#
+# Read the Intraday row again: the label does not settle until the session is 92% over,
+# which is when it stops being actionable. That is a structural reason the intraday hunt
+# keeps dying at the cost floor, arrived at from a completely different direction than the
+# cost studies -- you cannot act on a read that will change 3-5 times before the close, and
+# every change is another 22bps round trip. It also means the 15-minute auto-rescan is
+# largely re-reading an unfinished bar rather than resolving new information.
+#
+# The law: the faster the trigger frame, the more PROVISIONAL the tag. Slower presets are
+# steadier not because they are smarter but because their bar has already closed.
+REPAINT = {
+    "intraday":   {"tags_per_session": "3-5", "midday_differs": 57, "settles_pct": 92},
+    "btst":       {"tags_per_session": "2-3", "midday_differs": 53, "settles_pct": 79},
+    "swing":      {"tags_per_session": "1", "midday_differs": 0, "settles_pct": 0},
+    "positional": {"tags_per_session": "1", "midday_differs": 0, "settles_pct": 0},
+}
+
 _TREND_UP_S = {"BREAKOUT_UP", "TREND_UP"}
 _TREND_DN_S = {"BREAKOUT_DOWN", "TREND_DOWN"}
 _RANGE_S = {"CONSOLIDATION", "RANGE"}

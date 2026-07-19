@@ -858,3 +858,37 @@ def test_structure_and_levels_read_the_same_adjusted_series():
     a1 = indicators.adjust_corporate_actions(raw)
     a2 = indicators.adjust_corporate_actions(a1)
     assert np.allclose(a1["close"], a2["close"]), "adjusting twice must not re-scale"
+
+
+def test_failed_quote_chunk_is_counted_not_swallowed():
+    """A /quotes batch is FIFTY names. The old `except: continue` dropped the whole chunk
+    silently, and because PHASE 1 builds rows only from what the quote returned, those names
+    were never rows at all — n_scanned already excluded them, so the board looked complete at
+    a smaller size. Same class as the /history 429 hole, wider blast radius (it is the FIRST
+    fetch, so everything downstream inherits the gap)."""
+    import inspect
+    from eqbtst import live as _l
+    src = inspect.getsource(_l._fetch_quotes)
+    assert "_QUOTE_GAP" in src, "a dropped chunk must be counted"
+    assert "for attempt in" in src, "a dropped chunk must be retried once"
+    scan = inspect.getsource(_l.universe_mtf_scan)
+    assert "n_quote_gap" in scan, "the scan must report the gap to the UI"
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "n_quote_gap" in dash, "the UI must SAY when names are missing entirely"
+
+
+def test_repaint_is_declared_per_preset():
+    """The trigger bar is still printing, so the tag can relabel until it closes — and the
+    board never said so. Measured by replaying whole sessions on 49 names, rebuilding BOTH
+    frames from candles truncated to each 15-minute checkpoint: Intraday passes through 3-5
+    tags per session, its midday tag differs from its closing tag 57% of the time, and it
+    only settles after 92% of the session has elapsed. BTST 2-3 / 53% / 79%. The daily-trigger
+    presets cannot repaint intraday at all. That ordering is the point — the faster the
+    trigger frame, the more provisional the read — so it must not silently invert."""
+    from eqbtst import mtf as _m
+    assert set(_m.REPAINT) == set(_m.PRESETS), "every preset must declare its repaint risk"
+    order = [_m.REPAINT[p]["midday_differs"] for p in _m.PRESET_ORDER]
+    assert order == sorted(order, reverse=True), "repaint risk must fall as the hold lengthens"
+    assert _m.REPAINT["swing"]["midday_differs"] == 0, "a closed daily bar cannot repaint"
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "PROVISIONAL" in dash, "the UI must warn when the tag can still change"

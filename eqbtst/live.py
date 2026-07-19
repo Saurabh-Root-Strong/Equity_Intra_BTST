@@ -153,20 +153,43 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
 
 
 # ── tier 1: batch quotes scan ──────────────────────────────────────────────────
+_QUOTE_GAP: list[int] = [0]        # symbols lost to a failed /quotes chunk on the last call
+
+
 def _fetch_quotes(fy_syms: list[str]) -> dict:
+    """Batch quotes, 50 symbols per request.
+
+    A DROPPED CHUNK IS A DROPPED FIFTY NAMES. The old `except: continue` swallowed a whole
+    batch on any timeout or rate-limit, and those names never reached the board at all --
+    not as 'n/a' rows, but as rows that were never built, so `n_scanned` already excluded
+    them and nothing could flag the loss. Same failure class as the /history 429 hole that
+    cost 20% of the universe: a failure recorded as an answer. It has a wider blast radius
+    here because this is the FIRST fetch -- everything downstream inherits the gap.
+    So: retry once, then COUNT what is still missing so the caller can say so out loud."""
     out: dict = {}
-    for i in range(0, len(fy_syms), 50):                # /quotes caps the batch size
+    missing = 0
+    for i in range(0, len(fy_syms), 50):
         chunk = fy_syms[i:i + 50]
-        try:
-            r = requests.get(config.FYERS_QUOTES_URL,
-                             headers={"Authorization": _auth_header(), "version": "3"},
-                             params={"symbols": ",".join(chunk)}, timeout=8)
-            for it in (r.json().get("d") or []):
-                v = it.get("v") or {}
-                if it.get("n"):
-                    out[it["n"]] = v
-        except Exception:
-            continue
+        got = False
+        for attempt in (0, 1):
+            try:
+                r = requests.get(config.FYERS_QUOTES_URL,
+                                 headers={"Authorization": _auth_header(), "version": "3"},
+                                 params={"symbols": ",".join(chunk)}, timeout=8)
+                d = r.json().get("d") or []
+                if not d:
+                    raise ValueError("empty quote batch")
+                for it in d:
+                    if it.get("n"):
+                        out[it["n"]] = it.get("v") or {}
+                got = True
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.5)                     # one transient blip, not a policy
+        if not got:
+            missing += len(chunk)
+    _QUOTE_GAP[0] = missing
     return out
 
 
@@ -1262,7 +1285,11 @@ def universe_mtf_scan(date=None) -> dict:
            "board": board, "n_scanned": len(rows), "scanned_at": dt.datetime.now(),
            # names whose intraday frames are STILL blank after the retry — they cannot match
            # any intraday structure filter, so the count must be visible, not swallowed.
-           "n_blank_intraday": int(_still)}
+           "n_blank_intraday": int(_still),
+           # names that never even reached PHASE 1 because their /quotes chunk failed. These
+           # are invisible everywhere else -- no row is built, so n_scanned already excludes
+           # them and the board would look complete at a smaller size.
+           "n_quote_gap": int(_QUOTE_GAP[0])}
     if date is None:
         _UNISCAN_CACHE.clear()                  # never hold two buckets of full-universe boards
         _UNISCAN_CACHE[key] = out

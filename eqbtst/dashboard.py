@@ -586,6 +586,14 @@ if tf == "Intraday":
                    + ("  ·  🔄 auto-refresh ON (next 15-min close)" if auto_struct else ""))
         # A name with no intraday candles cannot match ANY intraday structure filter — it just
         # disappears. Say how many, so the board is never silently answering from a subset.
+        # A failed /quotes chunk removes FIFTY names before a single row is built, so
+        # n_scanned already excludes them and the board looks complete at a smaller size.
+        _qg = sc.get("n_quote_gap", 0)
+        if _qg:
+            st.error(f"⚠ **{_qg} names are MISSING from this scan entirely** — their quote "
+                     f"batch failed twice (broker timeout or rate-limit). They are not `—` "
+                     f"rows; no row exists for them at all, so every count and filter on this "
+                     f"page is answering from a smaller universe. ↻ re-scan.")
         _nb = sc.get("n_blank_intraday", 0)
         if _nb:
             st.caption(f"⚠ **{_nb}** of {sc['n_scanned']} names have no intraday candles (broker "
@@ -718,6 +726,25 @@ if tf == "Intraday":
                       "MIDDLE of the higher-TF box — statistically fades).\n\n"
                       "Rows sort best-setup-first regardless."))
             st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
+            # HOW PROVISIONAL IS THIS TAG? A forming trigger bar can relabel until it closes,
+            # and the board never said so. Measured per preset (see mtf.REPAINT) rather than
+            # hand-waved, because the answer differs by an order of magnitude across the four.
+            _rp = mtf.REPAINT.get(preset or "", {})
+            if _rp and _rp.get("midday_differs"):
+                st.caption(
+                    f"🔄 **This read is PROVISIONAL — the {_P['ltf']} trigger bar is still "
+                    f"printing.** Replaying full sessions: a name passes through "
+                    f"**{_rp['tags_per_session']} different setup tags** in one session, the "
+                    f"midday tag differs from the closing tag **{_rp['midday_differs']}% of "
+                    f"the time**, and the label only settles after **{_rp['settles_pct']}% of "
+                    f"the session has elapsed**. Treat it as a running commentary, not a "
+                    f"decision — and remember each change of mind is another ~22bps round trip.")
+            elif _rp:
+                st.caption(
+                    f"🔒 **This read is FIXED for the session** — the {_P['ltf']} trigger bar "
+                    f"is a closed daily bar from the archive, so nothing here can repaint "
+                    f"intraday. It also means it does NOT see today's session; only `ltp`, "
+                    f"`loc` and the live levels move.")
         fc1, fc2, fc3, fc4 = st.columns(4)
         f_htf = fc1.selectbox("Higher TF", [_NONE, "1h", "2h", "4h", "1D", "1W"], index=3,
                               key="mtf_htf", disabled=bool(_P),
