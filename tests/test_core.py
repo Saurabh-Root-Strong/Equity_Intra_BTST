@@ -1096,3 +1096,25 @@ def test_only_live_intraday_frames_are_marked_forming():
     assert 'forming=True' in src
     i1d = src.find('_set("1D"')
     assert i1d > 0 and "forming" not in src[i1d:i1d + 120], "the daily frame is never forming"
+
+
+def test_the_structure_explainer_matches_the_code():
+    """The "how structure is computed" panel is the page's own documentation, and it had drifted
+    from the code it describes: it still said the fetch was 20 calendar days (it is 60), that 1h
+    gives ~6.5 bars/day and 2h ~3.5 (the session-stub merge makes them exactly 6 and 3), and it
+    defined the coil as "3-bar range < 60% of the prior range" — which is the ORIGINAL BUG, a
+    short window compared against a long one, fixed long ago. It also omitted 15m entirely, the
+    trigger frame of the Intraday preset. Documentation that contradicts the code is worse than
+    none: it is believed."""
+    from eqbtst import live as _l
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.find("How structure is computed")
+    assert i > 0
+    blk = src[i:i + 6000]
+    assert f"{_l._MTF_FETCH_DAYS} calendar days" in blk, "fetch window must match _MTF_FETCH_DAYS"
+    assert "| **15m** |" in blk, "the Intraday preset's trigger frame must appear in the table"
+    # NSE 09:15-15:30 is 375 min; after folding the trailing stub these are exact, not approx
+    for frame, per_day in (("1h", 6), ("2h", 3), ("4h", 2), ("15m", 25)):
+        assert f"| **{frame}** | {per_day} " in blk, f"{frame} must say {per_day} bars/day"
+    assert "median" in blk, "the coil must be defined against the MEDIAN span, not 'the prior range'"
+    assert "ignores the bar still forming" in blk, "the live coil rule must be documented"
