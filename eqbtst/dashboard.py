@@ -113,7 +113,7 @@ LIVE_COLS = {
     "entered": st.column_config.TextColumn("entered", help="WHEN THE TRADE TRIGGERED — the wall-clock time (5-min resolution) the footprint FIRST fired today, INDEPENDENT of the timeframe you picked. If it fires at 12:30 while the 4h candle (09:15→13:15) is still forming, this reads 12:30 — not 09:15 or 13:15. The timeframe governs the structure/RSI/levels lens; the trigger is a clock event. (Qualification time, NOT the candle/scan timestamp.) Replay & the timeframe scans compute it CAUSALLY — the HH:MM the footprint first FORMED (up ≥1% AND closing the running session in the top of its range AND above session VWAP). The Live 5s snapshot has no intraday bars, so there it is FIRST-SEEN — the wall-clock time our scanner first saw the name qualify (accurate if the board ran from the open; later if you started the dashboard mid-session). Earlier + still holding = footprint persisted = higher conviction; just entered near the close = fresher/less proven. A DASH (—) means the validated footprint has NOT fired for this name today — it is in the timeframe list because it passed the (unvalidated) tf verdict, not because it formed the BTST footprint. Most often it is the VOLUME leg that fails: a name can be up 2.5%, closing strong and above VWAP on merely ordinary volume — price without participation is not accumulation. Those rejected names were measured over 8 years: 1,235 of them, worth −0.1bps. A coin flip. The dash is the signal protecting you from a chart pattern that pays nothing."),
     "time": st.column_config.TextColumn("time", help="The candle the signal is on, as open→close (e.g. 13:15-15:15 = the 2h candle spanning 13:15 to 15:15). IMPORTANT: an intraday signal only CONFIRMS at the candle's CLOSE — during a live session the current candle is still forming and the signal can repaint until it closes. Live snapshot = scan time; replay = last bar at/before your cut."),
     "sector": st.column_config.TextColumn("sector", help="Canonical sector — used for the concentration cap (≤2 names/sector, so many longs in one sector aren't one macro bet)."),
-    "ltp": st.column_config.NumberColumn("ltp", help="Last-traded price (Fyers) — LIVE, refreshed every 5s on every tab (one batch quote). In the TIMEFRAME tables a two-tier refresh runs: the price and everything cheap that hangs off it (day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the LONG/AVOID verdict itself) all re-derive on the live price every 5s. Only the CANDLE-derived columns (structure, RSI, tone) stay as-of the last scan — they need ~70 /history calls and only change when a BAR CLOSES anyway (on 4h, twice a day). Their age is stamped above the table; ↻ refresh to re-pull the candles.", format="%.2f"),
+    "ltp": st.column_config.NumberColumn("ltp", help="Last-traded price (Fyers) — LIVE, refreshed every 5s from one batch quote, on the live-snapshot board AND on the structure-scan tabs. In the TIMEFRAME tables a two-tier refresh runs: the price and everything cheap that hangs off it (day%, RS%, bar_clr, vs_vwap%, entry/stop/T1/T2, and the LONG/AVOID verdict itself) all re-derive on the live price every 5s. Only the CANDLE-derived columns (structure, RSI, tone) stay as-of the last scan — they need ~70 /history calls and only change when a BAR CLOSES anyway (on 4h, twice a day). Their age is stamped above the table; ↻ refresh to re-pull the candles.", format="%.2f"),
     "day%": st.column_config.NumberColumn("day%", help="Return vs previous close. The signal wants demand in control (≥ +1%).", format="%.2f"),
     "s15m": st.column_config.TextColumn("15m", help="Structure on 15-MINUTE bars (Kaufman efficiency over the last ~20 bars ≈ 5 hours). The fastest, noisiest frame — repaints until each 15m bar closes. Computed from one 15-min fetch (~20 days), NOT a separate API call per timeframe."),
     "s1h": st.column_config.TextColumn("1h", help="Structure on 1-HOUR bars (~20 bars ≈ 3 sessions), resampled locally from the same 15-min fetch. Includes today's forming bar → can repaint until it closes."),
@@ -1042,101 +1042,119 @@ if tf == "Intraday":
             # HTF x LTF read to take a side from — and inventing a side from a single
             # timeframe label is how a downtrend gets bought.
             if _P and "side" in light.columns:
-                # THE LONG SIDE IS RE-SORTED BY HOLD TOO. Measured: RANGE-TOP BREAK is the
-                # best OVERNIGHT long (+32.1bps excess, 9 of 9 years) and the WORST 5-day one
-                # (-24.7, and negative in absolute terms). WITH-TREND CONTINUATION is its
-                # mirror. TAG_RANK ranks continuation first, which is right for Swing and
-                # Positional and backwards for BTST.
-                _lo = light[light["side"] == "LONG"].copy()
-                if not _lo.empty:
-                    _lo["long_note"] = [mtf.long_verdict(t, preset) for t in _lo["setup"]]
-                    _lo["_lrank"] = [mtf.long_rank(t, preset) for t in _lo["setup"]]
-                    _lo = _lo.sort_values(["_lrank", "turn₹L"], ascending=[True, False])
-                _no = light[light["side"] == "—"]
-                # THE SHORT SIDE IS RE-SORTED BY WHAT WAS MEASURED, NOT BY TEXTBOOK QUALITY.
-                # setup_rank is a chartist ranking; on the short side it is inverted (see
-                # mtf.SHORT_RANK). Sorting the SHORT tab by it put the tag that measured
-                # +0.47% AGAINST a short at the top of every list, and the one tag that
-                # worked at the bottom.
-                _sh = light[light["side"] == "SHORT"].copy()
-                if not _sh.empty:
-                    _sh["short_note"] = [mtf.short_verdict(t, preset) for t in _sh["setup"]]
-                    _sh["_srank"] = [mtf.short_rank(t, preset) for t in _sh["setup"]]
-                    _sh = _sh.sort_values(["_srank", "turn₹L"], ascending=[True, False])
-                tL, tS, tN = st.tabs([f"🟢 LONG ({len(_lo)})", f"🔴 SHORT ({len(_sh)})",
-                                      f"⚪ No side ({len(_no)})"])
-                with tL:
-                    st.caption("Setups pointing UP: an uptrend coiling for continuation, a break "
-                               "at the top of the higher-TF range, or a pullback INTO an uptrend.")
-                    _side_table(_lo, extra_cols=("long_note",))
-                with tS:
-                    _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
-                    _edge = mtf.SHORT_EDGE_BPS.get(preset, 0.0)
-                    if _cash_ok:
-                        _side_table(_sh, extra_cols=("short_note",), note=(
-                            "⚠ **Intraday only — square off before the close.** Measured on this "
-                            "universe (43,042 down-structure days, 2018–2026): a same-day short "
-                            f"earns **{_edge:+.1f}bps** before the ~22bps round-trip cost. That is "
-                            "the BEST case on this board and it is still under the cost floor — "
-                            "a weakness screen, not an entry signal."))
-                    else:
-                        _side_table(_sh, extra_cols=("short_note",), note=(
-                            f"🛑 **This horizon cannot hold a short — twice over.**\n\n"
-                            f"**1. Mechanically:** Indian cash equity has no overnight short — it "
-                            f"must be squared off the SAME DAY. The *{_P['hold']}* hold is "
-                            f"unreachable in cash. These are all F&O names so a stock FUTURE "
-                            f"exists, but that is a different instrument: margin, lot size, "
-                            f"expiry and rollover.\n\n"
-                            f"**2. Economically — the part that matters more:** measured over "
-                            f"43,042 down-structure days, a short held to this horizon earns "
-                            f"**{_edge:+.1f}bps BEFORE costs.** The downtrend is real but it is an "
-                            f"INTRADAY move (−4.4bps in-session); overnight the same names gap "
-                            f"**+10.8bps AGAINST a short**, and only 32.5% of nights gap down at "
-                            f"all. The overnight gap that IS the long edge here is a nightly toll "
-                            f"for a short — with a tail that runs +438bps in the worst 1%.\n\n"
-                            f"Read this list as **names to AVOID or EXIT**, never to short."))
-                    # PER-TAG EVIDENCE. The horizon warning above is about the INSTRUMENT;
-                    # this is about the SETUP itself, and it is the more damaging result.
+                # ── PRICE TICKS HERE TOO, 5s, WHILE STRUCTURE STAYS PINNED ────────────────
+                # These tabs are what the board opens on, and they had no fragment at all: the
+                # ltp column was frozen at scan time while its own tooltip promised "LIVE,
+                # refreshed every 5s on every tab". One batch quote re-prices the whole board
+                # (243 names = 5 /quotes requests, not 243 /history), then add_setup re-derives
+                # everything that is a FUNCTION of price — loc, the setup tag, the side, and the
+                # nearest support/resistance/headroom. The 20-bar boxes, wall lists and ATRs are
+                # untouched: those only change when a BAR closes, which is what ↻ is for.
+                @st.fragment(run_every="5s")
+                def _side_tabs(base=light):
+                    light_live = base
+                    if live.market_open():
+                        _re = live.refresh_light_prices(base)
+                        light_live = live.add_setup(_re, ltf=_P["ltf"], htf=_P["htf"])
+                        st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure & "
+                                   f"walls pinned at {_sa:%H:%M}" if _sa else "💹 prices live")
+                    light = light_live
+                    # THE LONG SIDE IS RE-SORTED BY HOLD TOO. Measured: RANGE-TOP BREAK is the
+                    # best OVERNIGHT long (+32.1bps excess, 9 of 9 years) and the WORST 5-day one
+                    # (-24.7, and negative in absolute terms). WITH-TREND CONTINUATION is its
+                    # mirror. TAG_RANK ranks continuation first, which is right for Swing and
+                    # Positional and backwards for BTST.
+                    _lo = light[light["side"] == "LONG"].copy()
+                    if not _lo.empty:
+                        _lo["long_note"] = [mtf.long_verdict(t, preset) for t in _lo["setup"]]
+                        _lo["_lrank"] = [mtf.long_rank(t, preset) for t in _lo["setup"]]
+                        _lo = _lo.sort_values(["_lrank", "turn₹L"], ascending=[True, False])
+                    _no = light[light["side"] == "—"]
+                    # THE SHORT SIDE IS RE-SORTED BY WHAT WAS MEASURED, NOT BY TEXTBOOK QUALITY.
+                    # setup_rank is a chartist ranking; on the short side it is inverted (see
+                    # mtf.SHORT_RANK). Sorting the SHORT tab by it put the tag that measured
+                    # +0.47% AGAINST a short at the top of every list, and the one tag that
+                    # worked at the bottom.
+                    _sh = light[light["side"] == "SHORT"].copy()
                     if not _sh.empty:
-                        _anti = _sh[_sh["setup"].isin(mtf.SHORT_ANTI_PREDICTIVE)]
-                        _ok = _sh[_sh["setup"].isin(mtf.SHORT_VALIDATED)]
-                        st.error(
-                            f"🔬 **{len(_anti)} of these {len(_sh)} names sit on a setup measured "
-                            f"ANTI-PREDICTIVE on the short side.** Reconstructing this exact "
-                            f"pipeline over 468,661 observations (2018–2026), shorts "
-                            f"OUTPERFORMED the universe by +0.57% over 20 days — the side is "
-                            f"inverted, not merely weak.\n\n"
-                            f"Per setup (excess vs market; **positive = the short LOST**):\n"
-                            f"• ⚠️ EXTENDED (aligned) **+1.62%** — an extended downtrend is an "
-                            f"OVERSOLD name; shorting it is selling the low\n"
-                            f"• ↩️ PULLBACK vs HTF **+0.50%**\n"
-                            f"• 🎯 WITH-TREND CONTINUATION **+0.47%** — a downtrend that COILS is "
-                            f"a base forming, not a continuation\n"
-                            f"• 🔻 RANGE-FLOOR BREAK **−1.09%** — the only short setup that "
-                            f"worked ({len(_ok)} here now)\n\n"
-                            f"In a structurally rising market, most 'bearish' structure is a "
-                            f"bottoming pattern.")
-                    st.caption("Short P&L by hold, before the ~22bps cost floor (measured, "
-                               "n=43,042): intraday **+4.4bps** · overnight **−5.1** · 5-day "
-                               "**−13.6**. It decays monotonically with hold length — the exact "
-                               "opposite of the long side, where a longer horizon amortises cost.")
-                with tN:
-                    # A DATA GAP IS NOT A MARKET READING. Names whose intraday candles failed
-                    # come back "HTF warming" and would otherwise sit here indistinguishable
-                    # from names the tape genuinely has nothing to say about. Measured: 34 of
-                    # 243 on the intraday-frame presets, and 0 on positional — the archive
-                    # feeds 1D/1W, so the gap is frame-specific, not name-specific.
-                    _warm = int(_no["setup"].astype(str).str.contains("warming").sum())
-                    st.caption("Squeezes, traps and sideways names — the setup takes no side. "
-                               "Most of the universe lives here most of the time, and that is "
-                               "the honest default: no trade.")
-                    if _warm:
-                        st.info(f"⏳ **{_warm} of these {len(_no)} are UNREADABLE, not neutral** "
-                                f"— no candles came back for the {_P['ltf']}/{_P['htf']} frames "
-                                f"(broker rate-limit), so they could not be judged either way. "
-                                f"↻ refresh retries them. The **Positional** horizon reads "
-                                f"1D/1W from the EOD archive and can judge all of them.")
-                    _side_table(_no)
+                        _sh["short_note"] = [mtf.short_verdict(t, preset) for t in _sh["setup"]]
+                        _sh["_srank"] = [mtf.short_rank(t, preset) for t in _sh["setup"]]
+                        _sh = _sh.sort_values(["_srank", "turn₹L"], ascending=[True, False])
+                    tL, tS, tN = st.tabs([f"🟢 LONG ({len(_lo)})", f"🔴 SHORT ({len(_sh)})",
+                                          f"⚪ No side ({len(_no)})"])
+                    with tL:
+                        st.caption("Setups pointing UP: an uptrend coiling for continuation, a break "
+                                   "at the top of the higher-TF range, or a pullback INTO an uptrend.")
+                        _side_table(_lo, extra_cols=("long_note",))
+                    with tS:
+                        _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
+                        _edge = mtf.SHORT_EDGE_BPS.get(preset, 0.0)
+                        if _cash_ok:
+                            _side_table(_sh, extra_cols=("short_note",), note=(
+                                "⚠ **Intraday only — square off before the close.** Measured on this "
+                                "universe (43,042 down-structure days, 2018–2026): a same-day short "
+                                f"earns **{_edge:+.1f}bps** before the ~22bps round-trip cost. That is "
+                                "the BEST case on this board and it is still under the cost floor — "
+                                "a weakness screen, not an entry signal."))
+                        else:
+                            _side_table(_sh, extra_cols=("short_note",), note=(
+                                f"🛑 **This horizon cannot hold a short — twice over.**\n\n"
+                                f"**1. Mechanically:** Indian cash equity has no overnight short — it "
+                                f"must be squared off the SAME DAY. The *{_P['hold']}* hold is "
+                                f"unreachable in cash. These are all F&O names so a stock FUTURE "
+                                f"exists, but that is a different instrument: margin, lot size, "
+                                f"expiry and rollover.\n\n"
+                                f"**2. Economically — the part that matters more:** measured over "
+                                f"43,042 down-structure days, a short held to this horizon earns "
+                                f"**{_edge:+.1f}bps BEFORE costs.** The downtrend is real but it is an "
+                                f"INTRADAY move (−4.4bps in-session); overnight the same names gap "
+                                f"**+10.8bps AGAINST a short**, and only 32.5% of nights gap down at "
+                                f"all. The overnight gap that IS the long edge here is a nightly toll "
+                                f"for a short — with a tail that runs +438bps in the worst 1%.\n\n"
+                                f"Read this list as **names to AVOID or EXIT**, never to short."))
+                        # PER-TAG EVIDENCE. The horizon warning above is about the INSTRUMENT;
+                        # this is about the SETUP itself, and it is the more damaging result.
+                        if not _sh.empty:
+                            _anti = _sh[_sh["setup"].isin(mtf.SHORT_ANTI_PREDICTIVE)]
+                            _ok = _sh[_sh["setup"].isin(mtf.SHORT_VALIDATED)]
+                            st.error(
+                                f"🔬 **{len(_anti)} of these {len(_sh)} names sit on a setup measured "
+                                f"ANTI-PREDICTIVE on the short side.** Reconstructing this exact "
+                                f"pipeline over 468,661 observations (2018–2026), shorts "
+                                f"OUTPERFORMED the universe by +0.57% over 20 days — the side is "
+                                f"inverted, not merely weak.\n\n"
+                                f"Per setup (excess vs market; **positive = the short LOST**):\n"
+                                f"• ⚠️ EXTENDED (aligned) **+1.62%** — an extended downtrend is an "
+                                f"OVERSOLD name; shorting it is selling the low\n"
+                                f"• ↩️ PULLBACK vs HTF **+0.50%**\n"
+                                f"• 🎯 WITH-TREND CONTINUATION **+0.47%** — a downtrend that COILS is "
+                                f"a base forming, not a continuation\n"
+                                f"• 🔻 RANGE-FLOOR BREAK **−1.09%** — the only short setup that "
+                                f"worked ({len(_ok)} here now)\n\n"
+                                f"In a structurally rising market, most 'bearish' structure is a "
+                                f"bottoming pattern.")
+                        st.caption("Short P&L by hold, before the ~22bps cost floor (measured, "
+                                   "n=43,042): intraday **+4.4bps** · overnight **−5.1** · 5-day "
+                                   "**−13.6**. It decays monotonically with hold length — the exact "
+                                   "opposite of the long side, where a longer horizon amortises cost.")
+                    with tN:
+                        # A DATA GAP IS NOT A MARKET READING. Names whose intraday candles failed
+                        # come back "HTF warming" and would otherwise sit here indistinguishable
+                        # from names the tape genuinely has nothing to say about. Measured: 34 of
+                        # 243 on the intraday-frame presets, and 0 on positional — the archive
+                        # feeds 1D/1W, so the gap is frame-specific, not name-specific.
+                        _warm = int(_no["setup"].astype(str).str.contains("warming").sum())
+                        st.caption("Squeezes, traps and sideways names — the setup takes no side. "
+                                   "Most of the universe lives here most of the time, and that is "
+                                   "the honest default: no trade.")
+                        if _warm:
+                            st.info(f"⏳ **{_warm} of these {len(_no)} are UNREADABLE, not neutral** "
+                                    f"— no candles came back for the {_P['ltf']}/{_P['htf']} frames "
+                                    f"(broker rate-limit), so they could not be judged either way. "
+                                    f"↻ refresh retries them. The **Positional** horizon reads "
+                                    f"1D/1W from the EOD archive and can judge all of them.")
+                        _side_table(_no)
+                _side_tabs()
             else:
                 st.dataframe(_fmt(light)[_cols(light, light_cols)], use_container_width=True,
                              hide_index=True, column_config=_cfg)

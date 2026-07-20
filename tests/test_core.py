@@ -1118,3 +1118,27 @@ def test_the_structure_explainer_matches_the_code():
         assert f"| **{frame}** | {per_day} " in blk, f"{frame} must say {per_day} bars/day"
     assert "median" in blk, "the coil must be defined against the MEDIAN span, not 'the prior range'"
     assert "ignores the bar still forming" in blk, "the live coil rule must be documented"
+
+
+def test_the_structure_tabs_actually_tick():
+    """The LONG/SHORT/No-side tabs are what the structure board OPENS on, and they had no
+    fragment at all — the ltp column sat frozen at scan time while its own tooltip promised
+    "LIVE, refreshed every 5s on every tab". Measured after wiring: 196 of 243 prices moved
+    within 6 seconds, `loc` re-derived on 79 names and the nearest support/resistance on 17,
+    while the setup tag changed on 0 — which is the point. Price and everything that is a
+    FUNCTION of price ticks; the 20-bar boxes, wall lists and ATRs stay pinned until a bar
+    closes, because that is the only thing that can change them."""
+    import inspect
+    from eqbtst import live as _l
+    assert hasattr(_l, "refresh_light_prices"), "the structure lane needs a price refresh"
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.find("def _side_tabs")
+    assert i > 0, "the side tabs must live in a fragment"
+    assert 'run_every="5s"' in src[max(0, i - 400):i], "the tabs fragment must tick at 5s"
+    body = src[i:i + 900]
+    assert "refresh_light_prices" in body and "add_setup" in body, \
+        "the tick must re-price AND re-derive loc/side/levels from the new price"
+    # one batch quote, not a re-scan: the expensive half must stay pinned
+    assert "universe_mtf_scan" not in body, "a 5s tick must never trigger a full re-scan"
+    # and the quote fetch must be concurrent, since it now runs on a 5-second loop
+    assert "ThreadPoolExecutor" in inspect.getsource(_l._fetch_quotes)

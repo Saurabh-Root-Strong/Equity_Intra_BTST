@@ -166,11 +166,9 @@ def _fetch_quotes(fy_syms: list[str]) -> dict:
     cost 20% of the universe: a failure recorded as an answer. It has a wider blast radius
     here because this is the FIRST fetch -- everything downstream inherits the gap.
     So: retry once, then COUNT what is still missing so the caller can say so out loud."""
-    out: dict = {}
-    missing = 0
-    for i in range(0, len(fy_syms), 50):
-        chunk = fy_syms[i:i + 50]
-        got = False
+    chunks = [fy_syms[i:i + 50] for i in range(0, len(fy_syms), 50)]
+
+    def _one(chunk: list[str]) -> tuple[dict, int]:
         for attempt in (0, 1):
             try:
                 r = requests.get(config.FYERS_QUOTES_URL,
@@ -179,16 +177,26 @@ def _fetch_quotes(fy_syms: list[str]) -> dict:
                 d = r.json().get("d") or []
                 if not d:
                     raise ValueError("empty quote batch")
-                for it in d:
-                    if it.get("n"):
-                        out[it["n"]] = it.get("v") or {}
-                got = True
-                break
+                return ({it["n"]: (it.get("v") or {}) for it in d if it.get("n")}, 0)
             except Exception:
                 if attempt == 0:
                     time.sleep(0.5)                     # one transient blip, not a policy
-        if not got:
-            missing += len(chunk)
+        return ({}, len(chunk))
+
+    # CONCURRENT, because this now runs on a 5-SECOND LOOP. The chunks are independent GETs
+    # and each costs ~0.65s, so serially the whole universe took 3.3s -- two thirds of the
+    # refresh interval spent waiting, for a call that is only 5 requests wide. Bounded to the
+    # chunk count (at most 6 for ~270 names), which is nowhere near the /quotes budget.
+    out: dict = {}
+    missing = 0
+    if len(chunks) == 1:
+        out, missing = _one(chunks[0])
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(6, len(chunks))) as ex:
+            for got, miss in ex.map(_one, chunks):
+                out.update(got)
+                missing += miss
     _QUOTE_GAP[0] = missing
     return out
 
@@ -1399,6 +1407,40 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
     b["sup"], b["sup_t"] = sup, sup_t
     b["res"], b["res_t"] = res, res_t
     b["headroom"], b["at_wall"] = head, at_w
+    return b
+
+
+def refresh_light_prices(board: pd.DataFrame) -> pd.DataFrame:
+    """Re-price a STRUCTURE-SCAN board from one batch quote. Structure stays pinned.
+
+    The structure lane's own docstrings describe a two-tier refresh -- the expensive half
+    (bars, structure) moves only when a bar closes, the cheap half (price and everything
+    derived from it) moves every tick. That was wired for the ENRICHED table and for the live
+    snapshot, but NOT for the LONG/SHORT tabs the board opens on, which had no fragment at
+    all. Those tabs were therefore a still photograph while the ltp column's own tooltip
+    promised "LIVE, refreshed every 5s on every tab".
+
+    Cost is one batch quote for the whole board -- 243 names is 5 requests on /quotes, not
+    243 on /history -- so this is cheap enough to run every 5 seconds. Everything the scan
+    carried (the 20-bar boxes, the wall lists, the ATRs) is untouched and stays pinned; the
+    caller re-runs add_setup afterwards so `loc`, the setup tag, the side and the live levels
+    all re-derive from the new price, which is exactly what they are functions of."""
+    if board is None or board.empty or "symbol" not in board.columns:
+        return board
+    q = _fetch_quotes([fy_symbol(s) for s in board["symbol"]])
+    if not q:
+        return board                                  # a missed quote must not blank the board
+    b = board.copy()
+    ltp, day = [], []
+    for _, r in b.iterrows():
+        v = q.get(fy_symbol(r["symbol"])) or {}
+        px = v.get("lp")
+        if not px:
+            ltp.append(r.get("ltp")); day.append(r.get("day%")); continue
+        pc = v.get("prev_close_price") or r.get("_pc")
+        ltp.append(round(float(px), 2))
+        day.append(round(100 * (float(px) / float(pc) - 1), 2) if pc else r.get("day%"))
+    b["ltp"], b["day%"] = ltp, day
     return b
 
 
