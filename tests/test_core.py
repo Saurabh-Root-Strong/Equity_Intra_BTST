@@ -1142,3 +1142,43 @@ def test_the_structure_tabs_actually_tick():
     assert "universe_mtf_scan" not in body, "a 5s tick must never trigger a full re-scan"
     # and the quote fetch must be concurrent, since it now runs on a 5-second loop
     assert "ThreadPoolExecutor" in inspect.getsource(_l._fetch_quotes)
+
+
+def test_sr_tolerance_lets_touch_counts_accumulate():
+    """The touch count IS the value of the S/R feature — "how many times price rejected here".
+    The old tol=0.2*ATR was tighter than a single day's range, so two rejections a week apart
+    at what a chartist calls ONE level almost never landed within tolerance: measured 67% of
+    all levels came out 1-touch, i.e. the count never accumulated. A human reads a level as a
+    zone ~2-3% wide (≈0.6-1.0 ATR on a daily frame), not 0.2. Reproduces the MOTILALOFS case
+    the user drew by hand: three swing lows ~1% apart that the eye calls one support."""
+    import numpy as np, pandas as pd
+    from eqbtst import indicators, config
+    assert 0.4 <= config.SR_TOL_ATR <= 1.0, "the zone must be a chartist's width, not a hair"
+    assert config.SR_LOOKBACK >= 50, "levels persist longer than the 20-bar regime window"
+    # A FLAT base ~845 (so the ONLY swing lows are the three we plant), rejecting three times
+    # at 812 / 816 / 820 — half an ATR apart, exactly what the eye calls one support zone.
+    rows = [{"ts": pd.Timestamp("2026-05-01") + pd.Timedelta(days=i),
+             "open": 845, "high": 852, "low": 838, "close": 845, "volume": 1000}
+            for i in range(60)]
+    for k, px in ((12, 812.0), (30, 816.0), (48, 820.0)):
+        rows[k] = {**rows[k], "low": px, "high": px + 6, "close": px + 3}
+    c = pd.DataFrame(rows)
+    tight = indicators.sr_levels(c, spot=880.0, tol_atr=0.2)
+    wide = indicators.sr_levels(c, spot=880.0)             # config default (0.6)
+    def touches_near(sr, target):
+        return max((t for x, t in sr.get("levels", []) if abs(x - target) <= 12), default=0)
+    assert touches_near(tight, 816) == 1, "at 0.2 ATR the three touches stay split (the bug)"
+    assert touches_near(wide, 816) == 3, "at the chartist width they are one 3-touch wall"
+
+
+def test_both_clustering_sites_share_one_tolerance():
+    """sr_levels clusters pivots into walls; live._live_levels re-clusters the merged HTF+LTF
+    list against live price. If they used different tolerances the second would re-split what
+    the first merged, and the displayed touch count would silently disagree with the wall list
+    it was computed from. Both must read config.SR_TOL_ATR."""
+    import inspect
+    from eqbtst import live as _l, indicators
+    assert "config.SR_TOL_ATR" in inspect.getsource(_l._live_levels)
+    src = inspect.getsource(indicators.sr_levels)
+    assert "config.SR_TOL_ATR" in src and "config.SR_LOOKBACK" in src
+    assert "tol_atr: float = 0.2" not in src, "the old hardcoded 0.2 default must be gone"

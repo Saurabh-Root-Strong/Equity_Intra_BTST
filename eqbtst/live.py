@@ -1361,10 +1361,12 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
             # The anchor -- the price displayed -- stays the strongest member, because that is
             # the level the market actually defended. Touches are still MAXed, never summed:
             # the two frames resample ONE price series, so the same swing appears in both.
+            _tol = config.SR_TOL_ATR                      # MUST match sr_levels' clustering, or
+            _cap = 3.0 * config.SR_TOL_ATR                # this re-split what that just merged
             merged: list[list] = []                      # [anchor_px, touches, edge_px, min, max]
             for x, t, _tf in sorted(wl, key=lambda z: z[0]):
-                if merged and abs(x - merged[-1][2]) <= 0.2 * a and \
-                        (x - merged[-1][3]) <= 0.6 * a:              # width cap
+                if merged and abs(x - merged[-1][2]) <= _tol * a and \
+                        (x - merged[-1][3]) <= _cap * a:            # width cap
                     m = merged[-1]
                     if t > m[1]:
                         m[0], m[1] = x, t                           # strongest takes the anchor

@@ -366,7 +366,7 @@ def walls(h, l, tol: float, w: int = 2) -> list[tuple[float, int]]:
 
 
 def sr_levels(candles: pd.DataFrame, spot: float | None = None,
-              lookback: int = 40, tol_atr: float = 0.2,
+              lookback: int | None = None, tol_atr: float | None = None,
               min_dist_atr: float = 0.25) -> dict:
     """Nearest touch-counted support and resistance around `spot`, plus headroom.
 
@@ -380,6 +380,11 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
       head_up / head_dn         distance to the nearest >=2-touch wall each way, in ATR
 
     Returns {} when there are too few bars to have structure at all."""
+    from . import config
+    if lookback is None:
+        lookback = config.SR_LOOKBACK
+    if tol_atr is None:
+        tol_atr = config.SR_TOL_ATR
     if candles is None or len(candles) < 12:
         return {}
     cd = adjust_corporate_actions(candles)               # phantom walls at pre-split prices

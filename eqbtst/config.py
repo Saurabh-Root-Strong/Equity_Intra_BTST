@@ -58,6 +58,26 @@ STRUCT_BREAKOUT_ATR = 0.5   # close must clear the prior 19-bar range by >= this
 STRUCT_TREND_ER     = 0.40  # Kaufman efficiency ratio for a clean, low-noise trend
 STRUCT_TREND_ATR    = 1.0   # AND the window's net move must cover >= this x ATR (a REAL move)
 STRUCT_COIL         = 0.60  # recent 3-bar range < this x the prior range => contracting (coil)
+
+# ── TOUCH-COUNTED SUPPORT / RESISTANCE ───────────────────────────────────────────────
+# These decide WHETHER TWO PIVOTS ARE "THE SAME LEVEL", so they decide the touch count --
+# the whole value of the feature ("how many times price rejected here"). They were measured
+# wrong. The old tol=0.2*ATR is TIGHTER THAN A SINGLE DAY'S RANGE, so two rejections a week
+# apart at what a chartist calls one level almost never landed within tolerance: 67% of all
+# levels came out 1-touch, i.e. the count never accumulated. A human reads a level as a ZONE
+# ~2-3% wide; on a daily frame ATR is ~3%, so that is ~0.6-1.0 ATR, not 0.2. Measured across
+# 180 names: at 0.6, multi-touch levels go from 33% -> 65% and 3+ touch from 9% -> 39%,
+# without collapsing into 2-3 mega-zones (that starts near 1.0). Verified on MOTILALOFS
+# against a hand-drawn chart: 976 x5, 905 x3, 816 x2 -- the exact walls the eye picks, where
+# the old setting split each into 1-touch pivots. SR_TOL_ATR is used in BOTH clustering sites
+# (indicators.sr_levels AND live._live_levels' live re-cluster); they MUST agree or the second
+# re-splits what the first merged.
+SR_TOL_ATR   = 0.6    # two pivots within this x ATR = the same level (zone half-width ~= this)
+# A level PERSISTS far longer than a trend regime, so its window is longer than STRUCT_LOOKBACK.
+# 40 bars (~2 months on daily) cut off levels the chart still respects -- MOTILALOFS' own May
+# support/resistance, tested again in July, sat just outside it. 60 bars (~3 months daily,
+# ~2.5 days on 15m, ~14 months on weekly) is the standard "what you see on the chart" window.
+SR_LOOKBACK  = 60     # bars of history S/R levels are drawn from (NOT the 20-bar label window)
 # LIQ_MIN_LACS is the REALISM floor. Stress test: the headline +30bps net was partly
 # flattered by thin names where the fill is not real. On genuinely liquid names
 # (>=Rs20cr turnover) the honest deployable edge is ~+16-19bps net, win ~62%. Thin
