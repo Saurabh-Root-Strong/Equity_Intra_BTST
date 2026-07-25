@@ -197,11 +197,29 @@ def adjust_corporate_actions(candles: pd.DataFrame,
     Back-adjustment (multiply every PRIOR bar by the close ratio) rather than truncation, so
     the 20-bar window keeps its history instead of going 'n/a' for months after an event.
 
-    WHY 25% IS SAFE HERE: this universe is NSE F&O cash, where daily price bands cap real
-    moves well below that, so an overnight gap past 25% is a corporate action rather than a
-    trade. A genuine crash beyond the band cannot happen in one session. The threshold is
-    deliberately conservative — mis-adjusting a real move would erase it, so the bar is set
-    where real moves cannot reach."""
+    WHY 25%, AND WHAT IT CANNOT DO (corrected after an archive audit). The old justification
+    here was FALSE: it claimed F&O stocks have daily price bands that cap real moves below 25%.
+    They do not — stocks in the F&O segment have NO circuit limits, so a >25% single-day move
+    is entirely possible. Measured over 2018-2026, the F&O universe has 211 such moves. Most
+    are splits/bonuses (1:2 = -50%, 1:5 = -80%, 1:10 = -90%) and demergers, which MUST be
+    back-adjusted — the earlier TATAMOTORS fix (a 40% demerger read as a fake TREND_DOWN) is
+    exactly this case. But ~50 are genuine NEWS crashes (PAYTM -41% on the RBI action, IDEA
+    -37% on AGR dues), which must NOT be adjusted — their pre-crash prices are real levels the
+    stock fell away from.
+
+    THE HARD TRUTH: from OHLCV alone a demerger and a news crash are INDISTINGUISHABLE. Both
+    are permanent rebasings; demerger ratios are arbitrary (set by the spun-off entity's
+    value), so they do NOT land on clean split fractions either, and "same-day price movement"
+    smears every ratio off its nominal value. No price-only rule separates them.
+
+    So this is a deliberate LESSER-EVIL choice, not a safe one: ADJUST. An unadjusted demerger
+    corrupts BOTH the structure label AND every level; a wrongly-adjusted news crash corrupts
+    only the absolute price of levels OLDER than the event (the recent structure label is
+    unaffected), and only while that event sits inside the lookback window. Demergers are also
+    more common here than >25% single-day news crashes. The residual risk is real but rare and
+    self-clearing: once the event scrolls out of SR_LOOKBACK bars, the levels are clean again.
+    (Widening SR_LOOKBACK 40->60 slightly lengthens that exposure window — a known trade for
+    catching older, still-respected levels.)"""
     if candles is None or len(candles) < 3 or "close" not in candles.columns:
         return candles
     c = candles["close"].to_numpy(float)
