@@ -802,14 +802,15 @@ if tf == "Intraday":
             _setup_f = pc2.selectbox(
                 "Setup quality", ["All", "🎯 Textbook only", "🟢 Long-side setups",
                                   "🪤 Exclude traps"], index=0, key="mtf_setupf",
-                help=("Filter on the **HTF × LTF setup tag** (the chartist read), not on raw "
-                      "shapes.\n\n"
-                      "• **🎯 Textbook only** — `WITH-TREND CONTINUATION`: higher-TF trending, "
-                      "lower-TF coiling into it. The classical continuation setup.\n"
-                      "• **🟢 Long-side** — continuation + range-top break + pullback-with-trend.\n"
-                      "• **🪤 Exclude traps** — drops `FALSE-BREAK TRAP` (a lower-TF break in the "
-                      "MIDDLE of the higher-TF box — statistically fades).\n\n"
-                      "Rows sort best-setup-first regardless."))
+                help=("Keep only certain kinds of setup.\n\n"
+                      "• **🎯 Textbook only** — the cleanest one: the big picture is trending, "
+                      "and the stock has paused and gone quiet, resting before it likely "
+                      "continues the same way.\n"
+                      "• **🟢 Long-side** — everything pointing UP (continuation, a real "
+                      "breakout, or a dip inside an uptrend).\n"
+                      "• **🪤 Exclude traps** — hides the fake breakouts (a pop in the middle of "
+                      "the range that usually fades).\n\n"
+                      "Either way, the best setups are sorted to the top."))
             st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
             # HOW PROVISIONAL IS THIS TAG? A forming trigger bar can relabel until it closes,
             # and the board never said so. Measured per preset (see mtf.REPAINT) rather than
@@ -830,23 +831,41 @@ if tf == "Intraday":
                     f"is a closed daily bar from the archive, so nothing here can repaint "
                     f"intraday. It also means it does NOT see today's session; only `ltp`, "
                     f"`loc` and the live levels move.")
+        with st.expander("🧭 Higher TF vs Lower TF — the whole idea in 30 seconds"):
+            st.markdown(
+                "**Think of it like a map.**\n\n"
+                "- **Higher TF = zoomed OUT.** The big picture — which way the stock is really "
+                "going. Slow to change, but it is the direction that matters. *(This is the "
+                "\"confirm\" frame.)*\n"
+                "- **Lower TF = zoomed IN.** The close-up — what price is doing right now. Fast, "
+                "noisy, but it is where you actually time the entry. *(This is the \"trigger\" "
+                "frame.)*\n\n"
+                "**Why you need both.** One frame alone lies to you. A stock can look like it is "
+                "breaking out on the close-up while the big picture shows it is just wiggling in "
+                "the middle of a range — a fake move. The higher frame tells you *whether the "
+                "little move even means anything.*\n\n"
+                "**The one number that ties them together — `loc`.** It says WHERE price sits "
+                "inside the big-picture range: **0.0 = at the bottom, 1.0 = at the top.** A "
+                "breakout only counts at the top (loc near 1); a breakdown only at the bottom "
+                "(loc near 0). A \"break\" in the middle is the trap.\n\n"
+                "**You do not have to pick these** — the **Trade Horizon** dropdown above sets "
+                "both for you (BTST = 1h close-up inside a 4h big-picture). These boxes are for "
+                "when you want to choose the pair yourself.\n\n"
+                "*Golden rule: the Lower TF must be SMALLER than the Higher TF. Zoom in, never out.*")
         fc1, fc2, fc3, fc4 = st.columns(4)
         f_htf = fc1.selectbox("Higher TF", [_NONE, "1h", "2h", "4h", "1D", "1W"], index=3,
                               key="mtf_htf", disabled=bool(_P),
                               help=(
-                                  "**HIGHER TIMEFRAME — the big picture.**\n\n"
-                                  "Pick the LARGE timeframe you want to judge the trend on. This is "
-                                  "the CONTEXT: where is the stock in its bigger move? A bigger "
-                                  "frame changes slowly and matters more.\n\n"
-                                  "• **1h / 2h / 4h** — built live from today's + recent days' "
-                                  "candles. They include the bar still forming now, so they can "
-                                  "CHANGE (repaint) until that bar closes.\n"
-                                  "• **1D / 1W** — from the end-of-day archive, through the LAST "
-                                  "close. Rock-solid: they never change during the day (but they "
-                                  "don't see today yet).\n\n"
+                                  "**Higher TF = the big picture (zoomed OUT).**\n\n"
+                                  "Pick the bigger timeframe you want to judge the overall "
+                                  "direction on. It changes slowly and matters more — this is the "
+                                  "CONTEXT the smaller frame gets read inside.\n\n"
+                                  "• **1h / 2h / 4h** — built from recent days' candles, including "
+                                  "the bar forming now, so they can still CHANGE until it closes.\n"
+                                  "• **1D / 1W** — from the end-of-day archive. Rock-solid, never "
+                                  "change during the day — but they don't see today yet.\n\n"
                                   "This box picks the frame; the next box picks the SHAPE you want "
-                                  "on it. Pick **'— none —'** to switch the Higher-TF leg OFF "
-                                  "entirely (same as setting its structure to 'Any')."))
+                                  "on it. **'— none —'** turns the Higher-TF filter off."))
         f_hst = fc2.selectbox("HTF structure", _STRUCTS, index=0, key="mtf_hst",
                               format_func=_struct_label,
                               help=(
@@ -871,20 +890,17 @@ if tf == "Intraday":
         f_ltf = fc3.selectbox("Lower TF", [_NONE, "15m", "1h", "2h", "4h", "1D"], index=2,
                               key="mtf_ltf", disabled=bool(_P),
                               help=(
-                                  "**LOWER TIMEFRAME — the zoom-in.**\n\n"
-                                  "Pick the SMALL timeframe where you want to TIME the entry inside "
-                                  "the big frame's context. Think of it as zooming into the same "
-                                  "chart.\n\n"
+                                  "**Lower TF = the close-up (zoomed IN).**\n\n"
+                                  "Pick the smaller timeframe where you actually TIME the entry, "
+                                  "inside the big frame's context. Same chart, zoomed in.\n\n"
                                   "It does two jobs:\n"
-                                  "1. Filters on the small-frame SHAPE (next box).\n"
-                                  "2. Your **entry / stop / T1 / T2 levels are built on THIS "
-                                  "frame** (its ATR sets the stop width). Smaller frame = tighter "
-                                  "levels.\n\n"
-                                  "Keep it BELOW the Higher TF (e.g. Higher 4h, Lower 1h). Intraday "
-                                  "frames can repaint until the bar closes.\n\n"
-                                  "**'— none —'** switches the Lower-TF FILTER off. Levels/RSI/verdict "
-                                  "still need a frame, so they fall back to your Higher TF (or 1h if "
-                                  "that is also none)."))
+                                  "1. Filters on the close-up SHAPE (next box).\n"
+                                  "2. Your **entry / stop / target levels are built on THIS "
+                                  "frame** — smaller frame means tighter levels.\n\n"
+                                  "Keep it SMALLER than the Higher TF (e.g. Higher 4h, Lower 1h). "
+                                  "Zoom in, never out.\n\n"
+                                  "**'— none —'** turns the filter off; the levels then fall back "
+                                  "to your Higher TF."))
         f_lst = fc4.selectbox("LTF structure", _STRUCTS, index=0, key="mtf_lst",
                               format_func=_struct_label,
                               help=(
