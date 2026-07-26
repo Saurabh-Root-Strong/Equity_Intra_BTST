@@ -395,7 +395,12 @@ SR_COLS = {
              "The touch count deliberately does NOT increment while the test is happening — a "
              "touch only becomes a rejection once price actually turns. Counting the test in "
              "progress would let a level inflate its own strength on the way to breaking.\n\n"
-             "Blank = price is not near any multi-touch level."),
+             "Blank = price is not near any multi-touch level.\n\n"
+             "⚠ **VALIDATED ON DAILY & WEEKLY ONLY.** Backtested with a placebo (a random line): "
+             "1D/1W levels turn price meaningfully more than random (edge ~+0.12 ATR). On the "
+             "INTRADAY frames (15m–4h) a random line reacted just as much — the ~58% 'bounce' "
+             "there is intraday mean-reversion, NOT the level. So trust this on Swing/Positional; "
+             "on Intraday/BTST read it as rough visual context, not a predictive level."),
     "long_note": st.column_config.TextColumn(
         "long evidence", width="medium",
         help="**Did this setup actually make money — over the hold YOU picked?** Tested on 9 "
@@ -440,7 +445,9 @@ SR_COLS = {
              "side of a level the market has already defended twice; expect a fight, and "
              "size or target accordingly.\n\n"
              "Shown, never enforced: in the sister project near-wall trades did NOT bleed — "
-             "often the break IS the setup. This is the chartist's call, not a veto."),
+             "often the break IS the setup. This is the chartist's call, not a veto.\n\n"
+             "⚠ Placebo-validated on **1D/1W only**; on intraday frames (15m–4h) the walls a "
+             "random line hits react the same, so headroom there is visual context, not signal."),
 }
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
