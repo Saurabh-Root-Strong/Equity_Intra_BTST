@@ -1412,6 +1412,55 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
     return b
 
 
+_STALE_CACHE: dict = {}
+
+
+def archive_staleness() -> dict:
+    """Is the EOD archive behind the market? data.last_trading_date() only returns the
+    archive's OWN max date, so it cannot detect its own staleness — it is a mirror, not a
+    calendar. Fyers IS an independent calendar: its daily bars are the real trading days.
+
+    Compare the archive's latest date to Fyers' latest COMPLETED daily bar (a bar dated
+    strictly before today; today's bar is still forming intraday and is excluded). If Fyers
+    has a finished session the archive does not, the archive is stale — the DCM nightly sync
+    has not ingested it, and every 1D/1W structure, level and verdict is that many sessions
+    behind. Measured live 2026-07-26: archive latest 07-23, Fyers had 07-24 (MOTILALOFS closed
+    it -7.3%), so the board showed a bullish tag on pre-crash data with the price already
+    through its 'support'. This detector makes that visible instead of silent.
+
+    Returns {stale_days, archive_date, market_date, ok}. ok=False if Fyers can't be reached
+    (then we simply do not warn — never block the board on the probe)."""
+    from . import data as _data
+    key = dt.date.today()
+    if key in _STALE_CACHE:
+        return _STALE_CACHE[key]
+    out = {"stale_days": 0, "archive_date": None, "market_date": None, "ok": False}
+    try:
+        arch = pd.Timestamp(_data.last_trading_date()).normalize()
+        out["archive_date"] = arch
+        # RELIANCE trades every NSE session, so its daily bars ARE the trading calendar.
+        f = fetch_intraday("RELIANCE", tf="1D", lookback_days=12)
+        if f.empty:
+            _STALE_CACHE[key] = out
+            return out
+        today = pd.Timestamp(dt.date.today())
+        completed = f[f["ts"].dt.normalize() < today]      # exclude today's forming bar
+        if completed.empty:
+            _STALE_CACHE[key] = out
+            return out
+        mkt = completed["ts"].dt.normalize().max()
+        out["market_date"] = mkt
+        out["ok"] = True
+        # count how many of Fyers' completed sessions the archive is missing
+        out["stale_days"] = int((f["ts"].dt.normalize() > arch).sum()
+                                - (f["ts"].dt.normalize() >= today).sum())
+        out["stale_days"] = max(0, out["stale_days"])
+    except Exception:
+        pass
+    _STALE_CACHE[key] = out
+    return out
+
+
 def refresh_light_prices(board: pd.DataFrame) -> pd.DataFrame:
     """Re-price a STRUCTURE-SCAN board from one batch quote. Structure stays pinned.
 

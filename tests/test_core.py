@@ -1182,3 +1182,26 @@ def test_both_clustering_sites_share_one_tolerance():
     src = inspect.getsource(indicators.sr_levels)
     assert "config.SR_TOL_ATR" in src and "config.SR_LOOKBACK" in src
     assert "tol_atr: float = 0.2" not in src, "the old hardcoded 0.2 default must be gone"
+
+
+def test_archive_staleness_uses_an_independent_calendar():
+    """data.last_trading_date() returns the archive's OWN max date, so it cannot detect that
+    the archive is stale — a mirror is not a calendar. Fyers' daily bars ARE the trading
+    calendar, so archive_staleness compares the two and flags the gap. Measured live
+    2026-07-26: archive 07-23, Fyers had the 07-24 session (MOTILALOFS -7.3%), so the board
+    was showing a bullish tag on pre-crash data with price already through its 'support'. It
+    must exclude today's still-forming bar (that is not a stale session) and must never block
+    the board when Fyers is unreachable."""
+    import inspect
+    from eqbtst import live as _l
+    assert hasattr(_l, "archive_staleness")
+    src = inspect.getsource(_l.archive_staleness)
+    assert "fetch_intraday" in src, "must use Fyers as the independent calendar, not the archive"
+    assert "< today" in src or "< today)" in src, "must exclude today's forming bar"
+    # the failure path must be graceful: ok=False, no exception bubbles
+    s = _l.archive_staleness()
+    assert set(s) >= {"stale_days", "archive_date", "market_date", "ok"}
+    assert isinstance(s["stale_days"], int) and s["stale_days"] >= 0
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "archive_staleness()" in dash and "behind the market" in dash, \
+        "the UI must warn when the archive is behind"

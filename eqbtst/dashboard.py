@@ -638,6 +638,25 @@ if tf == "Intraday":
                     st.rerun()
             _auto_rescan()
 
+        # ARCHIVE STALENESS — the 1D/1W frames come from the EOD archive, and if the DCM
+        # nightly sync has not ingested the latest session those frames are behind the market
+        # WITHOUT the scan age showing it (the scan is fresh; the DATA under it is old). Fyers
+        # is the independent calendar. Warn loudly, because a name that moved big on the
+        # missing session shows a verdict built on pre-move data (MOTILALOFS -7.3% on 07-24
+        # read WITH-TREND CONTINUATION LONG off the 07-23 archive, price already below its
+        # 'support'). Cached once/day; never blocks the board if Fyers is unreachable.
+        _stale = live.archive_staleness()
+        if _stale.get("ok") and _stale["stale_days"] >= 1:
+            st.error(
+                f"⚠ **The EOD archive is {_stale['stale_days']} trading day(s) behind the "
+                f"market.** It has **{_stale['archive_date']:%d-%b}** as its latest close, but "
+                f"the market has traded through **{_stale['market_date']:%d-%b}**. So every "
+                f"**1D / 1W structure, level and verdict on this page is that many sessions "
+                f"old** — a name that moved hard on the missing session is judged on "
+                f"pre-move data (live prices still tick; the STRUCTURE under them does not). "
+                f"**Fix:** run the Daily_Cash_Market nightly sync to ingest the missing "
+                f"session(s), then ↻ re-scan. The Intraday frames (15m–4h) come straight from "
+                f"Fyers and are unaffected.")
         # AGE IS ALWAYS SHOWN. With no TTL the board holds its scan until you re-scan, so the
         # only thing that can mislead is not knowing how old it is. Off-hours this used to be
         # hidden entirely, which is when the board sits stalest.
