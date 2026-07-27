@@ -1566,18 +1566,21 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     b = _live_levels(b)                       # nearest/headroom against the price we have now
 
     # ── THE BIGGER-FRAME WALL THE PAIR IS BLIND TO ───────────────────────────────────────
-    # sup/res/headroom above see ONLY the two frames of the preset. But a 1h/4h long can be
-    # sitting right under a DAILY or WEEKLY resistance the pair never looked at, walk straight
-    # into it, and reverse -- the classic "traded the small frames, the big level capped it"
-    # loss. Confirmed live: SIEMENS read pair-headroom "∞ clear" with a 4-touch 1D wall 0.29
+    # sup/res/headroom above see ONLY the two frames of the preset. But a long can be sitting
+    # right under a resistance on a frame ABOVE the pair -- one it never looked at -- walk
+    # straight into it, and reverse: the classic "traded the small frames, the big level capped
+    # it" loss. Confirmed live: SIEMENS read pair-headroom "∞ clear" with a 4-touch 1D wall 0.29
     # ATR overhead; ATUL sat 0.02 ATR under a 5-touch daily wall. So surface the nearest
-    # DEFENDED (>=2-touch) wall from the ARCHIVE frames ABOVE the pair (1D and/or 1W -- the
-    # independent big-picture levels, NOT 2h/4h which just resample the pair's own series), in
-    # the TRADE'S direction: a ceiling above a long, a floor below a short. Distance in the
-    # TRIGGER frame's ATR, same unit as headroom/stop/target. CONTEXT, not a veto -- a break of
-    # a big level is often the move; but you must SEE the level before you buy into it.
+    # DEFENDED (>=2-touch) wall from EVERY frame ABOVE the pair's HTF, in the TRADE'S direction:
+    # a ceiling above a long, a floor below a short. Per horizon that is: Intraday (HTF 1h) ->
+    # 2h/4h/1D/1W; BTST (4h) -> 1D/1W; Swing (1D) -> 1W; Positional (1W) -> none. The frame
+    # LABEL travels with the level ("4h 250 ×3" vs "1D 250 ×5") so its weight is visible -- a
+    # coarser frame is a bigger level even when 2h/4h resample the pair's own series (this is a
+    # DESCRIPTION of the next obstacle, not a confluence CLAIM, so same-series is fine here).
+    # Distance in the TRIGGER frame's ATR, same unit as headroom/stop/target. CONTEXT, not a
+    # veto -- a break of a big level is often the move; but you must SEE it before you buy in.
     _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W")
-    _ctx = [f for f in ("1D", "1W") if _TF_ORD.index(f) > _TF_ORD.index(htf)]
+    _ctx = [f for f in _TF_ORD if _TF_ORD.index(f) > _TF_ORD.index(htf)]
     big_w, big_g = [], []
     for _, r in b.iterrows():
         px, a = r.get("ltp"), r.get("_sr_atr")
