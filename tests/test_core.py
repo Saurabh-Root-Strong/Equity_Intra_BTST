@@ -1262,3 +1262,33 @@ def test_sr_wall_exactly_at_price_is_the_resistance_at_wall_names():
     assert o["res"] == 1238.0 and o["res_t"] == 2, "wall at price must be the resistance"
     assert o["at_wall"].startswith("RES 1238"), "at_wall must name it, consistent with res"
     assert o["sup"] == 1231.43, "the floor below stays the support"
+
+
+def test_big_wall_surfaces_the_higher_frame_level_the_pair_is_blind_to():
+    """sup/res/headroom read only the two frames of the horizon. A 1h/4h long can sit right
+    under a DAILY resistance the pair never looked at, buy into it, and reverse — the classic
+    'traded the small frames, the big level capped it' loss (SIEMENS live: pair headroom '∞
+    clear' with a 4-touch 1D wall 0.29 ATR overhead). `big_wall` surfaces the nearest defended
+    (≥2-touch) 1D/1W wall in the trade's direction; `big_gap` is the distance in trigger ATR."""
+    import numpy as np, pandas as pd
+    from eqbtst import live as _l
+    # a BTST (1h/4h) LONG: 4h uptrend, 1h coiling mid-box -> WITH-TREND CONTINUATION UP
+    row = {"symbol": "TST", "ltp": 100.0,
+           "s1h": "CONSOLIDATION", "box_h1h": 102, "box_l1h": 98, "box_n1h": 20,
+           "s4h": "TREND_UP", "box_h4h": 110, "box_l4h": 90, "box_n4h": 20,
+           "sr_wall1h": [(99.0, 2)], "sr_wall4h": [(101.0, 1)], "sr_atr1h": 2.0,
+           "sr_wall1D": [(105.0, 3), (95.0, 2)], "sr_wall1W": [(120.0, 4)]}
+    b = _l.add_setup(pd.DataFrame([row]), ltf="1h", htf="4h").iloc[0]
+    assert b["side"] == "LONG", "setup should be a long here"
+    assert b["big_wall"] == "1D 105.00 ×3", "must surface the nearest >=2-touch 1D wall ABOVE a long"
+    assert abs(b["big_gap"] - 2.5) < 1e-6, "gap = (105-100)/trigger ATR 2.0 = 2.5"
+
+    # a SHORT looks DOWN: nearest defended 1D/1W wall BELOW price
+    rs = dict(row, s4h="TREND_DOWN", box_h4h=110, box_l4h=90, ltp=100.0)
+    bs = _l.add_setup(pd.DataFrame([rs]), ltf="1h", htf="4h").iloc[0]
+    assert bs["side"] == "SHORT"
+    assert bs["big_wall"] == "1D 95.00 ×2", "a short must look at the FLOOR below, not the ceiling"
+
+    # POSITIONAL (htf=1W): nothing sits above the weekly, so no big wall
+    bp = _l.add_setup(pd.DataFrame([row]), ltf="1D", htf="1W").iloc[0]
+    assert bp["big_wall"] == "" and np.isinf(bp["big_gap"]), "no frame above 1W -> blank"

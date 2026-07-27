@@ -1565,6 +1565,44 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     b["_sr_atr"] = b[f"sr_atr{ltf}"] if f"sr_atr{ltf}" in b.columns else np.nan
     b = _live_levels(b)                       # nearest/headroom against the price we have now
 
+    # ── THE BIGGER-FRAME WALL THE PAIR IS BLIND TO ───────────────────────────────────────
+    # sup/res/headroom above see ONLY the two frames of the preset. But a 1h/4h long can be
+    # sitting right under a DAILY or WEEKLY resistance the pair never looked at, walk straight
+    # into it, and reverse -- the classic "traded the small frames, the big level capped it"
+    # loss. Confirmed live: SIEMENS read pair-headroom "∞ clear" with a 4-touch 1D wall 0.29
+    # ATR overhead; ATUL sat 0.02 ATR under a 5-touch daily wall. So surface the nearest
+    # DEFENDED (>=2-touch) wall from the ARCHIVE frames ABOVE the pair (1D and/or 1W -- the
+    # independent big-picture levels, NOT 2h/4h which just resample the pair's own series), in
+    # the TRADE'S direction: a ceiling above a long, a floor below a short. Distance in the
+    # TRIGGER frame's ATR, same unit as headroom/stop/target. CONTEXT, not a veto -- a break of
+    # a big level is often the move; but you must SEE the level before you buy into it.
+    _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W")
+    _ctx = [f for f in ("1D", "1W") if _TF_ORD.index(f) > _TF_ORD.index(htf)]
+    big_w, big_g = [], []
+    for _, r in b.iterrows():
+        px, a = r.get("ltp"), r.get("_sr_atr")
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            px = 0.0
+        a = float(a) if (a is not None and a == a and float(a) > 0) else 0.0
+        if px <= 0 or a <= 0 or not _ctx:
+            big_w.append(""); big_g.append(np.inf); continue
+        walls = []
+        for f in _ctx:
+            wl = r.get(f"sr_wall{f}")
+            if isinstance(wl, list):
+                walls += [(float(x), int(t), f) for x, t in wl if int(t) >= 2]
+        look_up = r.get("side") != "SHORT"          # long / no-side watch the ceiling; short the floor
+        side_walls = [(x, t, f) for x, t, f in walls if (x > px) == look_up]
+        if side_walls:
+            x, t, f = (min if look_up else max)(side_walls, key=lambda z: z[0])
+            big_w.append(f"{f} {x:.2f} ×{t}")
+            big_g.append(round(abs(x - px) / a, 2))
+        else:
+            big_w.append(""); big_g.append(np.inf)
+    b["big_wall"], b["big_gap"] = big_w, big_g
+
     # NO CONFLUENCE FLAG — DELIBERATELY. The sister project's one POSITIVE level result was
     # pivot-meets-CALL-WALL confluence (+9.8pp, overhead only), and it is tempting to mirror
     # it here as "a 1h wall sitting on a 4h wall". That mirror is broken, for a reason worth

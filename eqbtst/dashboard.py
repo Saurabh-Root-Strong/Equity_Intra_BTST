@@ -112,6 +112,9 @@ def _fmt(df):
         _hv = pd.to_numeric(d["headroom"], errors="coerce")
         d["headroom"] = ["∞ clear" if np.isinf(v) else ("—" if pd.isna(v) else f"{v:.2f}")
                          for v in _hv]
+    if "big_gap" in d.columns:                             # same inf treatment as headroom
+        _bg = pd.to_numeric(d["big_gap"], errors="coerce")
+        d["big_gap"] = ["∞" if np.isinf(v) else ("—" if pd.isna(v) else f"{v:.2f}") for v in _bg]
     return d
 
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
@@ -399,6 +402,26 @@ SR_COLS = {
              "a pullback inside a downtrend is a short entry, not a dip to buy.\n\n"
              "**—** = the setup takes no side (squeeze, trap, or sideways). Most of the "
              "universe sits here most of the time."),
+    "big_wall": st.column_config.TextColumn(
+        "big wall", width="small",
+        help="**THE BIGGER-FRAME WALL YOUR PAIR CANNOT SEE.** The setup, sup/res and headroom "
+             "all read only the TWO frames of your horizon (e.g. 1h + 4h). But a 1h/4h long "
+             "can sit right under a DAILY or WEEKLY resistance the pair never looked at — you "
+             "buy, hit the big level, and it reverses. This column shows the nearest DEFENDED "
+             "(≥2-touch) wall from the 1D / 1W frame ABOVE your pair, in your trade's "
+             "direction: a ceiling above a long, a floor below a short.\n\n"
+             "`1D 3745.40 ×4` = a 4-touch DAILY resistance overhead. The `big gap` column is "
+             "how far, in your trigger-frame ATR (same unit as headroom). **< 0.5 = you are "
+             "buying straight into a major level** — expect a fight; a break THROUGH it is the "
+             "real move, so wait for the break or size for the wall. Blank = no defended "
+             "bigger-frame wall in your direction (or you are on Positional, the top frame). "
+             "Context, not a veto — but you must SEE the level before you trade into it."),
+    "big_gap": st.column_config.TextColumn(
+        "big gap",
+        help="Distance to the `big wall` (the nearest 1D/1W defended level in your trade's "
+             "direction), in your TRIGGER-frame ATR. ∞ = clear of any bigger-frame wall. "
+             "< 0.5 = trading straight into a daily/weekly level — the pair's own headroom can "
+             "say 'clear' while THIS says you are capped."),
     "at_wall": st.column_config.TextColumn(
         "at wall", width="small",
         help="**LIVE — price is testing a defended level RIGHT NOW** (within 0.15 ATR of a "
@@ -1033,7 +1056,7 @@ if tf == "Intraday":
         filtered = _mtf_filter(after_deliv)
         active = _htf_on or _ltf_on or _setup_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = (["symbol", "sector", "ltp", "turn₹L", "day%"]
-                      + (["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else [])
+                      + (["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else [])
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
@@ -1268,7 +1291,7 @@ if tf == "Intraday":
                     "Try a coarser Lower TF.")
             st.stop()
 
-        _sc = ["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom"] if _P else []
+        _sc = ["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else []
         long_cols = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
                      "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
