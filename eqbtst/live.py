@@ -998,6 +998,37 @@ def _daily_hist() -> dict:
     return out
 
 
+_MONTHLY_HIST: dict = {}       # date -> {sym: monthly OHLC frame}  (deep read, once per day)
+
+
+def _monthly_hist() -> dict:
+    """Per-symbol MONTHLY bars for the whole universe, ~6 years back — the source for the
+    Positional horizon's one-higher-frame (1M) big-wall. SEPARATE from the 14-month _daily_hist
+    because a monthly S/R level is a multi-year object: measured, 14 months of monthly bars
+    put a >=2-touch wall on 36% of names, ~60 months on 99%. Corporate-action adjusted at the
+    source like _daily_hist. One archive read per day, then free. Failed reads are NOT cached
+    (a DuckDB lock costs one scan, not a session)."""
+    key = dt.date.today()
+    if key in _MONTHLY_HIST:
+        return _MONTHLY_HIST[key]
+    try:
+        start = (pd.Timestamp(key) - pd.Timedelta(days=2400)).strftime("%Y-%m-%d")   # ~6.5yr
+        df = data.load_eod(start=start)[["symbol", "trade_date", "open_price",
+                                         "high_price", "low_price", "close_price"]].rename(
+            columns={"trade_date": "ts", "open_price": "open", "high_price": "high",
+                     "low_price": "low", "close_price": "close"})
+        out = {s: monthly_frame(indicators.adjust_corporate_actions(
+                   g.sort_values("ts").reset_index(drop=True)))
+               for s, g in df.groupby("symbol")}
+    except Exception:
+        out = {}
+    if not out:
+        return {}
+    _MONTHLY_HIST.clear()
+    _MONTHLY_HIST[key] = out
+    return out
+
+
 _DELIV_MOM: dict = {}          # date -> DataFrame(symbol, wtd_deliv7, avg_deliv100, deliv_vs_100d)
 
 
@@ -1139,10 +1170,37 @@ def mtf_structure(sym: str) -> dict:
         if d is not None and len(d) >= 5:
             _set("1D", d.tail(60))
             _set("1W", weekly_frame(d))
+            # MONTHLY S/R walls only — the ONE-higher-frame the POSITIONAL horizon (1D/1W)
+            # checks for its big-wall (1W is the top of the intraday ladder, so the frame above
+            # it is the month). Not a full frame (no struct/box/band): the big-wall check needs
+            # only the touch-counted levels. Built from a SEPARATE ~6-year daily read
+            # (_monthly_hist), NOT the shallow 14-month _daily_hist: measured, 14 months of
+            # monthly bars gave a ≥2-touch level on only 36% of names (a monthly level barely
+            # gets touched twice in a year), while ~60 months gives one on 99%. A monthly level
+            # is a multi-year object; anything less is starved.
+            _mo = _monthly_hist().get(sym)
+            _ok = _mo is not None and len(_mo) >= 12
+            out["wall1M"] = indicators.sr_levels(_mo).get("levels", []) if _ok else []
+            out["atr1M"] = indicators.atr(_mo, min(14, len(_mo))) if (_mo is not None and len(_mo) >= 5) else float("nan")
     except Exception:
         pass
     _MTF_CACHE[key] = out
     return out
+
+
+def monthly_frame(d: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Daily bars -> monthly (calendar month), dropping the INCOMPLETE current month — the same
+    rule as weekly_frame, one rung up. A part-formed month reads narrower and would fake a coil;
+    a monthly level is not one until the month closes. Used only for the Positional big-wall."""
+    m = (d.set_index("ts").groupby(pd.Grouper(freq="ME"))
+         .agg(open=("open", "first"), high=("high", "max"),
+              low=("low", "min"), close=("close", "last")).dropna().reset_index())
+    if len(m):
+        mo_end = m["ts"].iloc[-1]
+        today = (now or pd.Timestamp.now()).normalize()
+        if d["ts"].max() < mo_end and today <= mo_end:
+            m = m.iloc[:-1]
+    return m
 
 
 def weekly_frame(d: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
@@ -1238,6 +1296,7 @@ def universe_mtf_scan(date=None) -> dict:
     # but the first heavy LOAD must be serialised).
     from concurrent.futures import ThreadPoolExecutor
     _daily_hist()                                   # warm the 1D/1W source once
+    _monthly_hist()                                 # warm the 1M (Positional big-wall) source once
     syms = [x[0] for x in cand]
     with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as ex:
         mtfs = dict(zip(syms, ex.map(mtf_structure, syms)))
@@ -1287,6 +1346,8 @@ def universe_mtf_scan(date=None) -> dict:
             # touch-counted S/R per frame — feeds the level read (add_setup picks the pair)
             **{f"sr_{p}{t}": _mtf.get(f"{p}{t}")
                for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall", "atr")},
+            # MONTHLY walls (Positional big-wall only) — carried explicitly, not a full frame
+            "sr_wall1M": _mtf.get("wall1M"), "sr_atr1M": _mtf.get("atr1M"),
             # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
             "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
             "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
@@ -1573,17 +1634,19 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     # ATR overhead; ATUL sat 0.02 ATR under a 5-touch daily wall.
     #
     # Surface the nearest DEFENDED (>=2-touch) wall from exactly ONE frame -- the next standard
-    # CONFIRMATION frame above the pair's HTF, walking the 4x ladder (1h -> 4h -> 1D -> 1W) the
-    # whole system is built on. So per horizon it is: Intraday (HTF 1h) -> 4h; BTST (4h) -> 1D;
-    # Swing (1D) -> 1W; Positional (1W) -> none (it is already the top). Just ONE frame, as a
-    # chartist checks the next chart up -- not the whole stack (that buried the signal and
-    # double-showed the pair's own levels via the 2h/4h resamples of the same series). The 2h
-    # "tweener" is skipped because no preset uses it as a confirmation frame. Direction follows
-    # the trade: a ceiling above a long, a floor below a short. Distance in the TRIGGER frame's
-    # ATR (headroom/stop/target unit). CONTEXT, not a veto -- a break of the big level is often
-    # the move -- but you must SEE it before you buy in.
-    _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W")
-    _LADDER = ("1h", "4h", "1D", "1W")            # the 4x confirmation-frame ladder
+    # CONFIRMATION frame above the pair's HTF, walking the 4x ladder (1h -> 4h -> 1D -> 1W -> 1M)
+    # the whole system is built on. ALL FOUR horizons get their one frame: Intraday (HTF 1h) ->
+    # 4h; BTST (4h) -> 1D; Swing (1D) -> 1W; Positional (1W) -> 1M (the MONTH -- the frame above
+    # the weekly, so Positional is not left blind). Just ONE frame, as a chartist checks the
+    # next chart up -- not the whole stack (that buried the signal and double-showed the pair's
+    # own levels via the 2h/4h resamples of the same series). The 2h "tweener" is skipped -- no
+    # preset uses it as a confirmation frame. The relevant frame scales with the HOLD: an
+    # overnight BTST can blow through a daily level but not a weekly; a weeks-long Positional can
+    # reach the monthly. Direction follows the trade: a ceiling above a long, a floor below a
+    # short. Distance in the TRIGGER frame's ATR. CONTEXT, not a veto -- a break of the big
+    # level is often the move -- but you must SEE it before you buy in.
+    _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W", "1M")
+    _LADDER = ("1h", "4h", "1D", "1W", "1M")      # the 4x confirmation-frame ladder, incl. month
     _hi = _TF_ORD.index(htf) if htf in _TF_ORD else -1
     _one = next((f for f in _LADDER if _TF_ORD.index(f) > _hi), None)
     _ctx = [_one] if _one else []

@@ -1296,6 +1296,16 @@ def test_big_wall_surfaces_the_higher_frame_level_the_pair_is_blind_to():
     assert bs["side"] == "SHORT"
     assert bs["big_wall"] == "1D 95.00 ×2", "a short must look at the FLOOR below, not the ceiling"
 
-    # POSITIONAL (htf=1W): nothing sits above the weekly, so no big wall
-    bp = _l.add_setup(pd.DataFrame([row]), ltf="1D", htf="1W").iloc[0]
-    assert bp["big_wall"] == "" and np.isinf(bp["big_gap"]), "no frame above 1W -> blank"
+    # POSITIONAL (htf=1W): the one frame above the weekly is the MONTH — so it checks 1M,
+    # not "none". All four horizons get a higher frame: Intraday->4h, BTST->1D, Swing->1W,
+    # Positional->1M. A row carrying a monthly wall above a long must surface it.
+    # HTF 1W trending up + LTF 1D coiling mid-box -> WITH-TREND CONTINUATION UP -> LONG
+    prow = dict(row, s1W="TREND_UP", box_h1W=110, box_l1W=90, box_n1W=20,
+                s1D="CONSOLIDATION", box_h1D=104, box_l1D=96, box_n1D=20,
+                sr_atr1D=2.0, sr_wall1M=[(106.0, 4)])
+    bp = _l.add_setup(pd.DataFrame([prow]), ltf="1D", htf="1W").iloc[0]
+    assert bp["side"] == "LONG", f"expected LONG, got {bp['setup']}/{bp['side']}"
+    assert bp["big_wall"] == "1M 106.00 ×4", "Positional must check the MONTHLY frame above 1W"
+    # graceful when no monthly wall exists
+    bn = _l.add_setup(pd.DataFrame([dict(prow, sr_wall1M=[])]), ltf="1D", htf="1W").iloc[0]
+    assert bn["big_wall"] == "" and np.isinf(bn["big_gap"])
