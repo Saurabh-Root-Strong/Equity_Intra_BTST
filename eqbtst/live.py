@@ -1565,22 +1565,28 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     b["_sr_atr"] = b[f"sr_atr{ltf}"] if f"sr_atr{ltf}" in b.columns else np.nan
     b = _live_levels(b)                       # nearest/headroom against the price we have now
 
-    # ── THE BIGGER-FRAME WALL THE PAIR IS BLIND TO ───────────────────────────────────────
+    # ── THE ONE HIGHER-FRAME WALL THE PAIR IS BLIND TO ───────────────────────────────────
     # sup/res/headroom above see ONLY the two frames of the preset. But a long can be sitting
-    # right under a resistance on a frame ABOVE the pair -- one it never looked at -- walk
+    # right under a resistance ONE FRAME ABOVE the pair -- one it never looked at -- walk
     # straight into it, and reverse: the classic "traded the small frames, the big level capped
     # it" loss. Confirmed live: SIEMENS read pair-headroom "∞ clear" with a 4-touch 1D wall 0.29
-    # ATR overhead; ATUL sat 0.02 ATR under a 5-touch daily wall. So surface the nearest
-    # DEFENDED (>=2-touch) wall from EVERY frame ABOVE the pair's HTF, in the TRADE'S direction:
-    # a ceiling above a long, a floor below a short. Per horizon that is: Intraday (HTF 1h) ->
-    # 2h/4h/1D/1W; BTST (4h) -> 1D/1W; Swing (1D) -> 1W; Positional (1W) -> none. The frame
-    # LABEL travels with the level ("4h 250 ×3" vs "1D 250 ×5") so its weight is visible -- a
-    # coarser frame is a bigger level even when 2h/4h resample the pair's own series (this is a
-    # DESCRIPTION of the next obstacle, not a confluence CLAIM, so same-series is fine here).
-    # Distance in the TRIGGER frame's ATR, same unit as headroom/stop/target. CONTEXT, not a
-    # veto -- a break of a big level is often the move; but you must SEE it before you buy in.
+    # ATR overhead; ATUL sat 0.02 ATR under a 5-touch daily wall.
+    #
+    # Surface the nearest DEFENDED (>=2-touch) wall from exactly ONE frame -- the next standard
+    # CONFIRMATION frame above the pair's HTF, walking the 4x ladder (1h -> 4h -> 1D -> 1W) the
+    # whole system is built on. So per horizon it is: Intraday (HTF 1h) -> 4h; BTST (4h) -> 1D;
+    # Swing (1D) -> 1W; Positional (1W) -> none (it is already the top). Just ONE frame, as a
+    # chartist checks the next chart up -- not the whole stack (that buried the signal and
+    # double-showed the pair's own levels via the 2h/4h resamples of the same series). The 2h
+    # "tweener" is skipped because no preset uses it as a confirmation frame. Direction follows
+    # the trade: a ceiling above a long, a floor below a short. Distance in the TRIGGER frame's
+    # ATR (headroom/stop/target unit). CONTEXT, not a veto -- a break of the big level is often
+    # the move -- but you must SEE it before you buy in.
     _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W")
-    _ctx = [f for f in _TF_ORD if _TF_ORD.index(f) > _TF_ORD.index(htf)]
+    _LADDER = ("1h", "4h", "1D", "1W")            # the 4x confirmation-frame ladder
+    _hi = _TF_ORD.index(htf) if htf in _TF_ORD else -1
+    _one = next((f for f in _LADDER if _TF_ORD.index(f) > _hi), None)
+    _ctx = [_one] if _one else []
     big_w, big_g = [], []
     for _, r in b.iterrows():
         px, a = r.get("ltp"), r.get("_sr_atr")

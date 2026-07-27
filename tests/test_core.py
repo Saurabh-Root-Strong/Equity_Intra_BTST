@@ -1283,6 +1283,13 @@ def test_big_wall_surfaces_the_higher_frame_level_the_pair_is_blind_to():
     assert b["big_wall"] == "1D 105.00 ×3", "must surface the nearest >=2-touch 1D wall ABOVE a long"
     assert abs(b["big_gap"] - 2.5) < 1e-6, "gap = (105-100)/trigger ATR 2.0 = 2.5"
 
+    # ONE FRAME ONLY: BTST (HTF 4h) checks 1D and IGNORES 1W, even when 1W sits NEARER. The
+    # relevant bigger frame scales with the hold -- an overnight BTST cares about the daily,
+    # not the weekly. Here 1W has a wall at 103 (nearer) but the daily one at 108 is what shows.
+    one = dict(row, sr_wall1D=[(108.0, 3)], sr_wall1W=[(103.0, 4)])
+    bo = _l.add_setup(pd.DataFrame([one]), ltf="1h", htf="4h").iloc[0]
+    assert bo["big_wall"] == "1D 108.00 ×3", "BTST must use ONLY its one frame (1D), not the nearer 1W"
+
     # a SHORT looks DOWN: nearest defended 1D/1W wall BELOW price
     rs = dict(row, s4h="TREND_DOWN", box_h4h=110, box_l4h=90, ltp=100.0)
     bs = _l.add_setup(pd.DataFrame([rs]), ltf="1h", htf="4h").iloc[0]
