@@ -1229,3 +1229,36 @@ def test_setup_tag_shows_trend_direction():
     assert '_census = live.add_setup(sc["board"]' in src and '"dir"]].copy()' in src, \
         "census must carry dir"
     assert '_census["setup"] + _census["dir"]' in src, "census must key on (setup, dir)"
+
+
+def test_sr_cluster_never_spans_the_price():
+    """A cluster must stay on ONE side of price — a wall below is a floor, above is a ceiling.
+    MPHASIS live (BTST): a run 2315(x4) 2336(x4) 2361(x1) 2388(x4) 2412(x2), each pair within
+    tolerance, single-linkage chained into ONE cluster anchored at 2315.28 (BELOW price 2332.90),
+    so a x4 RESISTANCE at 2388 was absorbed into a SUPPORT at 2315 and `res` showed the weaker
+    far 2412(x2) with a stronger x4 hidden below it. Clustering each side of price separately
+    makes that impossible: sup = nearest-and-strongest BELOW, res = nearest ABOVE."""
+    import pandas as pd
+    from eqbtst import live as _l
+    b = pd.DataFrame([{"ltp": 2332.90, "_sr_atr": 45.37,
+                       "_wall_pair": [(2315.28, 4, "4h"), (2336.25, 4, "1h"), (2361.80, 1, "1h"),
+                                      (2388.28, 4, "4h"), (2412.65, 2, "1h")]}])
+    o = _l._live_levels(b).iloc[0]
+    assert o["sup"] < 2332.90 < o["res"], "sup must be below price, res above — never spanning it"
+    assert o["res"] == 2336.25, "res must be the nearest ABOVE wall, not a far weak one across a chain"
+    assert o["sup"] == 2315.28
+
+
+def test_sr_wall_exactly_at_price_is_the_resistance_at_wall_names():
+    """HAVELLS live: ltp 1238.00 with a 2-touch wall at exactly 1238.00. at_wall classifies a
+    wall at price as RES (x >= px), but sup/res used strict x < px / x > px, so a wall exactly
+    at price fell through both and at_wall named a level absent from sup/res. The boundary now
+    matches: x >= px goes to the ceiling, so res == the level at_wall reports."""
+    import pandas as pd
+    from eqbtst import live as _l
+    b = pd.DataFrame([{"ltp": 1238.00, "_sr_atr": 6.07,
+                       "_wall_pair": [(1231.43, 3, "1h"), (1238.0, 2, "1h"), (1246.9, 1, "4h")]}])
+    o = _l._live_levels(b).iloc[0]
+    assert o["res"] == 1238.0 and o["res_t"] == 2, "wall at price must be the resistance"
+    assert o["at_wall"].startswith("RES 1238"), "at_wall must name it, consistent with res"
+    assert o["sup"] == 1231.43, "the floor below stays the support"

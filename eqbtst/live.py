@@ -1349,47 +1349,49 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
         # that actually matters. Touches are MAXed, never summed: the two frames are seeing
         # one swing twice, so adding them would manufacture strength that never happened.
         if a > 0:
-            # SINGLE-LINKAGE, ANCHORED ON THE CLUSTER'S STRONGEST MEMBER.
-            # Comparing each candidate against the cluster ANCHOR alone chains badly: walls at
-            # 1794.6(x2), 1799.6(x2), 1804.0(x1) with a 5.6 tolerance absorbed the middle one
-            # into the first, after which 1804.0 measured 9.4 from the anchor and survived as
-            # its own "level" -- 4.4 away from a wall that had just been declared the same
-            # level. The board then showed support 1804.0 x1 while 1799.6 x2 sat inside the
-            # tolerance (DALBHARAT, Swing preset, live). Absorbing a member must not shrink the
-            # cluster's reach, so the tolerance is applied to the RUNNING EDGE (the last price
-            # taken in) and a width cap keeps single-linkage from drifting across the chart.
-            # The anchor -- the price displayed -- stays the strongest member, because that is
-            # the level the market actually defended. Touches are still MAXed, never summed:
-            # the two frames resample ONE price series, so the same swing appears in both.
-            _tol = config.SR_TOL_ATR                      # MUST match sr_levels' clustering, or
-            _cap = 3.0 * config.SR_TOL_ATR                # this re-split what that just merged
-            merged: list[list] = []                      # [anchor_px, touches, edge_px, min, max]
-            for x, t, _tf in sorted(wl, key=lambda z: z[0]):
-                if merged and abs(x - merged[-1][2]) <= _tol * a and \
-                        (x - merged[-1][3]) <= _cap * a:            # width cap
-                    m = merged[-1]
-                    if t > m[1]:
-                        m[0], m[1] = x, t                           # strongest takes the anchor
-                    m[2] = x                                        # running edge
-                    m[4] = max(m[4], x)
-                else:
-                    merged.append([x, t, x, x, x])
-            wl = [(m[0], m[1], "") for m in merged]
-        # THE MIN-DISTANCE FILTER MUST NOT SWALLOW A DEFENDED LEVEL. It exists to stop a
-        # 1-touch micro-swing hugging price from being called "the level" -- fine. But it was
-        # applied to EVERY wall, including multi-touch ones, and at_wall (which deliberately
-        # has NO such filter, because its whole job is "price is ON a level right now") uses
-        # the same list. Result: the instant at_wall fired, the level it named was BY
-        # CONSTRUCTION excluded from the sup/res column, so the table showed the NEXT level
-        # back. Measured: at_wall and sup/res disagreed on 100% of firings, every preset --
-        # 28/28, 29/29, 27/27, 31/31. On screen that reads as two columns contradicting each
-        # other (CROMPTON: "at wall RES 256.77" beside "res 257.83"; PFC: "at wall SUP 404.42"
-        # beside "sup 400.00"), and the hidden one is the level that matters MOST: a wall the
-        # market has defended twice, that price is testing this second. A >=2-touch wall is
-        # never noise, however close it sits, so the filter now applies only to 1-touch pivots.
+            # CLUSTER EACH SIDE OF PRICE SEPARATELY. A cluster must never span the current
+            # price: a wall below price is a FLOOR and a wall above is a CEILING -- functionally
+            # opposite -- so single-linkage chaining across price is nonsense. Measured live
+            # (MPHASIS, BTST): a run 2315(x4) 2336(x4) 2361(x1) 2388(x4) 2412(x2), each pair
+            # within tolerance, chained into ONE cluster anchored at 2315.28 -- BELOW price --
+            # so a x4 RESISTANCE at 2388 was absorbed into a SUPPORT at 2315, and `res` then
+            # showed the weaker 2412(x2) with a stronger x4 hiding 24 points below it. Splitting
+            # by side first makes that impossible. A wall exactly AT price goes to the ceiling
+            # (x >= px), matching at_wall's own classifier ("RES if x >= px").
+            #
+            # Within a side: SINGLE-LINKAGE anchored on the strongest member (the DALBHARAT
+            # fix). Tolerance on the RUNNING EDGE (not the anchor) so absorbing a member never
+            # shrinks the cluster's reach; a width cap stops the chain drifting across the
+            # chart. Touches MAXed, never summed -- the two frames resample ONE series.
+            _tol = config.SR_TOL_ATR
+            _cap = 3.0 * config.SR_TOL_ATR
+
+            def _cluster(pts):
+                merged: list[list] = []                  # [anchor_px, touches, edge_px, min]
+                for x, t in sorted(pts, key=lambda z: z[0]):
+                    if merged and abs(x - merged[-1][2]) <= _tol * a and \
+                            (x - merged[-1][3]) <= _cap * a:
+                        m = merged[-1]
+                        if t > m[1]:
+                            m[0], m[1] = x, t             # strongest takes the anchor
+                        m[2] = x                          # running edge
+                    else:
+                        merged.append([x, t, x, x])
+                return [(m[0], m[1]) for m in merged]
+
+            below_c = _cluster([(x, t) for x, t, _ in wl if x < px])
+            above_c = _cluster([(x, t) for x, t, _ in wl if x >= px])   # x==px -> ceiling
+            wl = [(x, t, "") for x, t in below_c + above_c]
+        # THE MIN-DISTANCE FILTER MUST NOT SWALLOW A DEFENDED LEVEL. It stops a 1-touch
+        # micro-swing hugging price from being called "the level" -- but a >=2-touch wall is
+        # never noise, however close it sits, so the filter applies only to 1-touch pivots.
+        # (at_wall has NO min-dist filter -- its job is "price is ON a level now" -- so without
+        # this exception the level at_wall names would vanish from sup/res, and the two columns
+        # would contradict on every firing, as they did before this rule: 28/28, 29/29 ...).
+        # `above` uses x >= px so a wall exactly at price is the resistance at_wall calls it.
         md = 0.25 * a
         below = [(x, t) for x, t, _ in wl if x < px and (t >= 2 or x < px - md)]
-        above = [(x, t) for x, t, _ in wl if x > px and (t >= 2 or x > px + md)]
+        above = [(x, t) for x, t, _ in wl if x >= px and (t >= 2 or x > px + md)]
         s_ = max(below, key=lambda z: z[0]) if below else (np.nan, 0)
         r_ = min(above, key=lambda z: z[0]) if above else (np.nan, 0)
         sup.append(round(s_[0], 2) if s_[0] == s_[0] else np.nan)
