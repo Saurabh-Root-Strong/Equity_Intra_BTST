@@ -1205,3 +1205,27 @@ def test_archive_staleness_uses_an_independent_calendar():
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     assert "archive_staleness()" in dash and "behind the market" in dash, \
         "the UI must warn when the archive is behind"
+
+
+def test_setup_tag_shows_trend_direction():
+    """WITH-TREND CONTINUATION (and COIL/EXTENDED/PULLBACK) are direction-agnostic — the same
+    tag is a LONG in an uptrend and a SHORT in a downtrend. On the SHORT tab, and in the census
+    which has no side column at all, the bare tag hid that. The display now appends the HTF
+    trend arrow (↑ up / ↓ down) from `dir`, and the census groups by (tag, direction) so a
+    bull-flag group and a bear-base group under the same tag are never merged with one read."""
+    import pandas as pd
+    from eqbtst import dashboard as D
+    df = pd.DataFrame([
+        {"setup": "WITH-TREND CONTINUATION", "dir": "DOWN"},
+        {"setup": "WITH-TREND CONTINUATION", "dir": "UP"},
+        {"setup": "NESTED SQUEEZE", "dir": "NONE"},
+    ])
+    out = D._fmt(df)["setup"].tolist()
+    assert out[0].endswith("↓"), "downtrend continuation must show ↓"
+    assert out[1].endswith("↑"), "uptrend continuation must show ↑"
+    assert not out[2].endswith(("↑", "↓")), "a NONE-direction tag gets no arrow"
+    # the census must group by (tag, dir): the two continuations are DIFFERENT rows
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert '_census = live.add_setup(sc["board"]' in src and '"dir"]].copy()' in src, \
+        "census must carry dir"
+    assert '_census["setup"] + _census["dir"]' in src, "census must key on (setup, dir)"

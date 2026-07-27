@@ -88,8 +88,19 @@ def _fmt(df):
         else:
             d[c] = d[c].map(_struct_label)
     if "setup" in d.columns:                               # tag -> icon + tag (display only)
-        d["setup"] = [f"{mtf.TAG_ICON.get(v, '')} {v}".strip() if isinstance(v, str) else "—"
-                      for v in d["setup"]]
+        # SHOW THE DIRECTION ON THE TAG. "WITH-TREND CONTINUATION" alone is ambiguous — it is a
+        # LONG in an uptrend and a SHORT in a downtrend (the tag is direction-agnostic; `dir`
+        # decides the side). A user reading it on the SHORT tab could not see it meant a
+        # DOWNTREND continuation. Same for COIL AT THE EXTREME / EXTENDED / PULLBACK. Append the
+        # HTF trend arrow from `dir` (↑ up, ↓ down) so the tag reads unambiguously; NONE-dir
+        # tags (squeeze, drift, range, trap) get no arrow. RANGE-TOP/FLOOR BREAK carry their
+        # own direction inherently and the arrow just reinforces it.
+        _dirs = d["dir"].tolist() if "dir" in d.columns else [None] * len(d)
+        _arrow = {"UP": " ↑", "DOWN": " ↓"}
+        d["setup"] = [
+            (f"{mtf.TAG_ICON.get(v, '')} {v}{_arrow.get(dv, '')}".strip()
+             if isinstance(v, str) else "—")
+            for v, dv in zip(d["setup"], _dirs)]
     if "headroom" in d.columns:
         # CLEAR ROAD IS AN ANSWER, AND IT WAS RENDERING AS AN EMPTY CELL. The scan stores
         # +inf when there is NO multi-touch wall overhead, precisely so that "nothing above
@@ -329,6 +340,10 @@ SETUP_COLS = {
         "setup", width="medium",
         help="The HIGHER-TF × LOWER-TF read for your chosen horizon — what the two frames say "
              "TOGETHER, which neither says alone.\n\n"
+             "**The ↑ / ↓ arrow is the direction of the HIGHER-TF TREND.** The same tag means "
+             "opposite trades by direction: **↑ = LONG** (uptrend), **↓ = SHORT** (downtrend). "
+             "WITH-TREND CONTINUATION ↑ is a bull flag; WITH-TREND CONTINUATION ↓ is a bear "
+             "flag — same shape, opposite side. The `side` column follows the arrow.\n\n"
              "🎯 WITH-TREND CONTINUATION — HTF trending, LTF coiling into it. Textbook.\n"
              "🚀 RANGE-TOP BREAK — LTF breaking up AT the HTF ceiling (the only place a break "
              "can be real).\n"
@@ -1001,7 +1016,7 @@ if tf == "Intraday":
             # therefore built from sc["board"] directly. Cost is nil — add_setup is arithmetic
             # over boxes the scan already carried.
             _census = live.add_setup(sc["board"], ltf=_P["ltf"], htf=_P["htf"])[
-                ["setup", "setup_read", "turn₹L", "symbol"]].copy()
+                ["setup", "setup_read", "turn₹L", "symbol", "dir"]].copy()
             if _setup_f == "🎯 Textbook only":
                 light, _setup_on = light[light["setup"] == "WITH-TREND CONTINUATION"], True
             elif _setup_f == "🟢 Long-side setups":
@@ -1025,16 +1040,25 @@ if tf == "Intraday":
         # WHAT THE TAPE LOOKS LIKE RIGHT NOW — the census of setups across the whole universe,
         # with the full read for each. A tag in a cell is a label; this is what it MEANS.
         if _P and _census is not None and not _census.empty:
-            _vc = _census["setup"].value_counts()
+            # GROUP BY (tag, DIRECTION), not tag alone. A directional tag means opposite things
+            # up vs down: WITH-TREND CONTINUATION ↑ is a bull flag (LONG), ↓ is a bear flag
+            # (SHORT); COIL AT THE EXTREME ↑ is a flag at the highs, ↓ a base at the lows. The
+            # old census lumped them under one heading and showed ONE read — so a group of 28
+            # 'COIL AT THE EXTREME' could be a mix of longs and shorts with the read of whichever
+            # sorted first. Split them, arrow the header, and show each direction's own read.
+            _arrow = {"UP": " ↑", "DOWN": " ↓"}
+            _key = _census["setup"] + _census["dir"].map(lambda d: _arrow.get(d, ""))
+            _vc = _key.value_counts()
             _band_cut = len(_census) - len(light) if not _setup_on else None
             with st.expander(f"🔭 What the {_P['ltf']} × {_P['htf']} tape says right now — "
                              f"{len(_vc)} setup types across all {len(_census)} scanned names"
                              + (f"  (incl. {_band_cut} your price band hides)"
                                 if _band_cut else "")):
-                for _tag, _cnt in _vc.items():
-                    _r = _census[_census["setup"] == _tag]
+                for _lbl, _cnt in _vc.items():
+                    _r = _census[_key == _lbl]
+                    _tag = _r["setup"].iloc[0]
                     _ex = ", ".join(_r.nlargest(min(4, len(_r)), "turn₹L")["symbol"])
-                    st.markdown(f"**{mtf.TAG_ICON.get(_tag, '')} {_tag}** — {_cnt} names  \n"
+                    st.markdown(f"**{mtf.TAG_ICON.get(_tag, '')} {_lbl}** — {_cnt} names  \n"
                                 f"{_r['setup_read'].iloc[0]}  \n"
                                 f"*most liquid:* {_ex}")
                 st.caption("⚠ Setup quality is a CHARTIST ranking, not an expected return. "
