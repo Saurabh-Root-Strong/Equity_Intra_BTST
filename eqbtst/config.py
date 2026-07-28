@@ -16,14 +16,18 @@ honest read from that validation (see README "Evidence"):
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # --- data source: the Daily_Cash_Market DuckDB archive (read-only) ------------
-DCM_DUCKDB = Path(r"d:/Python Projects/Daily_Cash_Market/data/market_data.duckdb")
+# ENV-OVERRIDABLE so the VM (different filesystem layout) needs no code edit -- set
+# EQBTST_DCM_DUCKDB / EQBTST_TRADEBOT_DIR there; the local dev paths are the fallback.
+DCM_DUCKDB = Path(os.environ.get(
+    "EQBTST_DCM_DUCKDB", r"d:/Python Projects/Daily_Cash_Market/data/market_data.duckdb"))
 NIFTY_INDEX_NAME = "Nifty 50"          # index_data.index_name for the regime gate
 
 # --- live feed: reuse the Tradebot Fyers auth/token (no re-plumbing) -----------
-TRADEBOT_DIR = Path(r"d:/Python Projects/Tradebot")
+TRADEBOT_DIR = Path(os.environ.get("EQBTST_TRADEBOT_DIR", r"d:/Python Projects/Tradebot"))
 FYERS_HISTORY_URL = "https://api-t1.fyers.in/data/history"
 FYERS_QUOTES_URL = "https://api-t1.fyers.in/data/quotes"
 NIFTY_FYERS = "NSE:NIFTY50-INDEX"      # live index for the regime / relative strength
