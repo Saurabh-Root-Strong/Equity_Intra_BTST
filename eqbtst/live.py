@@ -1007,7 +1007,16 @@ def _monthly_hist() -> dict:
     because a monthly S/R level is a multi-year object: measured, 14 months of monthly bars
     put a >=2-touch wall on 36% of names, ~60 months on 99%. Corporate-action adjusted at the
     source like _daily_hist. One archive read per day, then free. Failed reads are NOT cached
-    (a DuckDB lock costs one scan, not a session)."""
+    (a DuckDB lock costs one scan, not a session).
+
+    CA RISK IS AMPLIFIED HERE, ACCEPTED. adjust_corporate_actions back-adjusts any >25% single-
+    day step; over this 6-year window 110 names have one (mostly real splits/demergers, correctly
+    adjusted). A genuine NEWS crash among them (PAYTM/IDEA-class) is wrongly adjusted, and unlike
+    the 60-DAY daily window -- where it scrolls out in ~2 months -- here it can sit in the window
+    for years, leaving phantom OLD monthly levels at shifted prices. Impact is bounded: the
+    big-wall shows the NEAREST monthly level in the trade direction, and a phantom old level is
+    usually far from current price, so it rarely becomes the one shown. Not fixed (no price-only
+    rule separates a demerger from a crash -- see adjust_corporate_actions), documented."""
     key = dt.date.today()
     if key in _MONTHLY_HIST:
         return _MONTHLY_HIST[key]
