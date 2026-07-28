@@ -664,23 +664,41 @@ if tf == "Intraday":
         _sa = sc.get("scanned_at")
         _age = (dt.datetime.now() - _sa).total_seconds() if _sa else 0
 
-        # ── AUTO-REFRESH aligned to the 15-min bar close (opt-in) ───────────────────────
-        # Structure changes ONLY when a bar closes; the 15m frame is the finest, so its
-        # boundary (:00/:15/:30/:45) is the natural cadence. This fragment ticks lightly and
-        # triggers ONE full re-scan just after each boundary — never mid-bar (same result,
-        # wasted fetches). `scanned_b15` remembers the bucket the current scan belongs to so
-        # the first tick after a fresh scan does not immediately re-fire.
-        def _b15(t=None):
+        # ── AUTO-REFRESH ON THE TRIGGER FRAME'S BAR CLOSE (opt-in) ───────────────────────
+        # Structure changes only when a BAR closes, and the bar that matters is your TRIGGER
+        # (Lower TF) — the frame you time the entry on. So re-scan on THAT frame's close, not
+        # blindly every 15 min: Intraday (15m) at :00/:15/:30/:45; BTST (1h) at :15 past each
+        # hour; Swing (4h) at 13:15 and the 15:30 close; Positional (1D) not at all intraday
+        # (its daily bar only closes at 15:30, and it is archive-based -- it does not even see
+        # today until the nightly sync). This matches how a chartist works -- wait for YOUR
+        # candle to finish -- and stops the slower horizons from re-pulling the whole universe
+        # four times an hour for a bar that has not moved. All bar closes fall on the 15-min
+        # grid, so a bucket keyed to the trigger frame's period catches its close exactly.
+        _LTF_MIN = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440, "1W": 10080}
+        # The preset / lower-TF widgets are defined FURTHER DOWN the script, so read the
+        # trigger frame from persisted session_state (their keys survive from the prior run;
+        # first run falls back to the widget defaults: btst -> 1h). Never reference the
+        # not-yet-executed widget vars here.
+        _pp = mtf.PRESETS.get(st.session_state.get("mtf_preset", "btst"))
+        _cl = st.session_state.get("mtf_ltf", "1h")
+        _trig = _pp["ltf"] if _pp else (_cl if _cl in _LTF_MIN else "15m")
+
+        def _bar_bucket(tf, t=None):
             t = t or dt.datetime.now()
-            return f"{t:%H}:{(t.minute // 15) * 15:02d}"
-        st.session_state["scanned_b15"] = _b15(_sa) if _sa else _b15()
+            m = _LTF_MIN.get(tf, 15)
+            if m >= 1440:                                  # daily+ -> one bucket per day (no intraday re-scan)
+                return f"{t:%Y-%m-%d}"
+            elapsed = (t.hour * 60 + t.minute) - (9 * 60 + 15)   # minutes since the 09:15 open
+            return f"{t:%Y-%m-%d}:{max(0, elapsed) // m}"
+
+        st.session_state["scanned_bucket"] = _bar_bucket(_trig, _sa) if _sa else _bar_bucket(_trig)
         if auto_struct:
             @st.fragment(run_every="20s")
             def _auto_rescan():
                 if not live.market_open():
                     return
-                if _b15() != st.session_state.get("scanned_b15"):
-                    st.session_state["scanned_b15"] = _b15()
+                if _bar_bucket(_trig) != st.session_state.get("scanned_bucket"):
+                    st.session_state["scanned_bucket"] = _bar_bucket(_trig)
                     st.session_state["uni_nonce"] += 1     # force a fresh pull on the next run
                     live._UNISCAN_CACHE.clear()
                     st.rerun()

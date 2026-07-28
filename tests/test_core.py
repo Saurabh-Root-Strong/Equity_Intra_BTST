@@ -1370,3 +1370,42 @@ def test_big_gap_ticks_live_like_headroom():
     import numpy as np
     bpx, atr = 108.0, 2.0
     assert round(abs(bpx - 100.0) / atr, 2) == 4.0 and round(abs(bpx - 104.0) / atr, 2) == 2.0
+
+
+def test_auto_refresh_cadence_is_trigger_frame_aware():
+    """Auto-refresh must re-scan on the TRIGGER (Lower TF) frame's bar close, not blindly every
+    15 min. Intraday(15m) fires 4x/hr; BTST(1h) once/hr at :15; Swing(4h) at 13:15 & the close;
+    Positional(1D) never intraday. Replicates the _bar_bucket math in dashboard._auto_rescan and
+    guards that the source still resolves the trigger from persisted session_state (the widgets
+    are defined later in the script, so referencing them directly would NameError)."""
+    import datetime as dt, inspect
+    from eqbtst import dashboard as _d
+    src = inspect.getsource(_d)
+    assert 'st.session_state.get("mtf_preset"' in src, "trigger must come from persisted preset key"
+    assert 'st.session_state.get("mtf_ltf"' in src, "custom trigger must come from persisted ltf key"
+
+    _LTF_MIN = {"15m": 15, "1h": 60, "2h": 120, "4h": 240, "1D": 1440}
+
+    def bucket(tf, t):
+        m = _LTF_MIN[tf]
+        if m >= 1440:
+            return f"{t:%Y-%m-%d}"
+        e = (t.hour * 60 + t.minute) - (9 * 60 + 15)
+        return f"{t:%Y-%m-%d}:{max(0, e) // m}"
+
+    def rescans(tf):
+        seen, n = set(), 0
+        for hm in ("09:16", "10:15", "11:15", "13:15", "14:15", "15:15"):
+            t = dt.datetime.strptime("2026-07-27 " + hm, "%Y-%m-%d %H:%M")
+            b = bucket(tf, t)
+            if b not in seen:
+                n += 1
+                seen.add(b)
+        return n
+
+    # over those 6 checkpoints: 15m rolls every time (6), 1h every hour (6 here all on :15),
+    # 4h only at 09:16 & 13:15 (2), 1D once for the whole day (1)
+    assert rescans("15m") == 6
+    assert rescans("1h") == 6
+    assert rescans("4h") == 2
+    assert rescans("1D") == 1
