@@ -900,9 +900,12 @@ if tf == "Intraday":
                       "(t=-0.66, not significant), if anything the reverse, consistent with 'a "
                       "break THROUGH the big level is the move'. So 'has room' does not predict "
                       "the stock rises; it only tells you the higher frame is not blocking it. "
-                      "Use it to SEE the level and size the trade, not to pick winners. The "
-                      "validated trade here is the overnight BTST carry (delivery footprint), "
-                      "not these levels.\n\n"
+                      "SHORT side same (43,042 down-structure days, causal weekly-FLOOR read): "
+                      "room-to-fall did NOT beat capped (t=0.41), and EVERY class loses as a "
+                      "short (room -14.5bps, capped -16.3) — the short side has no edge, room or "
+                      "not. Use this to SEE the level and size the trade, not to pick winners. "
+                      "The validated trade here is the overnight BTST carry (delivery "
+                      "footprint), not these levels.\n\n"
                       "Composes with Setup quality: 🟢 Long-side + ✅ Has room = longs with a "
                       "clear higher frame."))
             st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
