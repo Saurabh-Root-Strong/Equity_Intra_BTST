@@ -880,21 +880,26 @@ if tf == "Intraday":
                       "the range that usually fades).\n\n"
                       "Either way, the best setups are sorted to the top."))
             _room_f = pc3.selectbox(
-                "Upper-TF S/R (one frame up)", ["All", "✅ Room above", "🧱 Capped"],
+                "Upper-TF S/R (one frame up)", ["All", "✅ Has room", "🧱 Capped"],
                 index=0, key="mtf_roomf",
                 help=("Filter on the ONE HIGHER frame's wall (the `big wall` column) — the level "
                       "your two trading frames are blind to. Per horizon that frame is: Intraday "
-                      "→ 4h, BTST → 1D, Swing → 1W, Positional → 1M.\n\n"
-                      "• **✅ Room above** — keep only setups where the higher frame is NOT "
-                      "capping the trade: the big-frame wall in your direction is either **∞ "
-                      "clear** or **≥ 1 ATR away**, so your 1×ATR target has room. This is the "
-                      "'horizon setup AND upper-TF S/R confirms' list.\n"
-                      "• **🧱 Capped** — the opposite: only setups sitting **< 0.5 ATR** from a "
-                      "defended higher-frame wall in their direction — the ones most likely to "
-                      "stall or reverse into the big level. See what to AVOID (or wait for the "
-                      "break of).\n\n"
-                      "Composes with Setup quality: pick 🟢 Long-side + ✅ Room above for "
-                      "confirmed longs with a clear higher frame."))
+                      "→ 4h, BTST → 1D, Swing → 1W, Positional → 1M. 'Room' is always in the "
+                      "TRADE'S direction: for a LONG it is clear of the RESISTANCE above (room "
+                      "to rise); for a SHORT it is clear of the SUPPORT below (room to fall).\n\n"
+                      "• **✅ Has room** — the higher-frame wall in the trade's direction is **∞ "
+                      "clear** or **≥ 1 ATR away**, so the 1×ATR target has space. This is the "
+                      "'horizon setup AND the upper frame is not blocking it' list.\n"
+                      "• **🧱 Capped** — the opposite: **< 0.5 ATR** from a defended higher-frame "
+                      "wall in the trade's direction — most likely to stall or reverse into the "
+                      "big level (AVOID, or wait for a clean break of it — a break THROUGH is "
+                      "often the real move, so capped is not automatically 'goes the other way').\n\n"
+                      "⚠ This is a CHARTIST screen, NOT a measured edge — 'has room' does not "
+                      "predict the stock rises, only that the higher frame is not stopping it. "
+                      "The validated trade here is the overnight BTST carry, selected by the "
+                      "delivery footprint, not by these levels.\n\n"
+                      "Composes with Setup quality: 🟢 Long-side + ✅ Has room = longs with a "
+                      "clear higher frame."))
             st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
             # HOW PROVISIONAL IS THIS TAG? A forming trigger bar can relabel until it closes,
             # and the board never said so. Measured per preset (see mtf.REPAINT) rather than
@@ -1076,7 +1081,7 @@ if tf == "Intraday":
             # "Capped" = a defended higher-frame wall sits <0.5 ATR in the trade's direction.
             if _room_f != "All" and "big_gap" in light.columns:
                 _bg = pd.to_numeric(light["big_gap"], errors="coerce")
-                if _room_f == "✅ Room above":
+                if _room_f == "✅ Has room":
                     light, _setup_on = light[np.isinf(_bg) | (_bg >= 1.0)], True
                 elif _room_f == "🧱 Capped":
                     light, _setup_on = light[_bg < 0.5], True
