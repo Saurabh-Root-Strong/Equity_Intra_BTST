@@ -1331,3 +1331,25 @@ def test_upper_tf_room_filter_wired():
     capped = [x for x in bg[bg < 0.5]]
     assert np.inf in room and 1.5 in room and 0.8 not in room, "Room = inf or >=1.0"
     assert 0.3 in capped and 0.1 in capped and 0.8 not in capped, "Capped = <0.5; marginal excluded"
+
+
+def test_enriched_view_carries_and_splits_by_setup_side():
+    """The MTF-setup layer (side, big_wall, big_gap) was added to add_setup/the light board and
+    the pre-filter tabs, but enrich_mtf never carried it — so the POST-filter enriched view lost
+    those columns and split its LONG/SHORT tabs by the intraday footprint `action` instead of
+    the setup `side`, with a dump-all fallback. Off-hours (no footprint) that fallback fired
+    every time, showing NESTED SQUEEZE / RANGE-BOUND (no-side) rows under the LONG tab. enrich
+    must carry side/big_wall/big_gap and the tabs must split on side, consistent with the filter
+    the user selected on."""
+    import inspect
+    from eqbtst import live as _l
+    esrc = inspect.getsource(_l.enrich_mtf)
+    for col in ('"side"', '"big_wall"', '"big_gap"'):
+        assert col in esrc, f"enrich_mtf must carry {col} so the enriched view keeps it"
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = dash.find("def _struct_panel")
+    body = dash[i:i + 2500]
+    assert 'bb["side"] == "LONG"' in body, "enriched LONG tab must split on the setup side"
+    assert 'bb["side"] == "SHORT"' in body, "enriched SHORT tab must split on the setup side"
+    assert "else bb" not in body.split("bb[\"side\"] == \"LONG\"")[0][-200:], \
+        "the dump-all fallback (show every match under LONG) must be gone"

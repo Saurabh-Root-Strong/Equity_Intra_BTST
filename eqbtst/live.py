@@ -1750,7 +1750,11 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             "bnds4h": r.get("bnds4h"), "bnds1D": r.get("bnds1D"), "bnds1W": r.get("bnds1W"),
             "sector": r["sector"], "ltp": ltp, "turn₹L": r.get("turn₹L"),
             # carried through so the enriched table keeps the HTFxLTF read it was selected on
-            "setup": r.get("setup"), "loc": r.get("loc"),
+            "setup": r.get("setup"), "loc": r.get("loc"), "dir": r.get("dir"),
+            # SIDE + the one-frame-up big wall MUST travel through enrich too, or the enriched
+            # view loses the very columns the setup filter and the room filter select on -- and
+            # its LONG/SHORT tabs then have nothing to split on but the footprint `action`.
+            "side": r.get("side"), "big_wall": r.get("big_wall"), "big_gap": r.get("big_gap"),
             "setup_rank": r.get("setup_rank"), "setup_read": r.get("setup_read"),
             "sup": r.get("sup"), "sup_t": r.get("sup_t"), "res": r.get("res"),
             "res_t": r.get("res_t"), "headroom": r.get("headroom"),

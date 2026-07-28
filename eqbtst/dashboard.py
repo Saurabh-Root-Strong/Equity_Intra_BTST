@@ -1366,24 +1366,33 @@ if tf == "Intraday":
             st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure/levels as-of "
                        f"{_sa:%H:%M}" if (_sa and live.market_open())
                        else "market closed — last-session values")
+            # SPLIT BY THE SETUP SIDE, consistent with the filter chain and the pre-filter tabs
+            # (the user selected these names by side + room, which are SIDE concepts). `action`
+            # / `sell` — the intraday FOOTPRINT verdict — stay as columns, so you see whether the
+            # footprint agrees with the MTF side. The old split was by `action` and, when no
+            # footprint fired (every off-hours session), fell back to dumping ALL matches under
+            # LONG — which is why NESTED SQUEEZE / RANGE-BOUND (no-side) rows appeared as longs.
+            _has_side = "side" in bb.columns
             tb, tsh = st.tabs([f"🟢 LONG ({levels_tf} bars)", f"🔴 SHORT ({levels_tf} bars)"])
             with tb:
-                lo = bb[bb["action"] == "LONG"]
-                _lo = lo if not lo.empty else bb
-                st.dataframe(_fmt(_lo)[_cols(_lo, long_cols)], use_container_width=True,
-                             hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS})
-                _tally(len(_lo), sc["n_scanned"], "names",
-                       f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}"
-                       + ("" if lo.empty else f" · {len(lo)} LONG"))
+                lo = bb[bb["side"] == "LONG"] if _has_side else bb[bb["action"] == "LONG"]
                 if lo.empty:
-                    st.caption("No LONG verdict among the matches — showing all matches.")
+                    st.caption("No LONG-side setup among the matches. That is a reading of the "
+                               "tape, not an error — loosen a filter to see more.")
+                else:
+                    st.dataframe(_fmt(lo)[_cols(lo, long_cols)], use_container_width=True,
+                                 hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS})
+                    _tally(len(lo), sc["n_scanned"], "names",
+                           f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
             with tsh:
                 st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Overnight "
                            "short is proven -EV (win 20%); intraday direction has no validated "
                            "edge either. Weakness screen, not alpha — trade small, manage by s_stop.")
-                sh = bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell")
+                sh = (bb[bb["side"] == "SHORT"] if _has_side
+                      else bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell"))
                 if sh.empty:
-                    st.caption("No distribution/weakness names among the matches.")
+                    st.caption("No SHORT-side setup among the matches. A reading of the tape, "
+                               "not an error.")
                 else:
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                  hide_index=True,
