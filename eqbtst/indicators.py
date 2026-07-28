@@ -369,7 +369,17 @@ def walls(h, l, tol: float, w: int = 2) -> list[tuple[float, int]]:
     amount: 2 rupees is a wide zone on a 90-rupee name and noise on a 9,000-rupee one.
 
     Returns [(level, touches)] sorted by price. Levels are the touch-weighted mean of their
-    cluster, so a level drifts toward where price actually turned most often."""
+    cluster, so a level drifts toward where price actually turned most often.
+
+    DELIBERATELY GLOBAL, NOT SPLIT PER SIDE OF PRICE (unlike live._live_levels). The live path
+    clusters each side of price separately because it uses SINGLE-LINKAGE on the running EDGE,
+    which chained a distant wall across price (the MPHASIS bug: a x4 resistance absorbed into a
+    support 24pts below). This function uses the touch-weighted MEAN instead: a member only
+    merges if within tol of the cluster's CENTRE, which lags and breaks the chain, so it does
+    not drift the same way. MEASURED before trusting that (536 archive 1D/1W frames): 0 straddling
+    clusters spanned >1.5 ATR across price; all 122 were <=1.22 ATR — i.e. price sitting ON one
+    level, whose pivots fall slightly both sides. Splitting here would have broken 116 real
+    price-on-level singles into weaker halves to fix ZERO actual chains. Leave it global."""
     his, los = pivots(h, l, w=w)
     lv: list[list] = []
     for x in sorted(his + los):
