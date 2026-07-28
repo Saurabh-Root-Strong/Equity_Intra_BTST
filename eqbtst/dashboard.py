@@ -1059,6 +1059,8 @@ if tf == "Intraday":
         # SETUP READ — free (pure arithmetic on boxes the scan already carried). Applied to the
         # WHOLE universe so the default view is already sorted best-context-first.
         _setup_on = False
+        _room_on = False
+        _n_setup = None
         _census = None
         if _P:
             light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"])
@@ -1087,17 +1089,20 @@ if tf == "Intraday":
             # to. big_gap is still NUMERIC here (float, inf for clear); _fmt stringifies it only
             # at render. "Room" = the higher frame is not capping the trade (clear or >=1 ATR);
             # "Capped" = a defended higher-frame wall sits <0.5 ATR in the trade's direction.
+            # A SEPARATE flag from setup quality so the funnel can attribute each cut honestly:
+            # picking "Has room" with Setup quality = All must NOT read as a "setup" cut.
+            _n_setup = len(light)                       # count AFTER setup quality, BEFORE room
             if _room_f != "All" and "big_gap" in light.columns:
                 _bg = pd.to_numeric(light["big_gap"], errors="coerce")
                 if _room_f == "✅ Has room":
-                    light, _setup_on = light[np.isinf(_bg) | (_bg >= 1.0)], True
+                    light, _room_on = light[np.isinf(_bg) | (_bg >= 1.0)], True
                 elif _room_f == "🧱 Capped":
-                    light, _setup_on = light[_bg < 0.5], True
+                    light, _room_on = light[_bg < 0.5], True
             light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
 
         after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
         filtered = _mtf_filter(after_deliv)
-        active = _htf_on or _ltf_on or _setup_on or (min_wtd > 0) or (min_vs > 0)
+        active = _htf_on or _ltf_on or _setup_on or _room_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = (["symbol", "sector", "ltp", "turn₹L", "day%"]
                       + (["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else [])
                       + ["wtd_deliv7", "deliv_vs_100d",
@@ -1299,7 +1304,9 @@ if tf == "Intraday":
         # it?), not a mystery. Only stages you actually engaged appear.
         _funnel = [f"scanned **{sc['n_scanned']}**"]
         if _setup_on:
-            _funnel.append(f"setup ({_setup_f}) → **{len(light)}**")
+            _funnel.append(f"setup ({_setup_f}) → **{_n_setup if _n_setup is not None else len(light)}**")
+        if _room_on:
+            _funnel.append(f"upper-TF ({_room_f}) → **{len(light)}**")
         if (st.session_state.get("price_max") or 0) or (st.session_state.get("price_min") or 0):
             _funnel.append(f"price band → **{len(light)}**")
         if min_wtd > 0 or min_vs > 0:
