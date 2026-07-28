@@ -483,21 +483,24 @@ SR_COLS = {
              "backwards is evidence the logic is wrong, not free money the other way."),
     "headroom": st.column_config.TextColumn(
         "headroom",
-        help="**How much ROOM is left before price hits the next defended level IN YOUR TRADE'S "
-             "DIRECTION** (a ≥2-touch wall), measured in ATR — the same unit as your stop and "
-             "target, so the numbers line up. For a **LONG** it is room UP to the next ceiling; "
-             "for a **SHORT** it is room DOWN to the next floor. (The LONG/SHORT tab you are on "
-             "sets which way it looks.)\n\n"
-             "• **∞** = CLEAR ROAD — no defended level in the way. Good.\n"
-             "• **< 0.5** = you are trading RIGHT INTO a level. Your target sits on the far "
-             "side of a wall the market has already turned back twice — expect a fight.\n\n"
-             "Shown, never enforced — a break THROUGH the level is often the trade, not a "
-             "reason to skip. Your call, not a veto.\n\n"
-             "**Example (long):** price ₹380, ceiling ₹388, ATR ₹8 → headroom = (388−380)/8 = "
-             "**1.0** (one full ATR of room). If the ceiling were ₹383 → headroom **0.4** — you'd "
-             "hit it almost immediately. A **short** reads the same, but toward the floor below.\n\n"
-             "⚠ This is context, not a signal on fast frames: measured, it only carries "
-             "information on the DAILY and WEEKLY; on 15m–4h a random line reacts the same."),
+        help="**How far to the level shown in `res` (long) / `sup` (short)** — the SAME nearest "
+             "level, just expressed as a distance in ATR (the unit of your stop and target). For "
+             "a **LONG** it is room UP to `res`; for a **SHORT** it is room DOWN to `sup`. The "
+             "LONG/SHORT tab sets which way it looks.\n\n"
+             "• **∞** = CLEAR ROAD — no level that side at all.\n"
+             "• **< 0.5** = you are trading RIGHT INTO the level — it sits between you and your "
+             "1-ATR target. The `res×`/`sup×` count tells you how many times price turned there.\n\n"
+             "**It matches `res`/`sup` by construction** — if the `res` column shows a level "
+             "overhead, headroom is finite, never '∞ clear'. (It used to gate on ≥2 touches, so a "
+             "single violent rejection — one big spike-and-crash — read '∞ clear' while `res` "
+             "showed the level right there. Fixed.)\n\n"
+             "**Example (long):** price ₹380, `res` ₹388, ATR ₹8 → headroom = (388−380)/8 = "
+             "**1.0**. If `res` were ₹383 → **0.4**, you'd hit it almost at once. A short reads "
+             "the same toward `sup` below.\n\n"
+             "⚠ A MAP, NOT A SIGNAL. Measured (7,061 daily approaches, placebo-controlled): a "
+             "real swing high is respected **69.2%** vs **70.5%** for a random line — the level "
+             "does NOT cap price more than chance, and the touch count does not change that. Use "
+             "it to SEE where the visible level is, never as a reason the trade will work."),
 }
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).

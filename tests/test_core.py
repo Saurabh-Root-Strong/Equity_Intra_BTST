@@ -1429,3 +1429,28 @@ def test_headroom_is_direction_aware_by_side():
     # no-side / missing side defaults to UP (long behaviour), never crashes
     ns = live._live_levels(pd.DataFrame([base])).iloc[0]
     assert abs(ns["headroom"] - 3.0) < 1e-6
+
+
+def test_headroom_matches_res_sup_and_sees_single_violent_rejection():
+    """headroom must equal the distance to the level the res/sup column shows -- ANY touch count.
+    Regression for PPLPHARMA: a single violent rejection (res 196.44 x1) read '∞ clear' because
+    headroom gated on >=2 touches while res displayed the level. Measured: touch count carries no
+    forward edge (real 69.2% vs random 70.5%), so the gate only made the board contradict its own
+    res column. Now they agree by construction."""
+    import numpy as np, pandas as pd
+    from eqbtst import live
+    # one 1-touch resistance 3 ATR above price (like 196 over 193), nothing else
+    b = live._live_levels(pd.DataFrame([{
+        "ltp": 193.35, "_sr_atr": 1.0, "side": "LONG",
+        "_wall_pair": [(196.44, 1, "4h")]}])).iloc[0]
+    assert b["res"] == 196.44 and b["res_t"] == 1, "the 1-touch level must still show in res"
+    assert not np.isinf(b["headroom"]), "headroom must NOT read '∞ clear' when res shows a level"
+    assert abs(b["headroom"] - 3.09) < 1e-2, f"headroom = (196.44-193.35)/1 = 3.09, got {b['headroom']}"
+    # and it equals the res distance exactly (consistency by construction)
+    assert abs(b["headroom"] - (b["res"] - b["ltp"]) / 1.0) < 1e-6
+    # SHORT mirror: a 1-touch support below -> headroom down to sup, finite
+    s = live._live_levels(pd.DataFrame([{
+        "ltp": 193.35, "_sr_atr": 1.0, "side": "SHORT",
+        "_wall_pair": [(190.0, 1, "4h")]}])).iloc[0]
+    assert s["sup"] == 190.0 and not np.isinf(s["headroom"])
+    assert abs(s["headroom"] - (s["ltp"] - s["sup"]) / 1.0) < 1e-6
