@@ -940,7 +940,20 @@ if tf == "Intraday":
             # and the board never said so. Measured per preset (see mtf.REPAINT) rather than
             # hand-waved, because the answer differs by an order of magnitude across the four.
             _rp = mtf.REPAINT.get(preset or "", {})
-            if _rp and _rp.get("midday_differs"):
+            # THE BANNER MUST KEY OFF WHAT THE TRIGGER FRAME ACTUALLY IS, NOT off midday_differs==0.
+            # Only a 1D/1W trigger is archive-based and truly fixed for the session. Swing's trigger
+            # is 4h -- a LIVE intraday resample of today's 15m fetch: it sees today and repaints
+            # until the 4h bar closes (13:15, 15:30). Routing it through the FIXED text (as
+            # midday_differs==0 did) told the user the 4h bar was "a closed daily bar from the
+            # archive" that "does NOT see today" -- all three claims false. Three honest cases:
+            _arch_trigger = _P["ltf"] in ("1D", "1W")           # archive-based, cannot repaint
+            if _arch_trigger:
+                st.caption(
+                    f"🔒 **This read is FIXED for the session** — the {_P['ltf']} trigger bar "
+                    f"is a closed archive bar, so nothing here can repaint intraday. It also "
+                    f"means it does NOT see today's session; only `ltp`, `loc` and the live "
+                    f"levels move.")
+            elif _rp and _rp.get("midday_differs"):
                 st.caption(
                     f"🔄 **This read is PROVISIONAL — the {_P['ltf']} trigger bar is still "
                     f"printing.** Replaying full sessions: a name passes through "
@@ -949,12 +962,16 @@ if tf == "Intraday":
                     f"the time**, and the label only settles after **{_rp['settles_pct']}% of "
                     f"the session has elapsed**. Treat it as a running commentary, not a "
                     f"decision — and remember each change of mind is another ~22bps round trip.")
-            elif _rp:
+            else:
+                # Live INTRADAY trigger that repaints little (Swing's 4h: only ~2 bars form per
+                # day). Honest middle: it is live and sees today, updates when the trigger bar
+                # closes, and its forming bar can still shift the read -- but it settles fast.
                 st.caption(
-                    f"🔒 **This read is FIXED for the session** — the {_P['ltf']} trigger bar "
-                    f"is a closed daily bar from the archive, so nothing here can repaint "
-                    f"intraday. It also means it does NOT see today's session; only `ltp`, "
-                    f"`loc` and the live levels move.")
+                    f"🟡 **This read is LIVE but slow-moving** — the {_P['ltf']} trigger is an "
+                    f"intraday bar, so it DOES see today and updates when each {_P['ltf']} bar "
+                    f"closes (e.g. 4h at 13:15 and 15:30). The forming bar can still shift the "
+                    f"tag, but only ~2 bars print per session, so it settles far faster than the "
+                    f"15m/1h triggers. Not archive-fixed; not fast-repainting either.")
         with st.expander("🧭 Higher TF vs Lower TF — the whole idea in 30 seconds"):
             st.markdown(
                 "**Think of it like a map.**\n\n"
