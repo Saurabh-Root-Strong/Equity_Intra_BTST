@@ -831,7 +831,7 @@ if tf == "Intraday":
         _PRE_OPTS = ["custom"] + mtf.PRESET_ORDER
         _pre_lbl = {"custom": "⚙ Custom — pick both frames myself",
                     **{k: v["label"] for k, v in mtf.PRESETS.items()}}
-        pc1, pc2 = st.columns([3, 2])
+        pc1, pc2, pc3 = st.columns([3, 2, 2])
         preset = pc1.selectbox("Trade horizon (sets both timeframes)", _PRE_OPTS,
                                index=_PRE_OPTS.index("btst"), key="mtf_preset",
                                format_func=lambda k: _pre_lbl[k],
@@ -865,6 +865,7 @@ if tf == "Intraday":
                        "is analysing. Different questions: the sidebar is the page, the "
                        "dropdown is the hold.")
         _setup_f = "All"
+        _room_f = "All"
         if _P:
             _setup_f = pc2.selectbox(
                 "Setup quality", ["All", "🎯 Textbook only", "🟢 Long-side setups",
@@ -878,6 +879,22 @@ if tf == "Intraday":
                       "• **🪤 Exclude traps** — hides the fake breakouts (a pop in the middle of "
                       "the range that usually fades).\n\n"
                       "Either way, the best setups are sorted to the top."))
+            _room_f = pc3.selectbox(
+                "Upper-TF S/R (one frame up)", ["All", "✅ Room above", "🧱 Capped"],
+                index=0, key="mtf_roomf",
+                help=("Filter on the ONE HIGHER frame's wall (the `big wall` column) — the level "
+                      "your two trading frames are blind to. Per horizon that frame is: Intraday "
+                      "→ 4h, BTST → 1D, Swing → 1W, Positional → 1M.\n\n"
+                      "• **✅ Room above** — keep only setups where the higher frame is NOT "
+                      "capping the trade: the big-frame wall in your direction is either **∞ "
+                      "clear** or **≥ 1 ATR away**, so your 1×ATR target has room. This is the "
+                      "'horizon setup AND upper-TF S/R confirms' list.\n"
+                      "• **🧱 Capped** — the opposite: only setups sitting **< 0.5 ATR** from a "
+                      "defended higher-frame wall in their direction — the ones most likely to "
+                      "stall or reverse into the big level. See what to AVOID (or wait for the "
+                      "break of).\n\n"
+                      "Composes with Setup quality: pick 🟢 Long-side + ✅ Room above for "
+                      "confirmed longs with a clear higher frame."))
             st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
             # HOW PROVISIONAL IS THIS TAG? A forming trigger bar can relabel until it closes,
             # and the board never said so. Measured per preset (see mtf.REPAINT) rather than
@@ -1053,6 +1070,16 @@ if tf == "Intraday":
                 light, _setup_on = light[light["side"] == "SHORT"], True
             elif _setup_f == "🪤 Exclude traps":
                 light, _setup_on = light[~light["setup"].isin(mtf.AVOID_TAGS)], True
+            # UPPER-TF S/R FILTER — on the big-wall (one frame up), the level the pair is blind
+            # to. big_gap is still NUMERIC here (float, inf for clear); _fmt stringifies it only
+            # at render. "Room" = the higher frame is not capping the trade (clear or >=1 ATR);
+            # "Capped" = a defended higher-frame wall sits <0.5 ATR in the trade's direction.
+            if _room_f != "All" and "big_gap" in light.columns:
+                _bg = pd.to_numeric(light["big_gap"], errors="coerce")
+                if _room_f == "✅ Room above":
+                    light, _setup_on = light[np.isinf(_bg) | (_bg >= 1.0)], True
+                elif _room_f == "🧱 Capped":
+                    light, _setup_on = light[_bg < 0.5], True
             light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
 
         after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE

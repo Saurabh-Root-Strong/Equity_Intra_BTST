@@ -1309,3 +1309,25 @@ def test_big_wall_surfaces_the_higher_frame_level_the_pair_is_blind_to():
     # graceful when no monthly wall exists
     bn = _l.add_setup(pd.DataFrame([dict(prow, sr_wall1M=[])]), ltf="1D", htf="1W").iloc[0]
     assert bn["big_wall"] == "" and np.isinf(bn["big_gap"])
+
+
+def test_upper_tf_room_filter_wired():
+    """The big-wall was display-only; the user wanted a SELECTION on it — show only setups the
+    one-frame-up S/R confirms. The 'Upper-TF room' filter keeps 'Room above' (big_gap ∞ or ≥1
+    ATR — the higher frame is not capping the trade) or 'Capped' (big_gap <0.5 — a defended
+    higher-frame wall right in the trade's direction). Composes with Setup quality: Long-side +
+    Room above = confirmed longs with a clear higher frame. Filters on the NUMERIC big_gap
+    (inf=clear), before _fmt stringifies it."""
+    import numpy as np, pandas as pd
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert 'key="mtf_roomf"' in src, "the Upper-TF room selectbox must exist"
+    assert '"✅ Room above"' in src and '"🧱 Capped"' in src
+    # the filter must run on the numeric big_gap (inf for clear), not the rendered string
+    assert "np.isinf(_bg) | (_bg >= 1.0)" in src, "Room = clear or >=1 ATR"
+    assert "_bg < 0.5" in src, "Capped = <0.5 ATR"
+    # behavioural: the thresholds partition as intended
+    bg = pd.to_numeric(pd.Series([np.inf, 0.3, 0.8, 1.5, 0.1]), errors="coerce")
+    room = [x for x in bg[np.isinf(bg) | (bg >= 1.0)]]
+    capped = [x for x in bg[bg < 0.5]]
+    assert np.inf in room and 1.5 in room and 0.8 not in room, "Room = inf or >=1.0"
+    assert 0.3 in capped and 0.1 in capped and 0.8 not in capped, "Capped = <0.5; marginal excluded"
