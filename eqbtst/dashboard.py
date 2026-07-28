@@ -365,7 +365,9 @@ SETUP_COLS = {
              "**0.0 = at the bottom (floor) · 1.0 = at the top (ceiling) · 0.5 = middle.**\n\n"
              "This decides if a breakout is real: near the top (≥0.72) a break UP can genuinely "
              "clear the range; near the bottom (≤0.28) a break DOWN is real. In the MIDDLE, a "
-             "'break' is usually a fake — there was nothing to break through."),
+             "'break' is usually a fake — there was nothing to break through.\n\n"
+             "**Example:** range ₹350–₹400, price ₹380 → loc = 0.60 (a bit above the middle). "
+             "Price ₹398 → loc 0.96 (right at the ceiling — a break up here is real)."),
 }
 
 # Touch-counted dynamic support/resistance (eqbtst/indicators.py :: walls).
@@ -376,7 +378,9 @@ SR_COLS = {
              "stock has BOUNCED UP before, so buyers tend to step in there. Not a line someone "
              "drew — a spot where price actually turned around, more than once.\n\n"
              "Blank = no clear floor below (price is in open air under it). Prices are adjusted "
-             "for splits/bonuses, so they match today's scale."),
+             "for splits/bonuses, so they match today's scale.\n\n"
+             "**Example:** `sup 355.00` — the stock keeps bouncing up from around ₹355. If it "
+             "drops toward there, buyers have stepped in before, so it may hold again."),
     "sup_t": st.column_config.NumberColumn(
         "sup×", format="%d",
         help="**How many times price has BOUNCED off that support** (the ×). This is your "
@@ -386,17 +390,23 @@ SR_COLS = {
              "⚠ MORE IS NOT ALWAYS STRONGER. Measured: at **5+ touches the edge flips** — a "
              "floor hit that many times is usually being worn down and about to BREAK. So a "
              "high number means 'this level is about to matter, one way or the other', not "
-             "'rock-solid floor'."),
+             "'rock-solid floor'.\n\n"
+             "**Example:** `sup 355 · sup× 3` — price bounced up off ₹355 three separate times. "
+             "A defended floor. `sup× 1` at the same price = it only touched once — much weaker."),
     "res": st.column_config.NumberColumn(
         "res", format="%.2f",
         help="**RESISTANCE — the nearest CEILING above the current price.** A level where the "
              "stock has been REJECTED (turned back down) before, so sellers tend to appear "
              "there.\n\n"
-             "Blank = clear sky above, no ceiling nearby — common right after a real breakout."),
+             "Blank = clear sky above, no ceiling nearby — common right after a real breakout.\n\n"
+             "**Example:** `res 400.00` — the stock keeps getting pushed back down from around "
+             "₹400. If it rises toward there, expect sellers; it may stall or reverse."),
     "res_t": st.column_config.NumberColumn(
         "res×", format="%d",
         help="**How many times price has been REJECTED at that ceiling** (the ×). Same reading "
-             "as sup×: 1 = weak, 2–3 = a defended ceiling, 5+ = worn down and about to break."),
+             "as sup×: 1 = weak, 2–3 = a defended ceiling, 5+ = worn down and about to break.\n\n"
+             "**Example:** `res 400 · res× 4` — price was turned back down from ₹400 four times. "
+             "A strong ceiling — but by 5+ it is more likely to finally break than hold."),
     "side": st.column_config.TextColumn(
         "side", width="small",
         help="Which side the HTF × LTF setup argues for — read off the setup's DIRECTION, "
@@ -481,6 +491,9 @@ SR_COLS = {
              "side of a level the market has already turned back twice — expect a fight.\n\n"
              "Shown, never enforced — a break THROUGH the ceiling is often the trade, not a "
              "reason to skip. Your call, not a veto.\n\n"
+             "**Example:** price ₹380, ceiling ₹388, ATR ₹8 → headroom = (388−380)/8 = **1.0** "
+             "(one full ATR of room). If the ceiling were ₹383 → headroom **0.4** — you'd hit "
+             "it almost immediately.\n\n"
              "⚠ This is context, not a signal on fast frames: measured, it only carries "
              "information on the DAILY and WEEKLY; on 15m–4h a random line reacts the same."),
 }
