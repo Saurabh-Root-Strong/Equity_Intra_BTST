@@ -1409,3 +1409,23 @@ def test_auto_refresh_cadence_is_trigger_frame_aware():
     assert rescans("1h") == 6
     assert rescans("4h") == 2
     assert rescans("1D") == 1
+
+
+def test_headroom_is_direction_aware_by_side():
+    """headroom must measure room in the TRADE'S direction: UP to the ceiling for a long, DOWN
+    to the floor for a short. It was hardcoded upward, so the enriched SHORT tab showed distance
+    to the resistance overhead -- irrelevant/backwards for a short. Build one board with a
+    defended wall on each side of price and assert the sign of headroom follows `side`."""
+    import numpy as np, pandas as pd
+    from eqbtst import live
+    # walls: a 3-touch floor 2 ATR below (96) and a 3-touch ceiling 3 ATR above (106); price 100, ATR 2
+    pair = [(96.0, 3, "1h"), (106.0, 3, "1h")]
+    base = dict(ltp=100.0, _sr_atr=2.0, _wall_pair=pair)
+    long_b = live._live_levels(pd.DataFrame([{**base, "side": "LONG"}])).iloc[0]
+    short_b = live._live_levels(pd.DataFrame([{**base, "side": "SHORT"}])).iloc[0]
+    # long looks UP: (106-100)/2 = 3.0 ; short looks DOWN: (100-96)/2 = 2.0
+    assert abs(long_b["headroom"] - 3.0) < 1e-6, f"long headroom up to ceiling, got {long_b['headroom']}"
+    assert abs(short_b["headroom"] - 2.0) < 1e-6, f"short headroom down to floor, got {short_b['headroom']}"
+    # no-side / missing side defaults to UP (long behaviour), never crashes
+    ns = live._live_levels(pd.DataFrame([base])).iloc[0]
+    assert abs(ns["headroom"] - 3.0) < 1e-6

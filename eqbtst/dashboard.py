@@ -483,17 +483,19 @@ SR_COLS = {
              "backwards is evidence the logic is wrong, not free money the other way."),
     "headroom": st.column_config.TextColumn(
         "headroom",
-        help="**How much ROOM is left before price hits the next ceiling above** (a defended "
-             "≥2-touch resistance), measured in ATR — the same unit as your stop and target, so "
-             "the numbers line up.\n\n"
-             "• **∞** = CLEAR ROAD — no ceiling above at all. Good — nothing in the way.\n"
-             "• **< 0.5** = you are buying RIGHT INTO a ceiling. Your target sits on the far "
-             "side of a level the market has already turned back twice — expect a fight.\n\n"
-             "Shown, never enforced — a break THROUGH the ceiling is often the trade, not a "
+        help="**How much ROOM is left before price hits the next defended level IN YOUR TRADE'S "
+             "DIRECTION** (a ≥2-touch wall), measured in ATR — the same unit as your stop and "
+             "target, so the numbers line up. For a **LONG** it is room UP to the next ceiling; "
+             "for a **SHORT** it is room DOWN to the next floor. (The LONG/SHORT tab you are on "
+             "sets which way it looks.)\n\n"
+             "• **∞** = CLEAR ROAD — no defended level in the way. Good.\n"
+             "• **< 0.5** = you are trading RIGHT INTO a level. Your target sits on the far "
+             "side of a wall the market has already turned back twice — expect a fight.\n\n"
+             "Shown, never enforced — a break THROUGH the level is often the trade, not a "
              "reason to skip. Your call, not a veto.\n\n"
-             "**Example:** price ₹380, ceiling ₹388, ATR ₹8 → headroom = (388−380)/8 = **1.0** "
-             "(one full ATR of room). If the ceiling were ₹383 → headroom **0.4** — you'd hit "
-             "it almost immediately.\n\n"
+             "**Example (long):** price ₹380, ceiling ₹388, ATR ₹8 → headroom = (388−380)/8 = "
+             "**1.0** (one full ATR of room). If the ceiling were ₹383 → headroom **0.4** — you'd "
+             "hit it almost immediately. A **short** reads the same, but toward the floor below.\n\n"
              "⚠ This is context, not a signal on fast frames: measured, it only carries "
              "information on the DAILY and WEEKLY; on 15m–4h a random line reacts the same."),
 }

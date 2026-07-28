@@ -1468,8 +1468,18 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
         sup_t.append(int(s_[1]))
         res.append(round(r_[0], 2) if r_[0] == r_[0] else np.nan)
         res_t.append(int(r_[1]))
-        up2 = [x for x, t, _ in wl if t >= 2 and x > px]
-        head.append(round((min(up2) - px) / a, 2) if (up2 and a > 0) else np.inf)
+        # HEADROOM IN THE TRADE'S DIRECTION, NOT ALWAYS UP. A long's room-to-run is UP to the
+        # nearest defended ceiling; a SHORT's is DOWN to the nearest defended floor. This column
+        # was hardcoded upward, so on the enriched SHORT tab it showed distance to the resistance
+        # OVERHEAD -- irrelevant to a short, and backwards as a "room" read: a short pinned right
+        # under a ceiling has ~0 upward headroom, yet that ceiling is exactly what caps it. Split
+        # on `side` (set by add_setup before this runs); default (no side / long) keeps UP.
+        if str(r.get("side")) == "SHORT":
+            dn2 = [x for x, t, _ in wl if t >= 2 and x < px]
+            head.append(round((px - max(dn2)) / a, 2) if (dn2 and a > 0) else np.inf)
+        else:
+            up2 = [x for x, t, _ in wl if t >= 2 and x > px]
+            head.append(round((min(up2) - px) / a, 2) if (up2 and a > 0) else np.inf)
         # LIVE TEST IN PROGRESS — price is sitting on a previously-defended level right now
         tol = _AT_WALL_ATR * a
         on = [(x, t) for x, t, _ in wl if t >= 2 and abs(x - px) <= tol] if a > 0 else []
