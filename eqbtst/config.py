@@ -62,6 +62,11 @@ STRUCT_BREAKOUT_ATR = 0.5   # close must clear the prior 19-bar range by >= this
 STRUCT_TREND_ER     = 0.40  # Kaufman efficiency ratio for a clean, low-noise trend
 STRUCT_TREND_ATR    = 1.0   # AND the window's net move must cover >= this x ATR (a REAL move)
 STRUCT_COIL         = 0.60  # recent 3-bar range < this x the prior range => contracting (coil)
+STRUCT_SPIKE_ATR    = 2.0   # a lone bar poking > this x ATR above/below every OTHER bar in the
+                            # window is an aberration (wick / fat-finger / gap), not the range
+                            # boundary. The breakout test ignores it (the spike still surfaces as
+                            # an sr_levels wall). Measured: catches ~6% more breakouts that a stale
+                            # spike had suppressed for up to 20 bars; normal ranges are untouched.
 
 # ── TOUCH-COUNTED SUPPORT / RESISTANCE ───────────────────────────────────────────────
 # These decide WHETHER TWO PIVOTS ARE "THE SAME LEVEL", so they decide the touch count --

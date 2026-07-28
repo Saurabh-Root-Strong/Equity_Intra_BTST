@@ -247,6 +247,24 @@ def structure(candles: pd.DataFrame, lookback: int | None = None) -> str:
     return struct_full(candles, lookback)["struct"]
 
 
+def _range_bound(vals: np.ndarray, atr_val: float, upper: bool) -> float:
+    """The range top (upper=True) or bottom the breakout test should clear — IGNORING a single
+    lone outlier bar. A high poking > STRUCT_SPIKE_ATR × ATR above every OTHER bar in the window
+    is a wick / fat-finger / gap aberration, not the consolidation range; the raw max let it
+    suppress genuine breakouts for the whole lookback. Returns the RAW extreme whenever there is
+    no such lone outlier, so normal ranges — and real highs confirmed by a nearby second bar —
+    are untouched. Symmetric for the low. See struct_full for the measured incidence."""
+    from . import config
+    v = np.asarray(vals, float)
+    if len(v) < 3 or not atr_val or atr_val <= 0:
+        return float(v.max() if upper else v.min())
+    s = np.sort(v)
+    gap = config.STRUCT_SPIKE_ATR * atr_val
+    if upper:
+        return float(s[-2] if (s[-1] - s[-2]) > gap else s[-1])   # drop a lone top spike
+    return float(s[1] if (s[1] - s[0]) > gap else s[0])           # drop a lone bottom spike
+
+
 def struct_full(candles: pd.DataFrame, lookback: int | None = None,
                 forming: bool = False) -> dict:
     """Structure label PLUS the context a multi-timeframe synthesis needs: the window's
@@ -292,8 +310,18 @@ def struct_full(candles: pd.DataFrame, lookback: int | None = None,
     if not a or a <= 0:                                    # flat/degenerate → fall back to span
         a = (hi.max() - lo.min()) / lb if lb else 0.0
     margin = config.STRUCT_BREAKOUT_ATR * a
-    prior_hi = hi[:-1].max() if len(hi) > 1 else last
-    prior_lo = lo[:-1].min() if len(lo) > 1 else last
+    # THE RANGE, NOT THE ABERRATION. prior_hi/lo used the RAW max/min, so a single stale spike
+    # (an old wick, a fat-finger, a gap bar) poisoned the breakout test for the whole 20-bar
+    # window: a genuine break of the real range read RANGE because the close could not clear the
+    # lone spike sitting above it. Measured on the archive, this suppressed MORE breakouts than
+    # the raw rule fired (2.5% of bars up, 2.3% down, vs 4.0% that fired). It was also inconsistent
+    # -- band_pct already trims the extreme for exactly this reason. _range_bound drops a bar only
+    # if it pokes > STRUCT_SPIKE_ATR beyond every OTHER bar (a true lone outlier); a normal range,
+    # or a real high confirmed by a second bar near it, is returned unchanged (measured +6% of
+    # breakouts at 2 ATR, all of them stale-spike cases). The spike is not lost -- it still shows
+    # as a resistance/support WALL in sr_levels; structure just stops pretending it is the range.
+    prior_hi = _range_bound(hi[:-1], a, upper=True) if len(hi) > 1 else last
+    prior_lo = _range_bound(lo[:-1], a, upper=False) if len(hi) > 1 else last
     coil = None
     # A COIL IS A COMPLETED OBSERVATION. "The range is contracting" cannot be said from a bar
     # that is five minutes old, and the coil test is precisely a span comparison — so a

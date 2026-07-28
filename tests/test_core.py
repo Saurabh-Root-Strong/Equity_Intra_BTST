@@ -1454,3 +1454,30 @@ def test_headroom_matches_res_sup_and_sees_single_violent_rejection():
         "_wall_pair": [(190.0, 1, "4h")]}])).iloc[0]
     assert s["sup"] == 190.0 and not np.isinf(s["headroom"])
     assert abs(s["headroom"] - (s["ltp"] - s["sup"]) / 1.0) < 1e-6
+
+
+def test_lone_spike_does_not_suppress_breakout():
+    """A stale lone spike must not poison the breakout label for the whole 20-bar window. Measured
+    on the archive: the raw-max rule let a single old wick suppress MORE breakouts than it fired.
+    _range_bound drops a bar only when it pokes > STRUCT_SPIKE_ATR beyond every other bar; normal
+    ranges are unchanged, and the spike still shows as an sr_levels wall."""
+    import numpy as np, pandas as pd
+    from eqbtst import indicators as I
+
+    def frame(c, h, l):
+        return pd.DataFrame({"open": c, "high": h, "low": l, "close": c, "volume": 1000})
+
+    base = list(100 + np.sin(np.arange(19)) * 2)            # tight range ~98-102
+    # A: a lone spike to 130 at bar 5; price then truly breaks the 105 range to 108
+    c = base + [108.0]; h = [x + 0.6 for x in base] + [108.5]; h[5] = 131.0
+    l = [x - 0.6 for x in base] + [107.5]
+    assert I.struct_full(frame(c, h, l))["struct"] == "BREAKOUT_UP", "lone spike must not hide the break"
+    # B: NO lone spike (a real double-top at ~112) -> a poke to 108 is NOT a breakout, unchanged
+    base2 = base[:]; base2[5] = 112.0; base2[12] = 111.6    # two bars near 112 = a real high
+    c2 = base2 + [108.0]; h2 = [x + 0.6 for x in base2] + [108.5]
+    l2 = [x - 0.6 for x in base2] + [107.5]
+    assert I.struct_full(frame(c2, h2, l2))["struct"] != "BREAKOUT_UP", "real high must still cap"
+    # _range_bound returns the raw max when no lone outlier
+    v = np.array([100.0, 101, 102, 103, 104])
+    assert I._range_bound(v, 1.0, upper=True) == 104.0
+    assert I._range_bound(np.array([100.0, 101, 102, 103, 130]), 1.0, upper=True) == 103.0  # 130 dropped
