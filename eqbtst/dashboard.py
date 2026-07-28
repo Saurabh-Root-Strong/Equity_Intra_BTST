@@ -361,37 +361,42 @@ SETUP_COLS = {
              "CONTEXT, not a signal — intraday MTF alignment is unvalidated in this stack."),
     "loc": st.column_config.NumberColumn(
         "loc", format="%.2f",
-        help="WHERE the price sits inside the HIGHER-TF range box. 0.00 = at the box LOW, "
-             "1.00 = at the box HIGH, 0.50 = dead middle.\n\n"
-             "This is the variable that decides whether a lower-TF breakout means anything: "
-             "≥0.72 (at the ceiling) or ≤0.28 (at the floor) = a break can genuinely resolve "
-             "the range. Anywhere in the middle = the same break is a trap."),
+        help="WHERE price is sitting inside the bigger timeframe's range — bottom to top.\n\n"
+             "**0.0 = at the bottom (floor) · 1.0 = at the top (ceiling) · 0.5 = middle.**\n\n"
+             "This decides if a breakout is real: near the top (≥0.72) a break UP can genuinely "
+             "clear the range; near the bottom (≤0.28) a break DOWN is real. In the MIDDLE, a "
+             "'break' is usually a fake — there was nothing to break through."),
 }
 
 # Touch-counted dynamic support/resistance (eqbtst/indicators.py :: walls).
 SR_COLS = {
     "sup": st.column_config.NumberColumn(
         "sup", format="%.2f",
-        help="Nearest SUPPORT below price on the higher timeframe — a cluster of swing LOWS "
-             "where price has actually turned, not a drawn line. Levels are back-adjusted for "
-             "splits/bonuses, so they are on today's price scale."),
+        help="**SUPPORT — the nearest FLOOR below the current price.** A price level where the "
+             "stock has BOUNCED UP before, so buyers tend to step in there. Not a line someone "
+             "drew — a spot where price actually turned around, more than once.\n\n"
+             "Blank = no clear floor below (price is in open air under it). Prices are adjusted "
+             "for splits/bonuses, so they match today's scale."),
     "sup_t": st.column_config.NumberColumn(
         "sup×", format="%d",
-        help="TOUCHES — how many separate times price rejected that support.\n\n"
-             "1 = a lone pivot (weak). 2–3 = a level being defended.\n\n"
-             "⚠ MORE IS NOT MONOTONICALLY BETTER: the sister-project level study found the "
-             "edge INVERTS at 5+ touches — a level tested that often is usually being worn "
-             "down, and breaks. Treat a high count as 'about to matter either way', not as "
-             "a stronger floor."),
+        help="**How many times price has BOUNCED off that support** (the ×). This is your "
+             "question answered: how often the stock got held up at this floor.\n\n"
+             "**1 = touched once (weak, could be luck) · 2–3 = a real floor the market keeps "
+             "defending.**\n\n"
+             "⚠ MORE IS NOT ALWAYS STRONGER. Measured: at **5+ touches the edge flips** — a "
+             "floor hit that many times is usually being worn down and about to BREAK. So a "
+             "high number means 'this level is about to matter, one way or the other', not "
+             "'rock-solid floor'."),
     "res": st.column_config.NumberColumn(
         "res", format="%.2f",
-        help="Nearest RESISTANCE above price on the higher timeframe (clustered swing HIGHS). "
-             "Blank = no pivot cluster above — price is in open air (typical after a genuine "
-             "breakout)."),
+        help="**RESISTANCE — the nearest CEILING above the current price.** A level where the "
+             "stock has been REJECTED (turned back down) before, so sellers tend to appear "
+             "there.\n\n"
+             "Blank = clear sky above, no ceiling nearby — common right after a real breakout."),
     "res_t": st.column_config.NumberColumn(
         "res×", format="%d",
-        help="How many times price was rejected at that resistance. Same 5+ inversion caveat "
-             "as sup×."),
+        help="**How many times price has been REJECTED at that ceiling** (the ×). Same reading "
+             "as sup×: 1 = weak, 2–3 = a defended ceiling, 5+ = worn down and about to break."),
     "side": st.column_config.TextColumn(
         "side", width="small",
         help="Which side the HTF × LTF setup argues for — read off the setup's DIRECTION, "
@@ -427,21 +432,14 @@ SR_COLS = {
              "say 'clear' while THIS says you are capped."),
     "at_wall": st.column_config.TextColumn(
         "at wall", width="small",
-        help="**LIVE — price is testing a defended level RIGHT NOW** (within 0.15 ATR of a "
-             "level that has already turned it ≥2 times).\n\n"
-             "`RES 2896.41 x3` = price is sitting on a resistance it was rejected from 3 times "
-             "before. This is the moment that decides the next move: it either turns again "
-             "(the 4th rejection) or breaks, and a break of a well-defended level is the more "
-             "meaningful event of the two.\n\n"
-             "The touch count deliberately does NOT increment while the test is happening — a "
-             "touch only becomes a rejection once price actually turns. Counting the test in "
-             "progress would let a level inflate its own strength on the way to breaking.\n\n"
-             "Blank = price is not near any multi-touch level.\n\n"
-             "⚠ **VALIDATED ON DAILY & WEEKLY ONLY.** Backtested with a placebo (a random line): "
-             "1D/1W levels turn price meaningfully more than random (edge ~+0.12 ATR). On the "
-             "INTRADAY frames (15m–4h) a random line reacted just as much — the ~58% 'bounce' "
-             "there is intraday mean-reversion, NOT the level. So trust this on Swing/Positional; "
-             "on Intraday/BTST read it as rough visual context, not a predictive level."),
+        help="**Price is TESTING a defended level RIGHT NOW.** It is sitting on a floor or "
+             "ceiling it has already bounced off ≥2 times before.\n\n"
+             "`RES 2896.41 x3` = price is at a ceiling it was rejected from 3 times. This is the "
+             "decision moment: it either turns away again (4th rejection) or breaks through — "
+             "and a break of a well-defended level is the bigger event.\n\n"
+             "Blank = price is not near any such level right now.\n\n"
+             "⚠ Trust this on the DAILY and WEEKLY only. On fast frames (15m–4h) the 'bounce' "
+             "is just intraday chop — measured no better than a random line."),
     "long_note": st.column_config.TextColumn(
         "long evidence", width="medium",
         help="**Did this setup actually make money — over the hold YOU picked?** Tested on 9 "
@@ -475,20 +473,16 @@ SR_COLS = {
              "backwards is evidence the logic is wrong, not free money the other way."),
     "headroom": st.column_config.TextColumn(
         "headroom",
-        help="Distance to the nearest MULTI-TOUCH (≥2) wall overhead, measured in the ATR of "
-             "your TRIGGER (lower) timeframe — the same unit your stop and 1×ATR target are "
-             "built from, so the two numbers are directly comparable.\n\n"
-             "The wall LIST still comes from BOTH timeframes: a level rejected three times "
-             "intraday still matters when the higher frame looks clear.\n\n"
-             "• **∞** = CLEAR ROAD — no defended level above. That is an answer, not missing "
-             "data.\n"
-             "• **< 0.5** = you are buying INTO a wall. Your 1×ATR target sits on the far "
-             "side of a level the market has already defended twice; expect a fight, and "
-             "size or target accordingly.\n\n"
-             "Shown, never enforced: in the sister project near-wall trades did NOT bleed — "
-             "often the break IS the setup. This is the chartist's call, not a veto.\n\n"
-             "⚠ Placebo-validated on **1D/1W only**; on intraday frames (15m–4h) the walls a "
-             "random line hits react the same, so headroom there is visual context, not signal."),
+        help="**How much ROOM is left before price hits the next ceiling above** (a defended "
+             "≥2-touch resistance), measured in ATR — the same unit as your stop and target, so "
+             "the numbers line up.\n\n"
+             "• **∞** = CLEAR ROAD — no ceiling above at all. Good — nothing in the way.\n"
+             "• **< 0.5** = you are buying RIGHT INTO a ceiling. Your target sits on the far "
+             "side of a level the market has already turned back twice — expect a fight.\n\n"
+             "Shown, never enforced — a break THROUGH the ceiling is often the trade, not a "
+             "reason to skip. Your call, not a veto.\n\n"
+             "⚠ This is context, not a signal on fast frames: measured, it only carries "
+             "information on the DAILY and WEEKLY; on 15m–4h a random line reacts the same."),
 }
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
