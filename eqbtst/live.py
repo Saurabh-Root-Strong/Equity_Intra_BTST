@@ -1659,7 +1659,7 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     _hi = _TF_ORD.index(htf) if htf in _TF_ORD else -1
     _one = next((f for f in _LADDER if _TF_ORD.index(f) > _hi), None)
     _ctx = [_one] if _one else []
-    big_w, big_g = [], []
+    big_w, big_g, big_px = [], [], []
     for _, r in b.iterrows():
         px, a = r.get("ltp"), r.get("_sr_atr")
         try:
@@ -1668,7 +1668,7 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
             px = 0.0
         a = float(a) if (a is not None and a == a and float(a) > 0) else 0.0
         if px <= 0 or a <= 0 or not _ctx:
-            big_w.append(""); big_g.append(np.inf); continue
+            big_w.append(""); big_g.append(np.inf); big_px.append(np.nan); continue
         walls = []
         for f in _ctx:
             wl = r.get(f"sr_wall{f}")
@@ -1680,9 +1680,10 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
             x, t, f = (min if look_up else max)(side_walls, key=lambda z: z[0])
             big_w.append(f"{f} {x:.2f} ×{t}")
             big_g.append(round(abs(x - px) / a, 2))
+            big_px.append(x)                        # the wall PRICE, so the 5s tick re-derives the gap
         else:
-            big_w.append(""); big_g.append(np.inf)
-    b["big_wall"], b["big_gap"] = big_w, big_g
+            big_w.append(""); big_g.append(np.inf); big_px.append(np.nan)
+    b["big_wall"], b["big_gap"], b["_big_wall_px"] = big_w, big_g, big_px
 
     # NO CONFLUENCE FLAG — DELIBERATELY. The sister project's one POSITIVE level result was
     # pivot-meets-CALL-WALL confluence (+9.8pp, overhead only), and it is tempting to mirror
@@ -1755,6 +1756,7 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             # view loses the very columns the setup filter and the room filter select on -- and
             # its LONG/SHORT tabs then have nothing to split on but the footprint `action`.
             "side": r.get("side"), "big_wall": r.get("big_wall"), "big_gap": r.get("big_gap"),
+            "_big_wall_px": r.get("_big_wall_px"),   # so refresh_prices ticks big_gap live
             "setup_rank": r.get("setup_rank"), "setup_read": r.get("setup_read"),
             "sup": r.get("sup"), "sup_t": r.get("sup_t"), "res": r.get("res"),
             "res_t": r.get("res_t"), "headroom": r.get("headroom"),
@@ -1866,10 +1868,17 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
         st_["rs_vs_index"] = rs
         b.at[i, "action"] = _tf_action(st_, risk_on)
         b.at[i, "sell"] = _tf_sell_action(st_, risk_on)
-    # LEVELS FOLLOW THE TICK. The walls are past structure and stay put until a bar closes,
-    # but which one is nearest — and whether price is testing one right now — changes with
-    # every print. Leaving these frozen was the same failure the verdict rebuild above exists
-    # to prevent: a stale level beside a live price reads as current.
+    # BIG-GAP FOLLOWS THE TICK TOO. The big-wall PRICE is a 1D/1W/1M level that cannot repaint
+    # intraday (so the wall itself stays), but the GAP to it is a function of the LIVE price --
+    # exactly like headroom, which _live_levels already ticks. Leaving big_gap frozen while
+    # headroom ticked was the same "stale number beside a live price" inconsistency. Re-derive
+    # the gap to the SAME pinned wall; the string (frame + price + touches) is unchanged.
+    if "_big_wall_px" in b.columns:
+        _bpx = pd.to_numeric(b["_big_wall_px"], errors="coerce")
+        _bltp = pd.to_numeric(b["ltp"], errors="coerce")
+        _batr = pd.to_numeric(b["_sr_atr"], errors="coerce")
+        _ok = _bpx.notna() & (_batr > 0)
+        b.loc[_ok, "big_gap"] = ((_bpx[_ok] - _bltp[_ok]).abs() / _batr[_ok]).round(2)
     return _live_levels(b)
 
 

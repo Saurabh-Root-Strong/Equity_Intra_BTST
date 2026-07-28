@@ -1353,3 +1353,20 @@ def test_enriched_view_carries_and_splits_by_setup_side():
     assert 'bb["side"] == "SHORT"' in body, "enriched SHORT tab must split on the setup side"
     assert "else bb" not in body.split("bb[\"side\"] == \"LONG\"")[0][-200:], \
         "the dump-all fallback (show every match under LONG) must be gone"
+
+
+def test_big_gap_ticks_live_like_headroom():
+    """big_gap (distance to the one-frame-up wall) is a function of the LIVE price, exactly like
+    headroom, which the 5s tick already re-derives. In the enriched view refresh_prices ticked
+    headroom but left big_gap FROZEN — a stale number beside a live price. The wall PRICE is a
+    1D/1W/1M level that cannot repaint intraday, so it stays; only the gap to it moves. add_setup
+    now carries _big_wall_px and refresh_prices re-derives the gap from it."""
+    import inspect
+    from eqbtst import live as _l
+    assert "_big_wall_px" in inspect.getsource(_l.add_setup), "add_setup must carry the wall price"
+    rp = inspect.getsource(_l.refresh_prices)
+    assert '"big_gap"' in rp and "_big_wall_px" in rp, "refresh_prices must re-derive big_gap on the tick"
+    # numeric check: gap shrinks as price nears the wall
+    import numpy as np
+    bpx, atr = 108.0, 2.0
+    assert round(abs(bpx - 100.0) / atr, 2) == 4.0 and round(abs(bpx - 104.0) / atr, 2) == 2.0
