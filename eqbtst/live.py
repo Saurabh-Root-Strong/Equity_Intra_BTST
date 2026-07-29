@@ -1125,7 +1125,7 @@ def mtf_structure(sym: str) -> dict:
     # construction. The flag reaches only the COIL test (see indicators.struct_full).
     _live_bar = market_open()
 
-    def _set(tf, frame, forming=False):
+    def _set(tf, frame, forming=False, sr_lb=None):
         sf = (indicators.struct_full(frame, forming=forming and _live_bar)
               if (frame is not None and len(frame) >= 5) else {"struct": "n/a", "n": 0})
         lab = sf["struct"]
@@ -1136,7 +1136,12 @@ def mtf_structure(sym: str) -> dict:
         out[f"n{tf}"] = int(sf.get("n", 0))
         # TOUCH-COUNTED S/R on this frame — computed here because this is the one place the
         # candles exist. Carrying the result means switching horizon later costs no fetch.
-        sr = indicators.sr_levels(frame) if lab != "n/a" else {}
+        # sr_lb overrides the S/R lookback for THIS frame: the DAILY level window is longer than
+        # the intraday one (a daily support persists 6-18 months; the shared 60-bar window is
+        # only ~3 months, so it undercounted major bases -- NATIONALUM's ×5 year-base read ×2,
+        # and universe-wide the nearest-wall touch count ran ~half). The structure LABEL and box
+        # are untouched (they read the last STRUCT_LOOKBACK bars regardless of frame length).
+        sr = indicators.sr_levels(frame, lookback=sr_lb) if lab != "n/a" else {}
         out[f"sup{tf}"] = sr.get("support", float("nan")) or float("nan")
         out[f"supt{tf}"] = int(sr.get("sup_touches", 0) or 0)
         out[f"res{tf}"] = sr.get("resistance", float("nan")) or float("nan")
@@ -1177,7 +1182,7 @@ def mtf_structure(sym: str) -> dict:
     try:
         d = _daily_hist().get(sym)
         if d is not None and len(d) >= 5:
-            _set("1D", d.tail(60))
+            _set("1D", d.tail(config.SR_DAILY_LOOKBACK), sr_lb=config.SR_DAILY_LOOKBACK)
             _set("1W", weekly_frame(d))
             # MONTHLY S/R walls only — the ONE-higher-frame the POSITIONAL horizon (1D/1W)
             # checks for its big-wall (1W is the top of the intraday ladder, so the frame above

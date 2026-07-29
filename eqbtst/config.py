@@ -87,6 +87,20 @@ SR_TOL_ATR   = 0.6    # two pivots within this x ATR = the same level (zone half
 # support/resistance, tested again in July, sat just outside it. 60 bars (~3 months daily,
 # ~2.5 days on 15m, ~14 months on weekly) is the standard "what you see on the chart" window.
 SR_LOOKBACK  = 60     # bars of history S/R levels are drawn from (NOT the 20-bar label window)
+# ...BUT 60 SESSIONS IS TOO SHORT FOR THE DAILY FRAME SPECIFICALLY. 60 bars means ~3 months on
+# daily, and daily levels persist 6-18 months, so the shared window undercounted major bases: a
+# level tested for half a year showed only its recent touches. Measured on the archive --
+# NATIONALUM's year-long ~332 base read ×2 at 60 bars but ×5 at 120+; universe-wide the nearest
+# wall's touch count ran median 3 at 60 vs 6 at 180, and 75% of names carried a stronger level
+# near price under the longer window (CONCOR ×2->×17, PETRONET ×5->×17). The touch count is the
+# strength label the eye reads off the chart, so the 60-bar daily window disagreed with the
+# chart on 3 of 4 names. This is a DISPLAY-fidelity fix, not an edge one -- levels are
+# non-predictive either way (measured 69% real vs 70% random), and the old "60 backtested
+# optimal" tuned forward REACTION, which is that null. Intraday frames keep 60 (an intraday
+# level is a days-long object); only the daily+ frame gets the longer memory. The 1D structure
+# LABEL and box are unchanged -- they read the last STRUCT_LOOKBACK bars regardless.
+SR_DAILY_LOOKBACK = 180   # ~9 months: long enough to carry a multi-month daily base, short
+                          # enough to stay out of an ancient, different price regime
 # LIQ_MIN_LACS is the REALISM floor. Stress test: the headline +30bps net was partly
 # flattered by thin names where the fill is not real. On genuinely liquid names
 # (>=Rs20cr turnover) the honest deployable edge is ~+16-19bps net, win ~62%. Thin

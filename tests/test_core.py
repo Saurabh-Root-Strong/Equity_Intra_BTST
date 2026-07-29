@@ -1481,3 +1481,30 @@ def test_lone_spike_does_not_suppress_breakout():
     v = np.array([100.0, 101, 102, 103, 104])
     assert I._range_bound(v, 1.0, upper=True) == 104.0
     assert I._range_bound(np.array([100.0, 101, 102, 103, 130]), 1.0, upper=True) == 103.0  # 130 dropped
+
+
+def test_daily_sr_uses_a_longer_lookback_than_intraday():
+    """A daily support persists 6-18 months, so the daily S/R window must be longer than the
+    shared 60-bar one (which is ~3 months and undercounted major bases -- NATIONALUM's year base
+    read x2 not x5). Config carries a dedicated daily lookback, and a level touched across >60
+    bars is seen in full only by the longer window."""
+    import numpy as np, pandas as pd
+    from eqbtst import indicators as I, config
+    assert config.SR_DAILY_LOOKBACK > config.SR_LOOKBACK, "daily window must exceed the intraday one"
+    # a level at ~100 revisited every ~30 bars across 180 bars (6 touches), noise elsewhere
+    rng = np.random.default_rng(1)
+    n = 180
+    c = 100 + np.cumsum(rng.normal(0, 0.4, n))
+    h = c + 0.5; l = c - 0.5
+    for j in (10, 40, 70, 100, 130, 160):        # pin a swing HIGH at 108 repeatedly
+        h[j] = 108.0; c[j] = 107.4; l[j] = 106.8
+        h[j - 1] = 107.0; h[j + 1] = 107.0       # make j the local extreme
+    f = pd.DataFrame({"open": c, "high": h, "low": l, "close": c, "volume": 1000})
+    short = I.sr_levels(f, spot=104.0, lookback=config.SR_LOOKBACK)
+    longw = I.sr_levels(f, spot=104.0, lookback=config.SR_DAILY_LOOKBACK)
+    def touches(sr, level=108.0):
+        return max([t for x, t in sr.get("levels", []) if abs(x - level) <= 1.0], default=0)
+    assert touches(longw) > touches(short), (
+        f"longer daily window must count more touches of a long-standing level: "
+        f"{touches(short)} (60) vs {touches(longw)} (180)")
+    assert touches(longw) >= 4, "the 6-touch base must be seen as a strong level by the daily window"
