@@ -1391,14 +1391,15 @@ if tf == "Intraday":
         _sc = ["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else []
 
         def _day_by_setup(cols):
-            # day% belongs BESIDE the setup, not buried after the risk columns: it is a validated
-            # footprint leg (the signal wants day_ret >= +1%), so you read the shape and the day's
-            # move together. Moves it right after `setup` when a preset is active; if there is no
-            # setup column (custom TF), it stays where it was.
-            if "setup" in cols and "day%" in cols:
-                cols = [c for c in cols if c != "day%"]
+            # ltp + day% belong BESIDE the setup, not buried after the risk columns: you read the
+            # shape, the price, and the day's move together, and day% is a validated footprint leg
+            # (the signal wants day_ret >= +1%). Relocates `ltp` then `day%` right after `setup`
+            # when a preset is active; with no setup column (custom TF) they stay where they were.
+            if "setup" in cols:
+                move = [c for c in ("ltp", "day%") if c in cols]
+                cols = [c for c in cols if c not in move]
                 i = cols.index("setup") + 1
-                cols = cols[:i] + ["day%"] + cols[i:]
+                cols = cols[:i] + move + cols[i:]
             return cols
 
         long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
