@@ -281,8 +281,16 @@ def _tf_scan(tf: str):
     return live.tf_scan(tf)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def _uni_scan(nonce: int):
+    # max_entries=1 CAPS MEMORY. There is deliberately no TTL (the nonce is the only trigger),
+    # but without a size cap st.cache_data kept ONE full-universe board (~270 names x 6 TF + wall
+    # lists) PER nonce for the whole session -- and the nonce only increments, so a heavy day of
+    # re-scans leaked dozens of stale boards that are never read again (the VM is OOM-prone). The
+    # nonce is monotonic and only the CURRENT one is ever requested, so keeping a single entry is
+    # functionally identical: a fresh nonce evicts the previous board, filters still hit instantly
+    # within a nonce (it is the one live entry), and the ↻ button still forces a true re-fetch by
+    # also clearing live._UNISCAN_CACHE.
     # NO TTL — the nonce is the ONLY trigger. A 30-minute TTL directly contradicted the intent
     # written below: once it expired, the next interaction of ANY kind paid a 30-60s cold
     # re-scan, so typing in the price box could kick off a full universe fetch and leave the
