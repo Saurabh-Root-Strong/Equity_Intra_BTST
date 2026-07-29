@@ -1389,16 +1389,28 @@ if tf == "Intraday":
             st.stop()
 
         _sc = ["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else []
-        long_cols = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
+
+        def _day_by_setup(cols):
+            # day% belongs BESIDE the setup, not buried after the risk columns: it is a validated
+            # footprint leg (the signal wants day_ret >= +1%), so you read the shape and the day's
+            # move together. Moves it right after `setup` when a preset is active; if there is no
+            # setup column (custom TF), it stays where it was.
+            if "setup" in cols and "day%" in cols:
+                cols = [c for c in cols if c != "day%"]
+                i = cols.index("setup") + 1
+                cols = cols[:i] + ["day%"] + cols[i:]
+            return cols
+
+        long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
                      "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
-                     "entry", "stop", "t1", "t2", "atr%", "action"]
-        sell_cols_tf = ["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
+                     "entry", "stop", "t1", "t2", "atr%", "action"])
+        sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "ltp",
                         "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
-                        "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
+                        "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"])
 
         @st.fragment(run_every="5s")
         def _struct_panel():
