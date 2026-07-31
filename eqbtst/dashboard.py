@@ -319,6 +319,71 @@ def render_tilt_help():
         st.markdown(sector_tilt.HELP_FULL)
 
 
+DELIV_HELP_FULL = """
+### 📦 The delivery columns
+
+**Delivery %** is the share of a day's traded volume that was actually *taken for delivery*
+rather than squared off intraday. A larger slice being kept is the footprint of someone
+**building a position**, not trading it.
+
+**`deliv 5wk` — the trend, newest first**
+
+    41, 35, 40, 41, 42   Base - (+1%)
+    ↑ this week          ↑ vs this stock's own normal rate
+
+* The **first** number is the **current week**; the rest go **backwards** in time. Newest sits
+  on the **left**, so a *rising* delivery trend reads as **descending** numbers —
+  `48, 43, 36, 33, 37` is accumulation **building**, not fading.
+* **`*4d`** means the week is **still forming** and has 4 trading days in it so far — the
+  noisiest figure in the cell. **No star = the week is complete.**
+* A name that did not trade in a week shows `–`, and is never marked as forming.
+
+**What "Base" is — and why it is there**
+
+The Base is **this stock's own normal delivery rate**: the turnover-weighted average delivery %
+over the **100 trading days ending BEFORE the five weeks shown**. It deliberately excludes those
+weeks, so a recent surge cannot drag its own yardstick and quietly shrink itself.
+
+Every stock has a different one — across this board they run from roughly **15% to 66%**. That
+is the whole reason the number is in the cell:
+
+| | raw week | its base | reads as |
+|---|---|---|---|
+| a high-delivery name | 62% | 69% | **−10%** — a *quiet* week |
+| a low-delivery name | 31% | 14% | **+116%** — delivery *doubled* |
+
+62% looks twice as impressive as 31%. It is the opposite. The **series gives you the
+direction**; the **Base % gives you the level**.
+
+`Base - (…)` is **not** a week-on-week change, **not** a slope, **not** a return.
+
+**Rough scale:** within **±10%** is noise · beyond **±20%** is worth a look · beyond **±30%**
+puts the name in the top or bottom decile of the board.
+
+**`wtdDeliv7 %` / `vs100D %`** answer a shorter-horizon version of the same question — the last
+7 calendar days against a 100-day baseline that *overlaps* the recent weeks. Similar-sounding
+numbers, deliberately different windows.
+
+**Leak-free.** NSE publishes delivery around 6pm, so today's figure does not exist at a 15:15
+decision. Every value here is read through the last **completed** session.
+
+**Context, not a signal.** Delivery's own forward IC is weak (~0.03–0.07). It earns its place as
+one leg of the accumulation footprint, alongside close strength, volume and relative strength —
+never as a reason to buy on its own.
+"""
+
+
+def render_deliv_help():
+    """Full delivery-column note, on the page rather than in a tooltip.
+
+    Streamlit clips a dataframe column tooltip at ~1,100 characters and gives it no scrollbar;
+    two attempts to force one with CSS failed because the tooltip is an internal component this
+    stylesheet cannot reliably target. Rather than keep guessing selectors, the long form lives
+    here — the same fix already proven for the sector-tilt column."""
+    with st.expander("📦 What the **delivery** columns mean (and what 'Base' is)"):
+        st.markdown(DELIV_HELP_FULL)
+
+
 def _wt(df, as_of, side=None):
     """Attach the `sector tilt` column at RENDER time.
 
@@ -580,27 +645,23 @@ SR_COLS = {
 DELIV_COLS = {
     "deliv 5wk": st.column_config.TextColumn(
         "deliv 5wk", width="medium",
-        help="Weekly DELIVERY % — the share of traded volume actually taken for delivery instead "
-             "of squared off intraday. More kept = someone building a position, not trading it.\n\n"
-             "READ  '19*4d, 17, 13, 16, 36   Base - (−35%)'\n"
-             "• First number = THIS week. The rest go BACKWARDS in time, so newest is on the "
-             "LEFT and a RISING trend reads as DESCENDING numbers.\n"
-             "• '*4d' = week still forming, 4 trading days in it so far (the noisiest number "
-             "here). No star = the week is complete.\n"
-             "• 'Base - (−35%)' = this week versus this stock's BASE.\n\n"
-             "WHAT THE BASE IS — this stock's OWN normal delivery rate: the turnover-weighted "
-             "average delivery % over the 100 trading days ENDING BEFORE the 5 weeks shown. It "
-             "deliberately excludes those weeks so the recent move cannot drag its own yardstick. "
-             "Every stock has a different one — across this board they run roughly 15% to 66%.\n\n"
-             "WHY IT MATTERS: 62% delivery is a QUIET week for a name whose base is 69%, while "
-             "31% is a SURGE for a name whose base is 14%. The raw numbers alone cannot tell you "
-             "that. The series gives you the direction; the Base % gives you the level.\n\n"
-             "It is NOT a week-on-week change, NOT a slope, NOT a return.\n\n"
-             "SCALE: within ±10% is noise · beyond ±20% worth a look · beyond ±30% puts the name "
-             "in the top or bottom decile of the board.\n\n"
-             "Leak-free — NSE publishes delivery ~6pm, so today never counts; read through the "
-             "last COMPLETED session. CONTEXT, not a signal: delivery's own forward IC is weak "
-             "(~0.03-0.07), it works as a leg of the footprint, not alone."),
+        # SHORT ON PURPOSE. Streamlit clips a dataframe column tooltip at roughly 1,100
+        # characters with no scrollbar, and two attempts to force one via CSS failed because the
+        # element is an internal component this stylesheet cannot reliably reach. So the tooltip
+        # now carries only what fits, and the full explanation lives in the on-page expander
+        # (render_deliv_help) — the pattern already proven to render in this app.
+        help="Weekly DELIVERY % — share of volume actually taken for delivery, not squared off "
+             "intraday. More kept = someone building a position.\n\n"
+             "'41, 35, 40, 41, 42  Base - (+1%)'\n"
+             "• FIRST number = THIS week, the rest go BACKWARDS. So a RISING trend reads as "
+             "DESCENDING numbers.\n"
+             "• '*4d' = week still forming, 4 days in so far. No star = complete.\n"
+             "• 'Base - (+1%)' = this week vs this stock's OWN normal delivery rate (its 100-day "
+             "average, measured BEFORE these 5 weeks). NOT a week-on-week change.\n\n"
+             "Bases differ per stock (~15%–66% here), which is the point: 62% is a QUIET week "
+             "for a 69%-base name, 31% is a SURGE for a 14%-base one.\n\n"
+             "±10% noise · ±20% notable · ±30% top/bottom decile.\n\n"
+             "See '📦 What the delivery columns mean' above the table for the full note."),
     "wtd_deliv7": st.column_config.NumberColumn(
         "wtdDeliv7 %", format="%.1f%%",
         help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
@@ -1298,6 +1359,7 @@ if tf == "Intraday":
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
             _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
             render_tilt_help()
+            render_deliv_help()
 
             def _side_table(df_, note=None, extra_cols=()):
                 if df_.empty:
