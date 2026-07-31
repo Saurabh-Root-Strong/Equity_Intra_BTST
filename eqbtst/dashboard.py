@@ -1326,9 +1326,15 @@ if tf == "Intraday":
         after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
         filtered = _mtf_filter(after_deliv)
         active = _htf_on or _ltf_on or _setup_on or _room_on or (min_wtd > 0) or (min_vs > 0)
+        # `deliv 5wk` sits immediately after `side`: once you know WHICH WAY a setup points, the
+        # next question is whether anyone is actually accumulating into it, and that read is
+        # useless twenty columns to the right. The per-side evidence note (`long/short evidence`)
+        # takes its old slot beside the other delivery columns — it is a long text field, so it
+        # scans poorly in the middle of numeric columns and costs nothing sitting further out.
         light_cols = (["symbol", "sector", "sector tilt", "ltp", "turn₹L", "day%"]
-                      + (["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else [])
-                      + ["wtd_deliv7", "deliv_vs_100d", "deliv 5wk",
+                      + (["setup", "side", "deliv 5wk", "loc", "at_wall", "sup", "sup_t", "res",
+                          "res_t", "headroom", "big_wall", "big_gap"] if _P else ["deliv 5wk"])
+                      + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
         # WHAT THE TAPE LOOKS LIKE RIGHT NOW — the census of setups across the whole universe,
@@ -1390,7 +1396,13 @@ if tf == "Intraday":
                 _c = list(light_cols)
                 for _e in extra_cols:                 # per-side columns (e.g. the short verdict)
                     if _e in df_.columns and _e not in _c:
-                        _c.insert(_c.index("side") + 1 if "side" in _c else 1, _e)
+                        # LANDS WITH THE DELIVERY BLOCK, not beside `side`. It used to sit right
+                        # after the side column, which pushed the level columns out and put a
+                        # wide sentence in the middle of the numbers you scan. `deliv 5wk` holds
+                        # that slot now; the evidence note reads fine further right.
+                        _anchor = next((c for c in ("deliv_vs_100d", "wtd_deliv7", "side")
+                                        if c in _c), None)
+                        _c.insert(_c.index(_anchor) + 1 if _anchor else 1, _e)
                 df_ = _wt(df_, _ASOF_LIVE)          # side comes from each row's own `side`
                 st.dataframe(_fmt(df_)[_cols(df_, _c)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
