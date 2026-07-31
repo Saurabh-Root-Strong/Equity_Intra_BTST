@@ -45,6 +45,9 @@ def main(argv=None):
     tm = sub.add_parser("tilt-measure")
     tm.add_argument("--start", default="2018-01-01")
     tm.add_argument("--ungated", action="store_true")
+    lv = sub.add_parser("levels"); lv.add_argument("symbol")
+    lv.add_argument("--frame", default="1D", choices=["1D", "1W"])
+    lv.add_argument("--date", default=None)
 
     a = ap.parse_args(argv)
     if a.cmd == "screen":
@@ -94,6 +97,43 @@ def main(argv=None):
         h = sector_tilt.build_history(start=a.start)
         print(f"  wrote {len(h)} sector-days, "
               f"{h['trade_date'].nunique() if len(h) else 0} dates")
+    elif a.cmd == "levels":
+        from . import data as _d, indicators as _i, live as _l, config as _c
+        end = pd.Timestamp(a.date) if a.date else _d.last_trading_date()
+        raw = _d.load_eod(start=(end - pd.Timedelta(days=900)).strftime("%Y-%m-%d"),
+                          end=end.strftime("%Y-%m-%d"))
+        g = raw[raw["symbol"] == a.symbol.upper()].sort_values("trade_date")
+        if g.empty:
+            print(f"  no EOD rows for {a.symbol.upper()}"); return
+        cd = _i.adjust_corporate_actions(g.rename(columns={
+            "trade_date": "ts", "open_price": "open", "high_price": "high",
+            "low_price": "low", "close_price": "close"})[["ts", "open", "high", "low", "close"]]
+            .reset_index(drop=True))
+        lb = _c.SR_DAILY_LOOKBACK if a.frame == "1D" else _c.SR_LOOKBACK
+        if a.frame == "1W":
+            cd = _l.weekly_frame(cd)
+        cd = cd.tail(lb).reset_index(drop=True)
+        sr = _i.sr_levels(cd, lookback=lb)
+        if not sr:
+            print("  not enough bars for a level read"); return
+        px, atr = float(cd["close"].iloc[-1]), sr["atr"]
+        print(f"\n  {a.symbol.upper()}  {a.frame}  as-of {cd['ts'].iloc[-1].date()}   "
+              f"close {px:.2f}   ATR {atr:.2f} ({100*atr/px:.1f}%)   "
+              f"zone +/-{_c.SR_TOL_ATR*atr:.2f}   window {len(cd)} bars")
+        print(f"  {'level':>10}{'dist%':>8}{'pivots':>8}{'visits':>8}{'bars':>7}"
+              f"{'closes':>8}{'time%':>7}   side")
+        for x, t in sorted(sr["levels"], key=lambda z: -z[0]):
+            z = _i.zone_visits(cd, x, atr)
+            side = "RES" if x > px else "SUP"
+            print(f"  {x:>10.2f}{100*(x-px)/px:>+8.1f}{t:>8}{z['visits']:>8}{z['bars']:>7}"
+                  f"{z['closes']:>8}{z['time_pct']:>7.1f}   {side}")
+        print(f"\n  nearest support {sr['support']} x{sr['sup_touches']} pivots / "
+              f"{sr['sup_visits']} visits ({sr['sup_time_pct']}% of the window)")
+        print(f"  nearest resist  {sr['resistance']} x{sr['res_touches']} pivots / "
+              f"{sr['res_visits']} visits ({sr['res_time_pct']}% of the window)")
+        print("\n  PIVOTS = 5-bar swing extremes (what sup×/res× on the board count).")
+        print("  VISITS = separate approaches into the zone — closer to what the eye counts.")
+        print("  Both are DESCRIPTIVE: measured on 8yr, neither ranks levels by what they pay.\n")
     elif a.cmd == "tilt-measure":
         m = sector_tilt.measure_overnight(start=a.start, gated=not a.ungated)
         print(sector_tilt.format_measurement(m))

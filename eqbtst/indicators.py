@@ -444,6 +444,42 @@ def walls(h, l, tol: float, w: int = 2) -> list[tuple[float, int]]:
     return [(round(x, 2), int(t)) for x, t in lv]
 
 
+def zone_visits(candles: pd.DataFrame, level: float, atr_val: float,
+                tol_atr: float | None = None) -> dict:
+    """How much ACTIVITY a level's zone actually saw — the chartist's sense of "strength".
+
+    Touch count answers "how many 5-bar swing extremes formed here". That is not what the eye
+    counts. Price can return to a shelf four times and pivot there twice, because a revisit
+    inside a choppy range never becomes a fractal extreme. Measured on BHEL's 371 zone: 4
+    separate visits, 10 bars traded into it, but only 2 pivots — so the board said x2 while the
+    chart plainly showed a level being used repeatedly.
+
+    Returns:
+      visits    separate approaches (runs of consecutive bars intersecting the zone)
+      bars      bars whose HIGH-LOW range intersected the zone at all
+      closes    bars that CLOSED inside it (commitment, not just a wick through)
+      time_pct  bars as a share of the window — how much of its life price spent here
+
+    This is DESCRIPTIVE, exactly like the touch count beside it. Measured over 8 years, neither
+    frequency NOR reaction size ranks levels by what they subsequently pay (see the level
+    studies in memory): more touches came out mildly ANTI-predictive. So read this as "how real
+    is this shelf on the chart", never as "how likely is it to hold".
+    """
+    from . import config
+    if candles is None or len(candles) < 3 or not atr_val or atr_val <= 0:
+        return {"visits": 0, "bars": 0, "closes": 0, "time_pct": 0.0}
+    tol = (config.SR_TOL_ATR if tol_atr is None else tol_atr) * float(atr_val)
+    lo, hi = float(level) - tol, float(level) + tol
+    h = candles["high"].to_numpy(float)
+    l = candles["low"].to_numpy(float)
+    c = candles["close"].to_numpy(float)
+    inz = (l <= hi) & (h >= lo)                    # the bar's range overlapped the zone
+    visits = int(np.sum(inz & ~np.concatenate(([False], inz[:-1]))))   # count run STARTS
+    return {"visits": visits, "bars": int(inz.sum()),
+            "closes": int(((c >= lo) & (c <= hi)).sum()),
+            "time_pct": round(100.0 * inz.mean(), 1)}
+
+
 def sr_levels(candles: pd.DataFrame, spot: float | None = None,
               lookback: int | None = None, tol_atr: float | None = None,
               min_dist_atr: float = 0.25) -> dict:
@@ -492,9 +528,16 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
     # wall from the very warning meant to flag it.
     up2 = [x for x, t in lv if t >= 2 and x > px]
     dn2 = [x for x, t in lv if t >= 2 and x < px]
+    # ACTIVITY beside the pivot count, for the two levels actually displayed. Same window the
+    # levels were drawn from, so the two numbers describe the same stretch of chart.
+    win = cd.iloc[-lookback:]
+    zs = zone_visits(win, sup, a) if sup else {"visits": 0, "bars": 0, "closes": 0, "time_pct": 0.0}
+    zr = zone_visits(win, res, a) if res else {"visits": 0, "bars": 0, "closes": 0, "time_pct": 0.0}
     return {
         "support": sup, "sup_touches": sup_t,
         "resistance": res, "res_touches": res_t,
+        "sup_visits": zs["visits"], "sup_time_pct": zs["time_pct"], "sup_bars": zs["bars"],
+        "res_visits": zr["visits"], "res_time_pct": zr["time_pct"], "res_bars": zr["bars"],
         "head_up": round((min(up2) - px) / a, 2) if up2 else None,
         "head_dn": round((px - max(dn2)) / a, 2) if dn2 else None,
         "atr": a, "levels": lv,

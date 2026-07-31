@@ -90,6 +90,54 @@ def test_structure_and_band_are_scale_invariant():
     assert a["res_touches"] == b["res_touches"] and a["head_up"] == b["head_up"]
 
 
+# ── zone activity: what the eye counts, beside what the pivot rule counts ────────
+def test_zone_visits_counts_approaches_not_bars():
+    # one long stay in the zone is ONE visit, not twenty. The eye counts approaches.
+    idx = pd.date_range("2025-01-01", periods=20, freq="D")
+    c = np.array([100.0] * 10 + [130.0] * 10)
+    d = pd.DataFrame({"ts": idx, "open": c, "high": c + 1, "low": c - 1,
+                      "close": c, "volume": 1.0})
+    z = I.zone_visits(d, 100.0, atr_val=2.0)
+    assert z["visits"] == 1 and z["bars"] == 10 and z["closes"] == 10
+
+
+def test_zone_visits_separates_repeat_approaches():
+    idx = pd.date_range("2025-01-01", periods=20, freq="D")
+    c = np.array([100.0, 100.0, 130.0, 130.0, 100.0, 100.0, 130.0, 130.0, 100.0, 130.0] * 2)
+    d = pd.DataFrame({"ts": idx, "open": c, "high": c + 1, "low": c - 1,
+                      "close": c, "volume": 1.0})
+    assert I.zone_visits(d, 100.0, atr_val=2.0)["visits"] == 6
+
+
+def test_zone_visits_can_exceed_the_pivot_count():
+    # THE POINT OF THE COLUMN: a shelf revisited inside a choppy range never forms a 5-bar
+    # fractal extreme, so the pivot rule under-reports a level the chart clearly uses.
+    rng = np.random.default_rng(5)
+    base = np.concatenate([np.full(12, 100.0) + rng.normal(0, 0.3, 12),
+                           np.full(12, 118.0) + rng.normal(0, 0.3, 12)] * 4)
+    d = pd.DataFrame({"ts": pd.date_range("2025-01-01", periods=len(base), freq="D"),
+                      "open": base, "high": base + 1, "low": base - 1,
+                      "close": base, "volume": 1.0})
+    z = I.zone_visits(d, 100.0, atr_val=3.0)
+    assert z["visits"] >= 4 and z["time_pct"] > 25
+
+
+def test_zone_visits_is_degenerate_safe():
+    for bad in (None, pd.DataFrame()):
+        assert I.zone_visits(bad, 100.0, 2.0)["visits"] == 0
+    d = _bars(np.full(20, 100.0), np.full(20, 100.0))
+    assert I.zone_visits(d, 100.0, atr_val=0.0)["visits"] == 0     # no ATR -> no zone
+
+
+def test_sr_levels_reports_activity_beside_touch_count():
+    rng = np.random.default_rng(11)
+    c = 500 + np.cumsum(rng.normal(0, 4, 150))
+    sr = I.sr_levels(_bars(c + 2, c - 2, c), lookback=config.SR_LOOKBACK)
+    for k in ("sup_visits", "sup_time_pct", "res_visits", "res_time_pct"):
+        assert k in sr
+    assert sr["sup_visits"] >= 0 and 0 <= sr["sup_time_pct"] <= 100
+
+
 def test_sr_levels_orders_support_below_price_and_resistance_above():
     rng = np.random.default_rng(11)
     c = 500 + np.cumsum(rng.normal(0, 4, 120))
