@@ -30,9 +30,21 @@ st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="�
 # Belt-and-braces: this targets a Streamlit internal test-id, so if a future version renames it
 # the CSS silently stops applying — the tooltips are ALSO kept short enough to mostly fit, and
 # the full text lives in an on-page expander that never depends on this working.
+# The first attempt targeted only [data-testid="stTooltipContent"], which is Streamlit's WIDGET
+# tooltip (the ⓘ beside a selectbox). A DATAFRAME column-header tooltip is a different element,
+# so the rule never applied and long help text stayed clipped with no scrollbar. Cast wider and
+# hit the generic ARIA/baseweb tooltip containers too — whichever one Streamlit is using, one of
+# these matches. Still belt-and-braces: the help strings are also kept short enough to fit.
 st.markdown("""<style>
-div[data-testid="stTooltipContent"]{max-height:22rem;overflow-y:auto;max-width:46rem;}
-div[data-testid="stTooltipContent"] p{margin-bottom:.5rem;}
+div[data-testid="stTooltipContent"],
+div[data-testid="stTooltipContent"] > div,
+div[data-baseweb="tooltip"],
+div[data-baseweb="popover"] div[role="tooltip"],
+div[role="tooltip"]{
+  max-height:24rem !important; overflow-y:auto !important;
+  max-width:46rem !important; white-space:pre-wrap;
+}
+div[role="tooltip"] p{margin-bottom:.4rem;}
 </style>""", unsafe_allow_html=True)
 
 
@@ -568,44 +580,27 @@ SR_COLS = {
 DELIV_COLS = {
     "deliv 5wk": st.column_config.TextColumn(
         "deliv 5wk", width="medium",
-        help="THE DELIVERY TREND — turnover-weighted delivery % for the CURRENT week first, then "
-             "the previous 4, and how far the current week sits from this stock's OWN norm. "
-             "Delivery % is the share of traded volume actually taken for delivery rather than "
-             "squared off intraday, so a larger slice being KEPT is the footprint of someone "
-             "building a position rather than trading it.\n\n"
-             "HOW TO READ '19*4d, 17, 13, 16, 36  Base - (−35%)': the FIRST number is this week "
-             "and the rest go BACKWARDS in time. '*4d' means the week is still forming and has "
-             "4 trading days in it so far — the noisiest number in the cell; no star means the "
-             "week is complete. 'Base - (−35%)' is the part people misread: it is NOT a "
-             "week-on-week change, a slope or a return — it is how far THIS WEEK sits from this "
-             "stock's own long-run delivery BASE (its 100-day norm). Here delivery is running a "
-             "third below what this name normally does, after collapsing from 36% five weeks "
-             "ago — distribution.\n\n"
-             "Rough scale: within ±10% is noise, beyond ±20% is worth a look, beyond ±30% puts "
-             "the name in the top or bottom decile of the board.\n\n"
-             "NOTE THE DIRECTION: newest is on the LEFT, so a RISING delivery trend reads as "
-             "DESCENDING numbers ('48, 43, 36, 33, 37' is accumulation building, not fading).\n\n"
-             "WHY THE DEVIATION IS RELATIVE (%) AND NOT PERCENTAGE POINTS: +19pp on a 29% norm "
-             "(+66%) and +19pp on a 60% norm (+32%) are different events. Only the relative form "
-             "makes two rows of this table comparable, which is the norm's entire job.\n\n"
-             "WHY THE NORM IS IN THE CELL, and it matters more than it looks: raw delivery % is "
-             "NOT comparable between names. Across this universe the per-stock norms run 15% to "
-             "66% (p5 28, median 47.5, p95 59), so the SAME reading means opposite things on two "
-             "rows. Measured, both printing ~50% last week: VMM (norm 64%) was −21% BELOW its "
-             "own norm and fading, while HINDCOPPER (norm 22%) was +117% ABOVE its norm and "
-             "accumulating hard. The series gives you the direction; the norm gives you the "
-             "level.\n\n"
-             "WHY FIVE WEEKS: a single week moves a median 5.0pp week-over-week while the 5-week "
-             "span is 12.8pp — one week is mostly noise, the direction across five is the "
-             "readable part.\n\n"
-             "The norm is the 100 trading days ending BEFORE the five weeks shown, so it is a "
-             "clean baseline rather than one containing the very move you are judging. That "
-             "makes it a DIFFERENT baseline from the `vs100D %` column, whose window overlaps "
-             "the recent weeks — two similar-sounding numbers answering two questions.\n\n"
-             "LEAK-FREE: NSE publishes delivery ~6pm, so today's figure does not exist at a "
-             "15:15 decision. Every value here is read from the archive through the last "
-             "COMPLETED session. CONTEXT, not a signal — delivery's own forward IC is weak "
-             "(~0.03-0.07); it earns its place as a leg of the footprint, not alone."),
+        help="Weekly DELIVERY % — the share of traded volume actually taken for delivery instead "
+             "of squared off intraday. More kept = someone building a position, not trading it.\n\n"
+             "READ  '19*4d, 17, 13, 16, 36   Base - (−35%)'\n"
+             "• First number = THIS week. The rest go BACKWARDS in time, so newest is on the "
+             "LEFT and a RISING trend reads as DESCENDING numbers.\n"
+             "• '*4d' = week still forming, 4 trading days in it so far (the noisiest number "
+             "here). No star = the week is complete.\n"
+             "• 'Base - (−35%)' = this week versus this stock's BASE.\n\n"
+             "WHAT THE BASE IS — this stock's OWN normal delivery rate: the turnover-weighted "
+             "average delivery % over the 100 trading days ENDING BEFORE the 5 weeks shown. It "
+             "deliberately excludes those weeks so the recent move cannot drag its own yardstick. "
+             "Every stock has a different one — across this board they run roughly 15% to 66%.\n\n"
+             "WHY IT MATTERS: 62% delivery is a QUIET week for a name whose base is 69%, while "
+             "31% is a SURGE for a name whose base is 14%. The raw numbers alone cannot tell you "
+             "that. The series gives you the direction; the Base % gives you the level.\n\n"
+             "It is NOT a week-on-week change, NOT a slope, NOT a return.\n\n"
+             "SCALE: within ±10% is noise · beyond ±20% worth a look · beyond ±30% puts the name "
+             "in the top or bottom decile of the board.\n\n"
+             "Leak-free — NSE publishes delivery ~6pm, so today never counts; read through the "
+             "last COMPLETED session. CONTEXT, not a signal: delivery's own forward IC is weak "
+             "(~0.03-0.07), it works as a leg of the footprint, not alone."),
     "wtd_deliv7": st.column_config.NumberColumn(
         "wtdDeliv7 %", format="%.1f%%",
         help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
