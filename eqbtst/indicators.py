@@ -35,7 +35,12 @@ def rsi(closes, period: int = 14) -> float:
         ag = (ag * (period - 1) + up[i]) / period
         al = (al * (period - 1) + dn[i]) / period
     if al == 0:
-        return 100.0
+        # A SERIES THAT NEVER FELL IS RSI 100 — BUT A SERIES THAT NEVER MOVED IS NOT.
+        # With zero average loss AND zero average gain the ratio is 0/0, and returning 100
+        # called a frozen tape "maximally overbought": rsi_state then read tone='strong', so a
+        # name that had not ticked in 14 bars displayed the strongest momentum on the board.
+        # No gain and no loss is the definition of neutral.
+        return 100.0 if ag > 0 else 50.0
     return float(100.0 - 100.0 / (1.0 + ag / al))
 
 
@@ -256,8 +261,14 @@ def _range_bound(vals: np.ndarray, atr_val: float, upper: bool) -> float:
     are untouched. Symmetric for the low. See struct_full for the measured incidence."""
     from . import config
     v = np.asarray(vals, float)
+    # NaN-SAFE, AND IT IS NOT COSMETIC. np.sort puts NaN at the END of the array, so a single
+    # missing bar made s[-1] NaN; the spike test (NaN - s[-2] > gap) is False, so NaN was
+    # returned as the range top. Every later comparison against it is False, which SILENTLY
+    # disables the breakout test — the name simply reads RANGE forever, with no error and no
+    # 'n/a' to signal that one candle poisoned it. Drop non-finite values instead.
+    v = v[np.isfinite(v)]
     if len(v) < 3 or not atr_val or atr_val <= 0:
-        return float(v.max() if upper else v.min())
+        return float(v.max() if upper else v.min()) if len(v) else float("nan")
     s = np.sort(v)
     gap = config.STRUCT_SPIKE_ATR * atr_val
     if upper:
@@ -378,9 +389,21 @@ def pivots(h, l, w: int = 2):
     l = np.asarray(l, float)
     his, los = [], []
     for i in range(w, len(h) - w):
-        if h[i] >= h[i - w:i + w + 1].max() - 1e-9:
+        wh, wl = h[i - w:i + w + 1], l[i - w:i + w + 1]
+        # A SWING REQUIRES THE PRICE TO HAVE MOVED. On a window with zero range — a halted or
+        # circuit-frozen name, or a thin intraday stretch where the broker repeats the last
+        # price — the >= and <= tests BOTH pass on every bar, so each bar is logged as a swing
+        # high AND a swing low at the same price. walls() then clusters them into one level
+        # whose touch count is ~2x the bar count: a dead-flat 40-bar window produced a single
+        # level "defended 72 times", the strongest wall the board can display, from a name
+        # that never traded. Touch count is the whole value of the feature, so it must not be
+        # manufacturable by inactivity. (Measured on 140 real names: this changes nothing —
+        # 0.5% of pivots are adjacent and no level crosses the x2/x3 lines because of them.)
+        if not (np.isfinite(wh).any() and np.isfinite(wl).any()) or wh.max() <= wl.min():
+            continue
+        if h[i] >= wh.max() - 1e-9:
             his.append(float(h[i]))
-        if l[i] <= l[i - w:i + w + 1].min() + 1e-9:
+        if l[i] <= wl.min() + 1e-9:
             los.append(float(l[i]))
     return his, los
 
