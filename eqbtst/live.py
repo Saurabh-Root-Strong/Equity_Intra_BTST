@@ -1084,6 +1084,113 @@ def deliv_momentum(date=None) -> pd.DataFrame:
     return res
 
 
+_DELIV_WK: dict = {}          # (as_of, n_weeks) -> DataFrame(symbol -> weekly delivery trend)
+_DELIV_WK_NORM = 100          # trading days of baseline, taken BEFORE the shown weeks
+_DELIV_WK_MINHIST = 40        # ... and at least this many, or no norm is published
+
+
+def deliv_weeks(date=None, n_weeks: int = 5) -> pd.DataFrame:
+    """Turnover-weighted delivery % for each of the last `n_weeks` WEEKS, per symbol,
+    plus that stock's OWN long-run norm — the 'are the big players building or leaving' read.
+
+    WHY THE WEEKLY SEQUENCE AND NOT ONE NUMBER. Measured on the archive: a single week moves a
+    median 5.0pp week-over-week while the 5-week span is 12.8pp. One week is mostly noise; the
+    DIRECTION across five is the readable part. Hence a series, not a point.
+
+    WHY RAW % *AND* A NORM, WHICH IS THE WHOLE DESIGN QUESTION.
+      Raw delivery % is NOT comparable across names. The universe's own 100-day norms run from
+      15% to 66% (p5 27.9, median 47.5, p95 59.3), so an identical reading means opposite
+      things on two rows of the same table. Measured example, both printing ~50% last week:
+          VMM         51, 49, 60, 38, 51   norm 64%  ->  -21% vs its own norm  (distribution)
+          HINDCOPPER  37, 33, 36, 43, 48   norm 22%  -> +117% vs its own norm  (accumulation)
+      But converting the SERIES to ratios destroys the magnitude a trader reads ("this name
+      delivers 60%"), and the trend is already self-normalising because it is one stock against
+      itself. So: keep the series in raw percentage points, and carry the norm in the same cell
+      as the anchor that makes the level comparable. Both questions answered, one column.
+
+    THE BASELINE DELIBERATELY EXCLUDES THE WEEKS ON DISPLAY. It is the 100 trading days ending
+    BEFORE the first shown week. Comparing five weeks against a norm that contains those same
+    five weeks is self-referential and drags the baseline toward whatever just happened, muting
+    exactly the move you are looking for. NOTE this is therefore NOT the same baseline as the
+    `deliv_vs_100d` column, whose avg_deliv100 is the 100 days before as_of and so overlaps the
+    recent weeks by ~25 days. Two similar-sounding numbers, two different questions.
+
+    LEAK-FREE, and this is the leg that has bitten this project before: NSE publishes delivery
+    ~6pm, so TODAY's figure does not exist at a 15:15 decision. Everything here is read from the
+    archive through `date` (the last COMPLETED, published session), and the newest week is
+    flagged `partial` whenever its Friday has not passed — so a Wednesday reading is honestly a
+    three-day week, never dressed up as a full one.
+
+    Cached per as-of DATE (never on today()), so Replay gets its own answer.
+    """
+    key = (pd.Timestamp(date).date() if date is not None else data.last_trading_date().date(),
+           int(n_weeks))
+    hit = _DELIV_WK.get(key)
+    if hit is not None:
+        return hit
+    as_of = pd.Timestamp(key[0])
+    start = (as_of - pd.Timedelta(days=330)).strftime("%Y-%m-%d")   # 5wk + 100td baseline + slack
+    df = data.load_eod(start=start, end=as_of.strftime("%Y-%m-%d"))
+    df = df[(df["turnover_lacs"] > 0) & df["deliv_per"].notna()]
+    if df.empty:
+        res = pd.DataFrame(columns=["norm", "partial", "cell"])
+        _DELIV_WK.clear(); _DELIV_WK[key] = res
+        return res
+
+    df = df.copy()
+    df["wk"] = df["trade_date"].dt.to_period("W-FRI")
+    wk = (df.assign(_num=df["deliv_per"] * df["turnover_lacs"])
+            .groupby(["symbol", "wk"], observed=True)[["_num", "turnover_lacs"]].sum())
+    wk = (wk["_num"] / wk["turnover_lacs"].replace(0, np.nan)).rename("d").reset_index()
+    weeks = sorted(wk["wk"].unique())[-n_weeks:]
+    if not weeks:
+        res = pd.DataFrame(columns=["norm", "partial", "cell"])
+        _DELIV_WK.clear(); _DELIV_WK[key] = res
+        return res
+    grid = wk[wk["wk"].isin(weeks)].pivot(index="symbol", columns="wk", values="d")
+    grid = grid.reindex(columns=weeks)
+
+    # baseline: the 100 trading days ENDING BEFORE the first displayed week
+    cut = pd.Timestamp(weeks[0].start_time)
+    hist = df[df["trade_date"] < cut].sort_values("trade_date")
+    def _norm(g):
+        g = g.tail(_DELIV_WK_NORM)
+        t = g["turnover_lacs"].sum()
+        return float((g["deliv_per"] * g["turnover_lacs"]).sum() / t) if (
+            t > 0 and len(g) >= _DELIV_WK_MINHIST) else np.nan
+    norm = (hist.groupby("symbol").apply(_norm, include_groups=False)
+            if not hist.empty else pd.Series(dtype=float))
+    out = grid.copy()
+    out.columns = [f"w{i+1}" for i in range(len(weeks))]
+    out["norm"] = norm.reindex(out.index)
+    # a week is finished once the CALENDAR has passed its Friday (holiday-proof, same rule as
+    # weekly_frame) — otherwise the newest column is a part-week and must say so.
+    out["partial"] = bool(as_of < pd.Timestamp(weeks[-1].end_time).normalize())
+
+    wcols = [c for c in out.columns if c.startswith("w")]
+
+    def _cell(r):
+        vals = [r[c] for c in wcols]
+        if not any(pd.notna(v) for v in vals):
+            return "—"
+        seq = ", ".join("–" if pd.isna(v) else f"{v:.0f}" for v in vals)
+        if r["partial"]:
+            seq += "*"
+        if pd.isna(r["norm"]) or r["norm"] <= 0:
+            return f"{seq}  (no norm)"
+        latest = next((v for v in reversed(vals) if pd.notna(v)), np.nan)
+        glyph = ""
+        if pd.notna(latest):
+            rel = latest / r["norm"]
+            glyph = " ▲" if rel >= 1.10 else (" ▼" if rel <= 0.90 else "")
+        return f"{seq}  n{r['norm']:.0f}{glyph}"
+
+    out["cell"] = out.apply(_cell, axis=1)
+    _DELIV_WK.clear()                       # never hold two days of frames
+    _DELIV_WK[key] = out
+    return out
+
+
 def mtf_structure(sym: str) -> dict:
     """Kaufman structure on SIX timeframes for one name — {15m,1h,2h,4h,1D,1W} — from ONE
     15-minute fetch (~20 days, resampled locally to 1h/2h/4h) plus the daily archive
@@ -1279,6 +1386,7 @@ def universe_mtf_scan(date=None) -> dict:
 
     uni = liquid_universe(date).set_index("symbol")
     dm = deliv_momentum(date)                    # DCM-ported delivery conviction (one read/day)
+    dw = deliv_weeks(date)                       # 5-week delivery TREND + own norm (one read/day)
     q = _fetch_quotes([fy_symbol(s) for s in uni.index])
     _nf = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
     idx_ret = _chp(_nf)
@@ -1350,6 +1458,7 @@ def universe_mtf_scan(date=None) -> dict:
             "turn₹L": turn_l,                                          # today's turnover (₹lacs)
             "wtd_deliv7": round(_wd, 1) if _wd == _wd else np.nan,     # NaN-safe (x==x)
             "deliv_vs_100d": round(_dv, 1) if _dv == _dv else np.nan,
+            "deliv 5wk": (dw.loc[sym, "cell"] if sym in dw.index else "—"),
             "s15m": _mtf["15m"], "s1h": _mtf["1h"], "s2h": _mtf["2h"],
             "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
             "bnds15m": _mtf["b15m"], "bnds1h": _mtf["b1h"], "bnds2h": _mtf["b2h"],
@@ -1786,6 +1895,7 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             # nearest/headroom/at_wall on every tick without a fetch
             "_wall_pair": r.get("_wall_pair"), "_sr_atr": r.get("_sr_atr"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
+            "deliv 5wk": r.get("deliv 5wk"),
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],

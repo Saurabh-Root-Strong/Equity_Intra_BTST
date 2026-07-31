@@ -566,6 +566,36 @@ SR_COLS = {
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
 DELIV_COLS = {
+    "deliv 5wk": st.column_config.TextColumn(
+        "deliv 5wk", width="medium",
+        help="THE DELIVERY TREND — turnover-weighted delivery % for each of the last 5 WEEKS, "
+             "oldest first, then this stock's OWN long-run norm. Delivery % is the share of "
+             "traded volume that was actually taken for delivery rather than squared off "
+             "intraday, so a rising series means a larger slice of the volume is being KEPT — "
+             "the footprint of someone building a position rather than trading it.\n\n"
+             "HOW TO READ '36, 16, 13, 17, 19*  n29 ▼': five weekly readings oldest→newest; "
+             "the * marks the newest week as STILL FORMING (its Friday has not passed, so it is "
+             "a part-week); n29 is this stock's own norm; ▲/▼ flag the latest week ≥10% above / "
+             "≤10% below that norm. Here delivery collapsed from 36% to the teens against a 29% "
+             "norm — distribution, not accumulation.\n\n"
+             "WHY THE NORM IS IN THE CELL, and it matters more than it looks: raw delivery % is "
+             "NOT comparable between names. Across this universe the per-stock norms run 15% to "
+             "66% (p5 28, median 47.5, p95 59), so the SAME reading means opposite things on two "
+             "rows. Measured, both printing ~50% last week: VMM (norm 64%) was −21% BELOW its "
+             "own norm and fading, while HINDCOPPER (norm 22%) was +117% ABOVE its norm and "
+             "accumulating hard. The series gives you the direction; the norm gives you the "
+             "level.\n\n"
+             "WHY FIVE WEEKS: a single week moves a median 5.0pp week-over-week while the 5-week "
+             "span is 12.8pp — one week is mostly noise, the direction across five is the "
+             "readable part.\n\n"
+             "The norm is the 100 trading days ending BEFORE the five weeks shown, so it is a "
+             "clean baseline rather than one containing the very move you are judging. That "
+             "makes it a DIFFERENT baseline from the `vs100D %` column, whose window overlaps "
+             "the recent weeks — two similar-sounding numbers answering two questions.\n\n"
+             "LEAK-FREE: NSE publishes delivery ~6pm, so today's figure does not exist at a "
+             "15:15 decision. Every value here is read from the archive through the last "
+             "COMPLETED session. CONTEXT, not a signal — delivery's own forward IC is weak "
+             "(~0.03-0.07); it earns its place as a leg of the footprint, not alone."),
     "wtd_deliv7": st.column_config.NumberColumn(
         "wtdDeliv7 %", format="%.1f%%",
         help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
@@ -1213,7 +1243,7 @@ if tf == "Intraday":
         active = _htf_on or _ltf_on or _setup_on or _room_on or (min_wtd > 0) or (min_vs > 0)
         light_cols = (["symbol", "sector", "sector tilt", "ltp", "turn₹L", "day%"]
                       + (["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else [])
-                      + ["wtd_deliv7", "deliv_vs_100d",
+                      + ["wtd_deliv7", "deliv_vs_100d", "deliv 5wk",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
         # WHAT THE TAPE LOOKS LIKE RIGHT NOW — the census of setups across the whole universe,
@@ -1474,12 +1504,12 @@ if tf == "Intraday":
             return cols
 
         long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                     "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
+                     "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv 5wk",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                      "entry", "stop", "t1", "t2", "atr%", "action"])
         sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                        "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d",
+                        "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv 5wk",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                         "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"])
