@@ -357,8 +357,26 @@ direction**; the **Base % gives you the level**.
 
 `Base - (…)` is **not** a week-on-week change, **not** a slope, **not** a return.
 
-**Rough scale:** within **±10%** is noise · beyond **±20%** is worth a look · beyond **±30%**
-puts the name in the top or bottom decile of the board.
+**The scale — how big is big**
+
+The `Base - (…)` number is a *relative* deviation, so it needs its own yardstick. Measured
+across the whole board (2026-07-31, 265 names):
+
+| where it sits | value | reading |
+|---|---|---|
+| bottom decile | **−19%** or worse | delivery draining out |
+| lower quartile | −6% | |
+| median | +5% | ordinary week |
+| upper quartile | +14% | |
+| top decile | **+29%** or better | genuine accumulation |
+
+So in practice: **within ±10% is noise**, beyond **±20%** is worth a look, and beyond roughly
+**±30%** puts the name in the top or bottom tenth of the board. `+1%` is nothing happening;
+`−22%` is a real drain; `+116%` is exceptional.
+
+Note this is a *relative* scale, not percentage points. **+19pp on a 29% base is +66%**, while
+**+19pp on a 60% base is only +32%** — the same move in points, two different events. That is
+why the column reports the ratio rather than the difference.
 
 **`wtdDeliv7 %` / `vs100D %`** answer a shorter-horizon version of the same question — the last
 7 calendar days against a 100-day baseline that *overlaps* the recent weeks. Similar-sounding
@@ -650,18 +668,19 @@ DELIV_COLS = {
         # element is an internal component this stylesheet cannot reliably reach. So the tooltip
         # now carries only what fits, and the full explanation lives in the on-page expander
         # (render_deliv_help) — the pattern already proven to render in this app.
-        help="Weekly DELIVERY % — share of volume actually taken for delivery, not squared off "
-             "intraday. More kept = someone building a position.\n\n"
+        # ORDER IS THE DEFENCE. Streamlit clips this tooltip near ~650 characters with no
+        # scrollbar, and the previous version lost its SCALE line to exactly that cut. So the
+        # scale now sits ABOVE everything optional: whatever survives the clip contains the
+        # numbers that make the column readable. The worked example moved to the expander.
+        help="Weekly DELIVERY % — share of volume taken for delivery, not squared off intraday.\n\n"
              "'41, 35, 40, 41, 42  Base - (+1%)'\n"
-             "• FIRST number = THIS week, the rest go BACKWARDS. So a RISING trend reads as "
-             "DESCENDING numbers.\n"
-             "• '*4d' = week still forming, 4 days in so far. No star = complete.\n"
-             "• 'Base - (+1%)' = this week vs this stock's OWN normal delivery rate (its 100-day "
-             "average, measured BEFORE these 5 weeks). NOT a week-on-week change.\n\n"
-             "Bases differ per stock (~15%–66% here), which is the point: 62% is a QUIET week "
-             "for a 69%-base name, 31% is a SURGE for a 14%-base one.\n\n"
-             "±10% noise · ±20% notable · ±30% top/bottom decile.\n\n"
-             "See '📦 What the delivery columns mean' above the table for the full note."),
+             "• FIRST = THIS week, rest go BACKWARDS (a RISING trend reads as DESCENDING).\n"
+             "• 'Base - (+1%)' = this week vs this stock's OWN normal rate — its 100-day average, "
+             "measured BEFORE these 5 weeks. NOT a week-on-week change.\n\n"
+             "SCALE:  ±10% = noise · ±20% = notable · ±30% = top/bottom decile.\n"
+             "Bases differ per stock (15–66%), so the % is what makes rows comparable.\n\n"
+             "'*4d' = week still forming, 4 days in. No star = complete.\n\n"
+             "Full note: the '📦 delivery columns' expander above the table."),
     "wtd_deliv7": st.column_config.NumberColumn(
         "wtdDeliv7 %", format="%.1f%%",
         help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
