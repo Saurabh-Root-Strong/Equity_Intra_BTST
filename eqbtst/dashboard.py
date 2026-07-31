@@ -385,9 +385,41 @@ numbers, deliberately different windows.
 **Leak-free.** NSE publishes delivery around 6pm, so today's figure does not exist at a 15:15
 decision. Every value here is read through the last **completed** session.
 
+**Does a high Base % actually pay? Measured — promising, not proven.**
+
+Joined to 8 years of this engine's own footprint triggers (n=692, regime-gated, net of 22bps),
+split into thirds by the Base %:
+
+| Base % third | n | net overnight | win% |
+|---|---|---|---|
+| low | 231 | +13.7 bps | 51.9% |
+| mid | 230 | +10.2 bps | 54.3% |
+| **HIGH** | 231 | **+30.3 bps** | **60.2%** |
+
+Top third minus bottom is **+16.6 bps (t = +1.39)** — economically large against a ~+20 bps
+edge, and unlike the sector-tilt column it *survives* removing the market's own overnight gap
+(cross-sectional excess **+20.0 bps, t = +1.85**), so it is not a which-nights-you-traded
+artifact. It is also genuinely new information, not the delivery leg the footprint already
+uses — correlation with `delivTr` is only **+0.16**. Same result in the deployable book
+(top-5/night, ≤2 per sector): **+16.4 bps**.
+
+**But it is not significant and not stable.** t ≈ 1.4 clustered by night, and HIGH beat low in
+only **5 of 9 years** (it fails 2018, 2019, 2025, 2026). So nothing in the engine reads it, and
+you should treat a big Base % as a tiebreaker between names you already like — not as a reason
+to take a trade you otherwise would not.
+
+*It would become wireable only on a pre-registered re-test clearing |t| ≥ 2 clustered by night
+AND ≥ 7 of 9 years. Judging it after the fact is how two earlier "edges" here were retracted.*
+
 **Context, not a signal.** Delivery's own forward IC is weak (~0.03–0.07). It earns its place as
 one leg of the accumulation footprint, alongside close strength, volume and relative strength —
 never as a reason to buy on its own.
+
+**Two honest limits of the number itself.** About **1 week in 4 is holiday-shortened** (15 of the
+last 61), and a 4-day week is noisier than a 5-day one though it renders identically. And a
+single huge-turnover day can dominate a week's figure — measured, the biggest day is a median
+32% of weekly turnover and exceeds 70% in only **1.3%** of weeks, so this is rare rather than
+routine, but a block deal can still lift one week on its own.
 """
 
 

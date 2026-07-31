@@ -1174,6 +1174,19 @@ def deliv_weeks(date=None, n_weeks: int = 5) -> pd.DataFrame:
 
     wcols = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()]
 
+    def _latest(r):
+        """Newest week that actually has a reading (a name may not have traded this week)."""
+        return next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan)
+
+    # ONE definition of the deviation, used by BOTH the column and the rendered string. They
+    # were computed separately at first — the same duplicate-formula pattern that caused the
+    # drift bugs in the sector-tilt port. Derive once, format from it.
+    out["dev_pct"] = [
+        (_latest(r) / r["norm"] - 1.0) * 100.0
+        if (pd.notna(r["norm"]) and r["norm"] > 0 and pd.notna(_latest(r))) else np.nan
+        for _i, r in out.iterrows()
+    ]
+
     def _cell(r):
         vals = [r[c] for c in wcols]                      # stored oldest -> newest
         if not any(pd.notna(v) for v in vals):
@@ -1194,21 +1207,12 @@ def deliv_weeks(date=None, n_weeks: int = 5) -> pd.DataFrame:
         # not. It is the CURRENT week measured against this stock's own long-run BASE, so the
         # cell now says "base 40 (+1%)": the absolute anchor restored (you can see what normal
         # looks like for this name) with the comparable relative form beside it.
-        if pd.isna(r["norm"]) or r["norm"] <= 0:
-            return f"{body}  Base - (n/a)"
-        latest = next((v for v in reversed(vals) if pd.notna(v)), np.nan)
-        if pd.isna(latest):
-            return f"{body}  Base - (n/a)"
         # RELATIVE, not percentage points: +19pp on a 29% base (+66%) and +19pp on a 60% base
         # (+32%) are different events, and only the relative form makes two rows comparable.
-        dev = (latest / r["norm"] - 1.0) * 100.0
-        return f"{body}  Base - ({dev:+.0f}%)"
+        if pd.isna(r["dev_pct"]):
+            return f"{body}  Base - (n/a)"
+        return f"{body}  Base - ({r['dev_pct']:+.0f}%)"
 
-    out["dev_pct"] = [
-        (next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan) / r["norm"] - 1) * 100
-        if (pd.notna(r["norm"]) and r["norm"] > 0) else np.nan
-        for _i, r in out.iterrows()
-    ]
     out["cell"] = out.apply(_cell, axis=1)
     _DELIV_WK.clear()                       # never hold two days of frames
     _DELIV_WK[key] = out
