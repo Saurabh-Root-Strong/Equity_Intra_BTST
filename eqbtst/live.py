@@ -1189,16 +1189,20 @@ def deliv_weeks(date=None, n_weeks: int = 5) -> pd.DataFrame:
         if r["partial"] and pd.notna(vals[-1]):
             seq[0] += f"*{int(r['cur_days'])}d" if r["cur_days"] else "*"
         body = ", ".join(seq)
+        # THE TAIL MUST NAME ITSELF. Shipped first as a bare "+1%" hanging off five percentages,
+        # which reads like a week-over-week change, a slope, or a return — three things it is
+        # not. It is the CURRENT week measured against this stock's own long-run BASE, so the
+        # cell now says "base 40 (+1%)": the absolute anchor restored (you can see what normal
+        # looks like for this name) with the comparable relative form beside it.
         if pd.isna(r["norm"]) or r["norm"] <= 0:
-            return f"{body}  (no norm)"
+            return f"{body}  Base - (n/a)"
         latest = next((v for v in reversed(vals) if pd.notna(v)), np.nan)
         if pd.isna(latest):
-            return f"{body}  (no norm)"
-        # SIGNED DEVIATION, RELATIVE — not percentage points. That is the whole job of the norm:
-        # +19pp on a 29% baseline (+66%) and +19pp on a 60% baseline (+32%) are different events,
-        # and only the relative form makes two rows of the table comparable.
+            return f"{body}  Base - (n/a)"
+        # RELATIVE, not percentage points: +19pp on a 29% base (+66%) and +19pp on a 60% base
+        # (+32%) are different events, and only the relative form makes two rows comparable.
         dev = (latest / r["norm"] - 1.0) * 100.0
-        return f"{body}  {dev:+.0f}%"
+        return f"{body}  Base - ({dev:+.0f}%)"
 
     out["dev_pct"] = [
         (next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan) / r["norm"] - 1) * 100
