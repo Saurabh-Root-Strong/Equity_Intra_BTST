@@ -1166,25 +1166,45 @@ def deliv_weeks(date=None, n_weeks: int = 5) -> pd.DataFrame:
     # a week is finished once the CALENDAR has passed its Friday (holiday-proof, same rule as
     # weekly_frame) — otherwise the newest column is a part-week and must say so.
     out["partial"] = bool(as_of < pd.Timestamp(weeks[-1].end_time).normalize())
+    # trading days actually printed in the newest week, PER SYMBOL — a "week" that is one
+    # session old is the noisiest number in the cell and must not look like a full one.
+    ndays = (df[df["wk"] == weeks[-1]].groupby("symbol").size()
+             if not df.empty else pd.Series(dtype=int))
+    out["cur_days"] = ndays.reindex(out.index).fillna(0).astype(int)
 
-    wcols = [c for c in out.columns if c.startswith("w")]
+    wcols = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()]
 
     def _cell(r):
-        vals = [r[c] for c in wcols]
+        vals = [r[c] for c in wcols]                      # stored oldest -> newest
         if not any(pd.notna(v) for v in vals):
             return "—"
-        seq = ", ".join("–" if pd.isna(v) else f"{v:.0f}" for v in vals)
-        if r["partial"]:
-            seq += "*"
+        # DISPLAY IS NEWEST FIRST. The eye lands on the leftmost number, and the current week is
+        # the decision-relevant one; the four behind it are the context. Note this reverses the
+        # chart convention, so a RISING delivery trend reads as DESCENDING numbers -- the tooltip
+        # says so explicitly, and the current week is marked, so there is no ambiguity about
+        # which end is now.
+        seq = ["–" if pd.isna(v) else f"{v:.0f}" for v in vals][::-1]
+        # only mark a week that HAS a reading — a name that did not trade this week shows a
+        # dash, and calling that dash "partial" would dress absence up as an in-progress figure
+        if r["partial"] and pd.notna(vals[-1]):
+            seq[0] += f"*{int(r['cur_days'])}d" if r["cur_days"] else "*"
+        body = ", ".join(seq)
         if pd.isna(r["norm"]) or r["norm"] <= 0:
-            return f"{seq}  (no norm)"
+            return f"{body}  (no norm)"
         latest = next((v for v in reversed(vals) if pd.notna(v)), np.nan)
-        glyph = ""
-        if pd.notna(latest):
-            rel = latest / r["norm"]
-            glyph = " ▲" if rel >= 1.10 else (" ▼" if rel <= 0.90 else "")
-        return f"{seq}  n{r['norm']:.0f}{glyph}"
+        if pd.isna(latest):
+            return f"{body}  (no norm)"
+        # SIGNED DEVIATION, RELATIVE — not percentage points. That is the whole job of the norm:
+        # +19pp on a 29% baseline (+66%) and +19pp on a 60% baseline (+32%) are different events,
+        # and only the relative form makes two rows of the table comparable.
+        dev = (latest / r["norm"] - 1.0) * 100.0
+        return f"{body}  {dev:+.0f}%"
 
+    out["dev_pct"] = [
+        (next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan) / r["norm"] - 1) * 100
+        if (pd.notna(r["norm"]) and r["norm"] > 0) else np.nan
+        for _i, r in out.iterrows()
+    ]
     out["cell"] = out.apply(_cell, axis=1)
     _DELIV_WK.clear()                       # never hold two days of frames
     _DELIV_WK[key] = out

@@ -48,10 +48,12 @@ def test_partial_week_is_flagged_and_rendered_with_a_star():
     expect_partial = d < wk_end
     assert bool(out["partial"].iloc[0]) == bool(expect_partial)
     if expect_partial:
-        assert out["cell"].str.contains(r"\*").all(), "a part-week must say so"
+        wl = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()][-1]
+        have = out[out[wl].notna()]
+        assert have["cell"].str.contains(r"\*\d*d?").all(), "a part-week must say so"
 
 
-def test_cell_carries_the_stocks_own_norm_not_a_universe_average():
+def test_norms_are_per_stock_not_a_universe_average():
     d = _archive()
     if d is None:
         pytest.skip("archive not reachable")
@@ -59,32 +61,58 @@ def test_cell_carries_the_stocks_own_norm_not_a_universe_average():
     if out.empty or "norm" not in out:
         pytest.skip("no rows")
     norms = out["norm"].dropna()
-    # per-stock baselines genuinely differ -- that is the whole reason the norm is displayed
+    # per-stock baselines genuinely differ -- that is the whole reason a norm is carried at all
     assert norms.max() - norms.min() > 15, "norms should span the universe, not be one number"
-    row = out.loc[norms.index[0]]
-    assert f"n{row['norm']:.0f}" in row["cell"]
 
 
-def test_direction_glyph_matches_the_latest_week_against_the_norm():
+def test_cell_leads_with_the_CURRENT_week_then_goes_backwards():
     d = _archive()
     if d is None:
         pytest.skip("archive not reachable")
     out = live.deliv_weeks(d)
     if out.empty:
         pytest.skip("no rows")
-    wcols = [c for c in out.columns if c.startswith("w")]
-    for _s, r in out.dropna(subset=["norm"]).head(200).iterrows():
-        vals = [r[c] for c in wcols]
-        latest = next((v for v in reversed(vals) if pd.notna(v)), np.nan)
+    wcols = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()]
+    r = out[out[wcols].notna().all(axis=1)].iloc[0]
+    shown = [s.split("*")[0] for s in r["cell"].split("  ")[0].split(", ")]
+    chrono = [f"{r[c]:.0f}" for c in wcols]           # stored oldest -> newest
+    assert shown == chrono[::-1], "display must be newest-first, storage stays chronological"
+
+
+def test_deviation_is_relative_to_the_norm_and_signed():
+    d = _archive()
+    if d is None:
+        pytest.skip("archive not reachable")
+    out = live.deliv_weeks(d)
+    if out.empty:
+        pytest.skip("no rows")
+    wcols = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()]
+    checked = 0
+    for _s, r in out.dropna(subset=["norm", "dev_pct"]).head(200).iterrows():
+        latest = next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan)
         if pd.isna(latest) or r["norm"] <= 0:
             continue
-        rel = latest / r["norm"]
-        if rel >= 1.10:
-            assert "▲" in r["cell"]
-        elif rel <= 0.90:
-            assert "▼" in r["cell"]
-        else:
-            assert "▲" not in r["cell"] and "▼" not in r["cell"]
+        want = (latest / r["norm"] - 1) * 100
+        assert r["dev_pct"] == pytest.approx(want, abs=1e-6)
+        # percentage POINTS would be latest-norm; assert we did NOT ship that
+        assert f"{want:+.0f}%" in r["cell"]
+        checked += 1
+    assert checked > 20
+
+
+def test_a_week_with_no_reading_is_not_marked_partial():
+    # a name that did not trade this week shows a dash; calling that dash "partial" would
+    # dress absence up as an in-progress figure
+    d = _archive()
+    if d is None:
+        pytest.skip("archive not reachable")
+    out = live.deliv_weeks(d)
+    if out.empty:
+        pytest.skip("no rows")
+    wcols = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()]
+    for _s, r in out.iterrows():
+        if pd.isna(r[wcols[-1]]):
+            assert not r["cell"].startswith("–*")
 
 
 def test_missing_history_says_no_norm_rather_than_inventing_one():
