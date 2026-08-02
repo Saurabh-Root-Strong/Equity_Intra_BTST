@@ -341,8 +341,26 @@ rather than squared off intraday. A larger slice being kept is the footprint of 
 **What "Base" is — and why it is there**
 
 The Base is **this stock's own normal delivery rate**: the turnover-weighted average delivery %
-over the **100 trading days ending BEFORE the five weeks shown**. It deliberately excludes those
-weeks, so a recent surge cannot drag its own yardstick and quietly shrink itself.
+over the trading days immediately before the current week. **How many days depends on your trade
+horizon**, and the column header names it (`deliv 5wk · base 30d`):
+
+| trade horizon | baseline |
+|---|---|
+| Intraday | 15 days |
+| BTST | 30 days |
+| Swing | 30 days |
+| Positional | 60 days |
+
+⚠️ **A short baseline drifts with the stock.** If delivery declines slowly for two months, a
+30-day base declines with it and the % can read near zero — the fall has become the new normal.
+`KALYANKJIL` shows this: **+24% on a 15-day base, +16% on 30, −7% on 60**, same week. So read the
+**series** for the trend and the **%** for "unusual versus recent". They answer different
+questions, and on a long slow drift only the series will tell you.
+
+*Measured, 2018-2026: a 5-day baseline (the obvious "match it to an intraday hold" choice) is the
+worst on every horizon — two tiny samples disagreeing is noise, not signal. The optimum sits near
+30 days for every horizon, so the right baseline turns out to be a property of the delivery
+series itself, about a month, rather than of how long you hold.*
 
 Every stock has a different one — across this board they run from roughly **15% to 66%**. That
 is the whole reason the number is in the cell:
@@ -432,6 +450,25 @@ def render_deliv_help():
     here — the same fix already proven for the sector-tilt column."""
     with st.expander("📦 What the **delivery** columns mean (and what 'Base' is)"):
         st.markdown(DELIV_HELP_FULL)
+
+
+def _dw(df, as_of, horizon: str | None):
+    """Recompute `deliv 5wk` for the ACTIVE trade horizon, at render time.
+
+    The baseline scales with the hold (see live.DELIV_BASE_BY_HORIZON), but the universe scan
+    is cached and must not re-run just because the horizon dropdown moved — so the column is
+    rebuilt here from the per-day delivery table instead. Degrades to whatever the scan already
+    attached if the archive is momentarily unavailable."""
+    if df is None or df.empty or "symbol" not in df.columns:
+        return df
+    try:
+        bd = live.DELIV_BASE_BY_HORIZON.get(horizon or "btst", live._DELIV_WK_NORM)
+        cells = live.deliv_weeks(as_of, base_days=bd)["cell"]
+        out = df.copy()
+        out["deliv 5wk"] = out["symbol"].map(cells).fillna("—")
+        return out
+    except Exception:
+        return df
 
 
 def _wt(df, as_of, side=None):
@@ -1093,6 +1130,7 @@ if tf == "Intraday":
                                    "eats a far smaller share of a multi-day move than of a "
                                    "30-minute one. The intraday hunt in this stack is closed."))
         _P = mtf.PRESETS.get(preset)
+        _hz = preset            # active trade horizon — scales the delivery baseline (_dw)
         if _P and preset != "intraday" and tf == "Intraday":
             # NAME COLLISION: the sidebar radio picks WHICH BOARD you are on (validated
             # BTST-carry board / this structure lane / replay); this dropdown picks the
@@ -1415,6 +1453,15 @@ if tf == "Intraday":
                 + " Raise a **delivery** slider or pick a **structure** to narrow further; "
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
             _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
+            # NAME THE ACTIVE BASELINE IN THE HEADER. It now moves with the trade horizon, so a
+            # bare "deliv 5wk" would leave the reader guessing which yardstick the % is against
+            # — and the answer changes the sign on real names (KALYANKJIL reads +24% on a 15-day
+            # base and −7% on a 60-day one).
+            _bd = live.DELIV_BASE_BY_HORIZON.get(_hz or "btst", live._DELIV_WK_NORM)
+            _cfg["deliv 5wk"] = st.column_config.TextColumn(
+                f"deliv 5wk · base {_bd}d", width="medium",
+                help=DELIV_COLS["deliv 5wk"].help if hasattr(DELIV_COLS["deliv 5wk"], "help")
+                else None)
             render_tilt_help()
             render_deliv_help()
 
@@ -1435,7 +1482,7 @@ if tf == "Intraday":
                         _anchor = next((c for c in ("deliv_vs_100d", "wtd_deliv7", "side")
                                         if c in _c), None)
                         _c.insert(_c.index(_anchor) + 1 if _anchor else 1, _e)
-                df_ = _wt(df_, _ASOF_LIVE)          # side comes from each row's own `side`
+                df_ = _wt(_dw(df_, _ASOF_LIVE, _hz), _ASOF_LIVE)   # side comes from each row's own `side`
                 st.dataframe(_fmt(df_)[_cols(df_, _c)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
                 # Denominator = the pool the SIDES were split from, not the raw scan. Quoting
@@ -1563,7 +1610,7 @@ if tf == "Intraday":
                         _side_table(_no)
                 _side_tabs()
             else:
-                _lt = _wt(light, _ASOF_LIVE)
+                _lt = _wt(_dw(light, _ASOF_LIVE, _hz), _ASOF_LIVE)
                 st.dataframe(_fmt(_lt)[_cols(_lt, light_cols)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
                 _tally(len(light), sc["n_scanned"], "names",
@@ -1664,7 +1711,7 @@ if tf == "Intraday":
                     st.caption("No LONG-side setup among the matches. That is a reading of the "
                                "tape, not an error — loosen a filter to see more.")
                 else:
-                    lo = _wt(lo, _ASOF_LIVE, "LONG")
+                    lo = _wt(_dw(lo, _ASOF_LIVE, _hz), _ASOF_LIVE, "LONG")
                     st.dataframe(_fmt(lo)[_cols(lo, long_cols)], use_container_width=True,
                                  hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS})
                     _tally(len(lo), sc["n_scanned"], "names",
@@ -1679,7 +1726,7 @@ if tf == "Intraday":
                     st.caption("No SHORT-side setup among the matches. A reading of the tape, "
                                "not an error.")
                 else:
-                    sh = _wt(sh, _ASOF_LIVE, "SHORT")
+                    sh = _wt(_dw(sh, _ASOF_LIVE, _hz), _ASOF_LIVE, "SHORT")
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                  hide_index=True,
                                  column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS})

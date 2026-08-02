@@ -30,10 +30,39 @@ def test_weekly_value_is_turnover_weighted_not_a_simple_average():
     assert wtd < np.mean([20.0, 90.0]), "a plain mean would let a dead day count equally"
 
 
-def test_norm_window_is_taken_before_the_displayed_weeks():
-    # comparing 5 weeks against a baseline that CONTAINS them is self-referential and mutes
-    # the very move being judged. The constant exists so that intent is greppable.
-    assert live._DELIV_WK_NORM == 100 and live._DELIV_WK_MINHIST == 40
+def test_no_horizon_uses_a_baseline_short_enough_to_be_noise():
+    """A 5-day baseline is the obvious "match it to an intraday hold" choice and it is WRONG.
+
+    Measured 2018-2026, IC t-stat clustered by date: base-5 is the worst column on every one of
+    the four horizons (Intraday 3.03 vs 5.21 at 30d; BTST 1.27 vs 2.83; Swing 3.67 vs 6.67;
+    Positional 1.70 vs 3.57). A 4-day reading against a 5-day base is two tiny samples
+    disagreeing. This pins the floor so the ladder cannot be "simplified" back into noise.
+    """
+    assert set(live.DELIV_BASE_BY_HORIZON) == {"intraday", "btst", "swing", "positional"}
+    for hz, days in live.DELIV_BASE_BY_HORIZON.items():
+        assert days >= 15, f"{hz}: a baseline under 15d measured worse than useless"
+    # and the ladder is non-decreasing with holding period, which is the whole design intent
+    order = ["intraday", "btst", "swing", "positional"]
+    vals = [live.DELIV_BASE_BY_HORIZON[h] for h in order]
+    assert vals == sorted(vals)
+
+
+def test_baseline_length_actually_changes_the_deviation():
+    d = _archive()
+    if d is None:
+        pytest.skip("archive not reachable")
+    short = live.deliv_weeks(d, base_days=15)
+    long_ = live.deliv_weeks(d, base_days=60)
+    if short.empty or long_.empty:
+        pytest.skip("no rows")
+    common = short.index.intersection(long_.index)
+    assert len(common) > 50
+    # the weekly SERIES is identical (same data); only the yardstick moved
+    wl = [c for c in short.columns if c.startswith("w") and c[1:].isdigit()][-1]
+    assert np.allclose(short.loc[common, wl].astype(float),
+                       long_.loc[common, wl].astype(float), equal_nan=True)
+    moved = (short.loc[common, "dev_pct"] - long_.loc[common, "dev_pct"]).abs()
+    assert moved.median() > 1.0, "a 15d vs 60d base must give materially different deviations"
 
 
 # ── the honesty markers ───────────────────────────────────────────────────────────
