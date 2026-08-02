@@ -77,9 +77,22 @@ _UNI_TTL = 120.0               # seconds — the EOD universe changes once a DAY
 
 
 def clear_universe_cache() -> None:
-    """Drop the cached EOD universe (the dashboard's ↻ refresh calls this, so a fresh
-    nightly sync is picked up immediately rather than after the TTL)."""
-    _UNI_CACHE.clear()
+    """Drop EVERY cache derived from the EOD archive, so a fresh nightly sync is picked up at
+    once rather than after a TTL.
+
+    A NEW trading date already refreshes itself: each of these is keyed by date, so tomorrow's
+    ingest simply misses and recomputes. The case this exists for is the archive being rewritten
+    for the SAME date — a partial sync that later completes, or a corrected bhavcopy. The key
+    does not change then, so without an explicit clear the board would serve the first,
+    incomplete read for the life of the process while cheerfully reporting the right date.
+
+    The delivery tables were missing from this list even though the docstring promised "a fresh
+    nightly sync is picked up immediately" — the ↻ button rebuilt the universe around stale
+    delivery numbers.
+    """
+    for c in (_UNI_CACHE, _DELIV_MOM, _DELIV_WK, _DAILY_HIST, _MONTHLY_HIST,
+              _MTF_CACHE, _UNISCAN_CACHE, _STALE_CACHE):
+        c.clear()
 
 
 def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
