@@ -409,7 +409,8 @@ the **Base % gives you the level**.
 | beyond **±20%** | worth a look |
 | beyond **±30%** | top or bottom tenth of the board |
 
-Measured across the whole board: bottom decile **−19%**, median **+5%**, top decile **+29%**.
+Measured across the whole board on the shipped 30-session baseline: bottom decile **−23%**,
+median **+1%**, top decile **+30%**.
 
 ---
 
@@ -435,28 +436,35 @@ drift, only the numbers will tell you.
 
 ---
 
-#### Does a high Base % actually pay? Measured — promising, not proven
+#### Does a high Base % actually pay? Measured — the best evidence on this board, still not wired
 
-Joined to 8 years of this engine's own footprint triggers (n=692, regime-gated, net of 22bps),
-split into thirds by the Base %:
+Joined to 8 years of this engine's own footprint triggers (n=744, regime-gated, net of 22bps),
+split into thirds by the Base % **as this column computes it** (5 sessions against the 30 before
+them):
 
 | Base % third | n | net overnight | win% |
 |---|---|---|---|
-| low | 231 | +13.7 bps | 51.9% |
-| mid | 230 | +10.2 bps | 54.3% |
-| **HIGH** | 231 | **+30.3 bps** | **60.2%** |
+| low | 248 | +7.1 bps | 49.6% |
+| mid | 248 | +17.4 bps | 58.1% |
+| **HIGH** | 248 | **+31.3 bps** | **60.1%** |
 
-Top third minus bottom is **+16.6 bps (t = +1.39)** — large against a ~+20 bps edge, and unlike
-the sector-tilt column it *survives* removing the market's own overnight gap (cross-sectional
-excess **+20.0 bps, t = +1.85**). It is genuinely new information too, not the delivery leg the
-footprint already uses (correlation with `delivTr` only **+0.16**).
+Monotone, and the spread is large: **+24.3 bps**, night-clustered **t = +2.24** across 380
+nights, **HIGH beat low in 8 of 9 years**. It survives removing the market's own overnight gap
+(cross-sectional excess **+18.1 bps, t = +1.89**), so it is not a which-nights-you-traded
+artifact, and it is genuinely new information rather than the delivery leg the footprint already
+uses (correlation with `delivTr` only **+0.13**).
 
-**But it is not significant and not stable** — t ≈ 1.4 clustered by night, and HIGH beat low in
-only **5 of 9 years**. So nothing in the engine reads it. Treat a big Base % as a **tiebreaker
-between names you already like**, never as a reason to take a trade you otherwise would not.
+**So why is nothing wired to it?** Because those thresholds — |t| ≥ 2 and ≥ 7 of 9 years — were
+written down in advance for the baseline that was shipped *at the time* (100 days). The 30-day
+baseline was then chosen by testing several, and re-scored on the same 8 years. Clearing a bar
+you moved the goalposts toward is not the same as passing it.
 
-*It becomes wireable only on a pre-registered re-test clearing |t| ≥ 2 clustered by night AND
-≥ 7 of 9 years.*
+What genuinely supports it: the effect is positive at **every** baseline tested (5d +14.1, 15d
++6.3, 30d +24.3, 60d +19.4, 100d +21.3), so this is not one lucky cell in a grid — 30 is simply
+the best of a set that all point the same way.
+
+Treat a big Base % as a **tiebreaker between names you already like**. It becomes wireable on a
+re-test over nights the search never saw, clearing the same bar.
 
 **Context, not a signal.** Delivery's own forward IC is weak (~0.03–0.07). It earns its place as
 one leg of the accumulation footprint — alongside close strength, volume and relative strength —
