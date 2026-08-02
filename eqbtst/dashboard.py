@@ -352,24 +352,42 @@ MANAPPURAM on 31-Jul, BTST horizon (`deliv 5d · base 30d`):
 
     48, 36, 44, 22, 48   Base - (+3%)
 
-Those five numbers are simply the last five sessions, latest first:
+**Step 1 — the five numbers** are just the last five sessions, latest first. Both the recent
+figure and the Base come from the same formula:
 
-| | Fri 31 | Thu 30 | Wed 29 | Tue 28 | Mon 27 |
-|---|---|---|---|---|---|
-| delivery | 48% | 36% | 44% | 22% | 48% |
+    rate = SUM(delivery% x turnover)  /  SUM(turnover)
 
-Choppy, no clear direction — one weak day (Tue 22%) inside an otherwise ~45% week.
+| session | delivery % | turnover (₹ lacs) | delivery % × turnover |
+|---|---|---|---|
+| Fri 31-Jul | 48.0% | 24,418 | 1,170,827 |
+| Thu 30-Jul | 35.8% | 32,666 | 1,170,742 |
+| Wed 29-Jul | 43.7% | 21,068 | 921,317 |
+| Tue 28-Jul | 22.1% | 8,755 | 193,746 |
+| Mon 27-Jul | 48.0% | 13,874 | 666,110 |
+| **total** | | **100,781** | **4,122,742** |
 
-Now the **Base**. Take the **30 sessions before those five** (12-Jun → 24-Jul) and work out this
-stock's normal delivery rate over that stretch: **39.8%**. Then compare the recent five sessions
-(**40.9%** together) against it:
+    4,122,742 / 100,781  =  40.91%     <- the recent five sessions, together
 
-    40.9 / 39.8 - 1  =  +3%
+Read that as: **of every rupee that traded across those five sessions, 40.9% was taken for
+delivery.** Note the simple mean of the five percentages is 39.53% — a *different* number,
+because it lets Tuesday (22.1% on the lightest turnover of the week) count as heavily as
+Thursday's 32,666. An average of ratios is not the ratio.
 
-So MANAPPURAM is delivering **3% more than it normally does** — i.e. business as usual. Nothing
-to see.
+**Step 2 — the Base** is the identical calculation over the **30 sessions before those five**
+(12-Jun → 24-Jul):
 
----
+    SUM(delivery% x turnover) = 14,600,485
+    SUM(turnover)             =    366,660
+                                ----------
+                                    39.82%     <- this stock's normal rate
+
+**Step 3 — compare them:**
+
+    40.91 / 39.82 - 1  =  +3%
+
+So MANAPPURAM is delivering **3% more than it normally does** — business as usual. Nothing to
+see. The trend across the five is choppy too: one weak day (Tue 22%) inside an otherwise ~45%
+week, no direction.
 
 #### What "Base" is
 
