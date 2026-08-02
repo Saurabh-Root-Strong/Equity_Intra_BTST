@@ -1752,7 +1752,12 @@ if tf == "Intraday":
                     "Try a coarser Lower TF.")
             st.stop()
 
-        _sc = ["setup", "side", "loc", "at_wall", "sup", "sup_t", "res", "res_t", "headroom", "big_wall", "big_gap"] if _P else []
+        # `deliv trend` sits after `side` here TOO. The pre-filter table already placed it
+        # there; leaving the enriched lists with it out in the delivery block meant the
+        # column JUMPED across the table the moment a filter was applied — same board,
+        # same row, different position depending on whether you had narrowed it.
+        _sc = ["setup", "side", "deliv trend", "loc", "at_wall", "sup", "sup_t", "res",
+               "res_t", "headroom", "big_wall", "big_gap"] if _P else []
 
         def _day_by_setup(cols):
             # ltp + day% belong BESIDE the setup, not buried after the risk columns: you read the
@@ -1774,12 +1779,12 @@ if tf == "Intraday":
             return cols
 
         long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                     "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
+                     "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                      "entry", "stop", "t1", "t2", "atr%", "action", "turn₹L"])
         sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                        "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
+                        "day%", "wtd_deliv7", "deliv_vs_100d",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                         "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell", "turn₹L"])
