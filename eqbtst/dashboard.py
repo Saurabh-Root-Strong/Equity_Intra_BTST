@@ -1425,11 +1425,16 @@ if tf == "Intraday":
         # useless twenty columns to the right. The per-side evidence note (`long/short evidence`)
         # takes its old slot beside the other delivery columns — it is a long text field, so it
         # scans poorly in the middle of numeric columns and costs nothing sitting further out.
-        light_cols = (["symbol", "sector", "sector tilt", "ltp", "turn₹L", "day%"]
+        # `turn₹L` sits LAST. It is a fill-risk CHECK, not something you scan row by row: you
+        # consult it once you have a candidate, to ask whether the level you just read is
+        # actually tradeable in that name. Holding a prime column for it pushed the reads you
+        # do scan further right. NOTE it is still load-bearing — the universe carries no
+        # turnover floor, so thin names appear, and the caption above the table keeps saying so.
+        light_cols = (["symbol", "sector", "sector tilt", "ltp", "day%"]
                       + (["setup", "side", "deliv trend", "loc", "at_wall", "sup", "sup_t", "res",
                           "res_t", "headroom", "big_wall", "big_gap"] if _P else ["deliv trend"])
                       + ["wtd_deliv7", "deliv_vs_100d",
-                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
+                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W", "turn₹L"])
 
         # WHAT THE TAPE LOOKS LIKE RIGHT NOW — the census of setups across the whole universe,
         # with the full read for each. A tag in a cell is a label; this is what it MEANS.
@@ -1706,15 +1711,15 @@ if tf == "Intraday":
             return cols
 
         long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                     "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
+                     "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
-                     "entry", "stop", "t1", "t2", "atr%", "action"])
+                     "entry", "stop", "t1", "t2", "atr%", "action", "turn₹L"])
         sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                        "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
+                        "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
-                        "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"])
+                        "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell", "turn₹L"])
 
         @st.fragment(run_every="5s")
         def _struct_panel():
