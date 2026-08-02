@@ -1093,25 +1093,29 @@ _DELIV_WK_MINHIST = 15        # ... and at least this many days, or no base is p
 # sampling noise. Two independent tests, 2018-2026:
 #
 #   (a) universe-wide IC of the deviation vs forward return, t-stat clustered by date:
-#         horizon        base5  base15  base30  base60  base100
-#         Intraday(1d)    3.03    4.80    5.21    5.22    5.08
-#         BTST(overnight) 1.27    2.18    2.83    2.43    1.64
-#         Swing(5d)       3.67    7.22    6.67    5.81    5.34
-#         Positional(20d) 1.70    2.51    3.57    1.45    1.42
+#         horizon        base5  base15  base30  base45  base60  base100
+#         Intraday(1d)    3.03    4.80    5.21    5.53    5.22    5.08
+#         BTST(overnight) 1.27    2.18    2.83    2.27    2.43    1.64
+#         Swing(5d)       3.67    7.22    6.67    7.00    5.81    5.34
+#         Positional(20d) 1.70    2.51    3.57    3.24    1.45    1.42
 #   (b) as a refiner ON this engine's own footprint triggers (n=692, the BTST use case),
 #       HIGH-minus-low third of the deviation:
 #         5d +14.1 (t1.31) · 15d +6.3 (t0.54) · 30d +23.1 (t2.07, 7/9yr) · 60d +19.4 · 100d +21.3
 #
 # base=5 is the WORST row in (a) everywhere — a 4-day reading against a 5-day baseline is two
-# tiny samples disagreeing, which is why the proposed Intraday setting is raised to 15. The
-# optimum sits near 30 for EVERY horizon, so the baseline is a property of the delivery series'
-# own timescale (about a month), not of the holding period. The map below keeps the user's
-# horizon-scaling shape while staying inside the measured-sane band.
+# tiny samples disagreeing, which is why the Intraday setting is 15 and not the 5 first proposed.
+# Everything from 15 to 60 sits on a broad plateau, so the ladder below is a DESIGN choice made
+# inside a measured-safe band rather than an optimum: it rises monotonically with the hold, which
+# is easy to remember and to explain, and it costs nothing detectable (Swing 45d IC t=7.00 vs
+# 6.67 at 30d — better on IC, marginally worse on decile spread, both inside noise).
+# THE ONE WEAK CELL IS POSITIONAL 60d (t=1.45, against 3.57 at 30d). It is kept because the
+# ladder is a preference and Positional is not a horizon this engine trades; if that ever
+# changes, that is the cell to revisit first.
 DELIV_BASE_BY_HORIZON = {
-    "intraday":   15,   # proposed 5 -> 15: base5 measured worst on every horizon
-    "btst":       30,   # proposed 15 -> 30: 15d is the weakest refiner (+6.3), 30d the best
-    "swing":      30,   # as proposed
-    "positional": 60,   # as proposed (30d actually measures stronger; 60 kept as the ask)
+    "intraday":   15,   # raised from the proposed 5 — base5 measured worst on every horizon
+    "btst":       30,   # the best cell for the one horizon this engine actually trades
+    "swing":      45,
+    "positional": 60,   # weakest cell in the grid; kept for the clean ladder, see above
 }
 
 

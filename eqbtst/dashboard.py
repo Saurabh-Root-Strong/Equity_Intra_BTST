@@ -348,7 +348,7 @@ horizon**, and the column header names it (`deliv 5wk · base 30d`):
 |---|---|
 | Intraday | 15 days |
 | BTST | 30 days |
-| Swing | 30 days |
+| Swing | 45 days |
 | Positional | 60 days |
 
 ⚠️ **A short baseline drifts with the stock.** If delivery declines slowly for two months, a
@@ -358,9 +358,10 @@ horizon**, and the column header names it (`deliv 5wk · base 30d`):
 questions, and on a long slow drift only the series will tell you.
 
 *Measured, 2018-2026: a 5-day baseline (the obvious "match it to an intraday hold" choice) is the
-worst on every horizon — two tiny samples disagreeing is noise, not signal. The optimum sits near
-30 days for every horizon, so the right baseline turns out to be a property of the delivery
-series itself, about a month, rather than of how long you hold.*
+worst on every horizon — two tiny samples disagreeing is noise, not signal. Everything from 15 to
+60 days sits on a broad plateau, so this ladder is a readable design choice inside a measured-safe
+band, not an optimum. The genuinely weak setting is Positional's 60 days (IC t 1.45, against 3.57
+at 30) — kept because Positional is not a horizon this engine trades.*
 
 Every stock has a different one — across this board they run from roughly **15% to 66%**. That
 is the whole reason the number is in the cell:
