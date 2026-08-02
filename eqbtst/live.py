@@ -1723,6 +1723,36 @@ def _live_levels(b: pd.DataFrame) -> pd.DataFrame:
     return b
 
 
+_PHANTOM_COLS = ("open", "high", "low", "close", "volume")
+
+
+def drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove bars that REPEAT the previous bar exactly — a broker artifact, not a session.
+
+    Over a weekend the Fyers daily feed can carry an extra bar stamped on the NEXT calendar
+    slot whose OHLCV is byte-identical to the last real session. Caught live on Sunday
+    2026-08-02: the 1D feed held a 01-Aug (SATURDAY) bar identical to 31-Jul, and
+    archive_staleness counted it as a session the archive had not ingested — raising a loud
+    "the EOD archive is 1 trading day behind the market" on an archive that was perfectly
+    current. A false staleness alarm is expensive: it tells you to distrust every 1D/1W
+    verdict on the page and to go re-run a sync that has nothing to do.
+
+    Deliberately keyed on DUPLICATE DATA rather than on the weekday. NSE does hold occasional
+    Saturday sessions (disaster-recovery drills), and those carry their own prices — a
+    weekday-only rule would silently discard a real session, which is the worse error. A bar
+    that repeats its predecessor tick-for-tick carries no information either way.
+    """
+    if df is None or df.empty:
+        return df
+    cols = [c for c in _PHANTOM_COLS if c in df.columns]
+    if not cols:
+        return df
+    d = df.sort_values("ts").reset_index(drop=True)
+    dup = (d[cols] == d[cols].shift(1)).all(axis=1)
+    dup.iloc[0] = False                      # the first bar has nothing to repeat
+    return d[~dup].reset_index(drop=True)
+
+
 _STALE_CACHE: dict = {}
 
 
@@ -1750,7 +1780,7 @@ def archive_staleness() -> dict:
         arch = pd.Timestamp(_data.last_trading_date()).normalize()
         out["archive_date"] = arch
         # RELIANCE trades every NSE session, so its daily bars ARE the trading calendar.
-        f = fetch_intraday("RELIANCE", tf="1D", lookback_days=12)
+        f = drop_phantom_bars(fetch_intraday("RELIANCE", tf="1D", lookback_days=12))
         if f.empty:
             _STALE_CACHE[key] = out
             return out

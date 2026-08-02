@@ -150,3 +150,36 @@ def test_sr_levels_orders_support_below_price_and_resistance_above():
     for k in ("head_up", "head_dn"):
         if sr.get(k) is not None:
             assert sr[k] >= 0, "headroom is a distance and can never be negative"
+
+
+# ── broker feed artifacts: a repeated bar is not a session ────────────────────────
+def test_phantom_bar_is_dropped_and_a_real_session_is_kept():
+    """Caught live on Sunday 2026-08-02: the Fyers 1D feed carried a 01-Aug (SATURDAY) bar
+    byte-identical to 31-Jul, so the staleness detector reported the EOD archive "1 trading day
+    behind the market" when it was perfectly current — telling the user to distrust every 1D/1W
+    verdict on the page and re-run a sync with nothing to do."""
+    from eqbtst import live
+    idx = pd.to_datetime(["2026-07-30", "2026-07-31", "2026-08-01"])
+    dup = pd.DataFrame({"ts": idx,
+                        "open": [1279.8, 1295.0, 1295.0], "high": [1297.0, 1309.7, 1309.7],
+                        "low": [1275.3, 1293.6, 1293.6], "close": [1292.9, 1307.8, 1307.8],
+                        "volume": [12158451, 8624996, 8624996]})
+    out = live.drop_phantom_bars(dup)
+    assert len(out) == 2 and out["ts"].max() == pd.Timestamp("2026-07-31")
+
+    # a GENUINE Saturday session (NSE runs occasional drills) carries its own prices and MUST
+    # survive — keying the filter on the weekday instead of on duplicate data would bin it
+    real = dup.copy()
+    real.loc[2, ["open", "high", "low", "close", "volume"]] = [1300.0, 1312.0, 1298.0, 1310.0, 51234]
+    assert len(live.drop_phantom_bars(real)) == 3
+
+
+def test_phantom_filter_is_a_no_op_on_ordinary_bars():
+    from eqbtst import live
+    rng = np.random.default_rng(4)
+    c = 100 + np.cumsum(rng.normal(0, 1, 30))
+    df = pd.DataFrame({"ts": pd.date_range("2026-06-01", periods=30, freq="B"),
+                       "open": c, "high": c + 1, "low": c - 1, "close": c,
+                       "volume": rng.integers(1e5, 1e6, 30)})
+    assert len(live.drop_phantom_bars(df)) == 30
+    assert live.drop_phantom_bars(pd.DataFrame()).empty
