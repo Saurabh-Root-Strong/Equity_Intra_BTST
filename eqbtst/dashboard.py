@@ -805,15 +805,20 @@ DELIV_COLS = {
         # scrollbar, and the previous version lost its SCALE line to exactly that cut. So the
         # scale now sits ABOVE everything optional: whatever survives the clip contains the
         # numbers that make the column readable. The worked example moved to the expander.
-        help="Weekly DELIVERY % — share of volume taken for delivery, not squared off intraday.\n\n"
-             "'41, 35, 40, 41, 42  Base -> (+1%)'\n"
-             "• FIRST = THIS week, rest go BACKWARDS (a RISING trend reads as DESCENDING).\n"
-             "• 'Base -> (+1%)' = this week vs this stock's OWN normal rate — its 100-day average, "
-             "measured BEFORE these 5 weeks. NOT a week-on-week change.\n\n"
-             "SCALE:  ±10% = noise · ±20% = notable · ±30% = top/bottom decile.\n"
-             "Bases differ per stock (15–66%), so the % is what makes rows comparable.\n\n"
-             "'*4d' = week still forming, 4 days in. No star = complete.\n\n"
-             "Full note: the '📦 delivery columns' expander above the table."),
+        # STALE TEXT IS WORSE THAN SHORT TEXT. This still said "Weekly", "THIS week" and "its
+        # 100-day average" long after the buckets began following the trade horizon and the
+        # baseline became 15/30/45/60 sessions — describing a column that no longer existed,
+        # under a header that plainly said otherwise. Rewritten to read correctly in BOTH modes
+        # and to name the header as the source of truth for which one is active.
+        help="DELIVERY % — share of volume taken for delivery, not squared off intraday.\n\n"
+             "'48, 36, 44, 22, 48  Base -> (+3%)'\n"
+             "• FIRST = most recent; the rest go BACKWARDS (a RISING trend reads DESCENDING).\n"
+             "• Each number = one SESSION on Intraday/BTST, one WEEK on Swing/Positional — the "
+             "header says which.\n"
+             "• 'Base -> (+3%)' = vs this stock's OWN normal rate over the header's baseline "
+             "('base 30d' = the 30 sessions before them).\n\n"
+             "SCALE: ±10% noise · ±20% notable · ±30% top/bottom decile.\n\n"
+             "Full note + worked example: the '📦 delivery columns' expander."),
     "wtd_deliv7": st.column_config.NumberColumn(
         "wtdDeliv7 %", format="%.1f%%",
         help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
