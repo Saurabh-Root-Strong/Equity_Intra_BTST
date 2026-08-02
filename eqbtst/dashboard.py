@@ -320,107 +320,122 @@ def render_tilt_help():
 
 
 DELIV_HELP_FULL = """
-### 📦 The delivery columns
+### 📦 The delivery columns, in plain English
 
-**Delivery %** is the share of a day's traded volume that was actually *taken for delivery*
-rather than squared off intraday. A larger slice being kept is the footprint of someone
-**building a position**, not trading it.
+**Delivery %** = out of everything traded in a stock that day, how much was actually *taken
+home* instead of being bought and sold again the same day. High delivery means someone is
+**building a position**. Low delivery means the volume was mostly day-traders passing it around.
 
-**The buckets follow your trade horizon.** Intraday and BTST show the **last 5 SESSIONS**
-(header: `deliv 5d`); Swing and Positional show the **last 5 WEEKS** (`deliv 5wk`). A one-night
-carry needs to see what the last few days did; a multi-week hold does not, and daily buckets
-would just be noise there.
+---
 
-**The trend, newest first**
+#### The five numbers
 
-    41, 35, 40, 41, 42   Base - (+1%)
-    ↑ this week          ↑ vs this stock's own normal rate
+They are the **five most recent readings, newest on the LEFT.** What one reading covers depends
+on your **Trade horizon**:
 
-* The **first** number is the **current week**; the rest go **backwards** in time. Newest sits
-  on the **left**, so a *rising* delivery trend reads as **descending** numbers —
-  `48, 43, 36, 33, 37` is accumulation **building**, not fading.
-* **`*4d`** (weekly view only) means the week is **still forming** and has 4 trading days in it
-  so far — the noisiest figure in the cell. **No star = the week is complete.** Daily buckets
-  never carry it: a session is finished once its delivery publishes.
-* A name that did not trade in a bucket shows `–`, and is never marked as forming.
-* In the **daily** view the `%` compares the **last 5 sessions together** to the Base, not the
-  newest single day. Measured: a one-day reading swings a median **14.9pp per session** against
-  the base versus **3.6pp** for a five-day one — 4.1× jumpier. A number that repaints that hard
-  every morning is not a read.
+| horizon | each number is | header says |
+|---|---|---|
+| Intraday · BTST | **one trading session** | `deliv 5d` |
+| Swing · Positional | **one week** | `deliv 5wk` |
 
-**What "Base" is — and why it is there**
+A one-night carry needs to see what the last few *days* did. A multi-week hold does not — daily
+numbers would just be noise there.
 
-The Base is **this stock's own normal delivery rate**: the turnover-weighted average delivery %
-over the trading days immediately before the current week. **How many days depends on your trade
-horizon**, and the column header names it (`deliv 5d · base 30d`):
+⚠️ Because newest is on the left, the numbers run **backwards in time**. So a *rising* delivery
+trend appears as *descending* numbers: `48, 43, 36, 33, 37` means delivery has been **climbing**.
+
+---
+
+#### A real cell, worked end to end
+
+MANAPPURAM on 31-Jul, BTST horizon (`deliv 5d · base 30d`):
+
+    48, 36, 44, 22, 48   Base - (+3%)
+
+Those five numbers are simply the last five sessions, latest first:
+
+| | Fri 31 | Thu 30 | Wed 29 | Tue 28 | Mon 27 |
+|---|---|---|---|---|---|
+| delivery | 48% | 36% | 44% | 22% | 48% |
+
+Choppy, no clear direction — one weak day (Tue 22%) inside an otherwise ~45% week.
+
+Now the **Base**. Take the **30 sessions before those five** (12-Jun → 24-Jul) and work out this
+stock's normal delivery rate over that stretch: **39.8%**. Then compare the recent five sessions
+(**40.9%** together) against it:
+
+    40.9 / 39.8 - 1  =  +3%
+
+So MANAPPURAM is delivering **3% more than it normally does** — i.e. business as usual. Nothing
+to see.
+
+---
+
+#### What "Base" is
+
+**The stock's own normal delivery rate**, measured over the trading days immediately before the
+window shown. Not a market average, not a fixed number — its own.
 
 | trade horizon | baseline |
 |---|---|
-| Intraday | 15 days |
-| BTST | 30 days |
-| Swing | 45 days |
-| Positional | 60 days |
+| Intraday | 15 sessions |
+| BTST | 30 sessions |
+| Swing | 45 sessions |
+| Positional | 60 sessions |
 
-**The Base always ends where the % window starts** — so what it overlaps differs by view. In the
-**daily** view it excludes all five sessions on display; in the **weekly** view it ends before the
-*current* week and therefore overlaps the four older weeks you can see. Switching horizon
-therefore moves the % for two reasons at once: a different baseline length, and a different
-overlap with what is on screen.
+Those are **trading days**, so they reach further back than they sound: 30 sessions ≈ **6 weeks**
+of calendar time, 60 ≈ **3 months**.
 
-⚠️ **A short baseline drifts with the stock.** If delivery declines slowly for two months, a
-30-day base declines with it and the % can read near zero — the fall has become the new normal.
-`KALYANKJIL` shows this: **+24% on a 15-day base, +16% on 30, −7% on 60**, same week. So read the
-**series** for the trend and the **%** for "unusual versus recent". They answer different
-questions, and on a long slow drift only the series will tell you.
+**Why it has to be there.** Delivery % is not comparable between stocks — across this board the
+normal rates run from about **15% to 66%**. So the same reading means opposite things:
 
-*Measured, 2018-2026: a 5-day baseline (the obvious "match it to an intraday hold" choice) is the
-worst on every horizon — two tiny samples disagreeing is noise, not signal. Everything from 15 to
-60 days sits on a broad plateau, so this ladder is a readable design choice inside a measured-safe
-band, not an optimum. The genuinely weak setting is Positional's 60 days (IC t 1.45, against 3.57
-at 30) — kept because Positional is not a horizon this engine trades.*
-
-Every stock has a different one — across this board they run from roughly **15% to 66%**. That
-is the whole reason the number is in the cell:
-
-| | raw week | its base | reads as |
+| | this week | its normal | reads as |
 |---|---|---|---|
 | a high-delivery name | 62% | 69% | **−10%** — a *quiet* week |
 | a low-delivery name | 31% | 14% | **+116%** — delivery *doubled* |
 
-62% looks twice as impressive as 31%. It is the opposite. The **series gives you the
-direction**; the **Base % gives you the level**.
+62% looks twice as impressive as 31%. It is the opposite. The **numbers give you the direction**;
+the **Base % gives you the level**.
 
-`Base - (…)` is **not** a week-on-week change, **not** a slope, **not** a return.
+`Base - (…)` is **not** a day-on-day change, **not** a slope, **not** a return.
 
-**The scale — how big is big**
+---
 
-The `Base - (…)` number is a *relative* deviation, so it needs its own yardstick. Measured
-across the whole board (2026-07-31, 265 names):
+#### How big is big
 
-| where it sits | value | reading |
-|---|---|---|
-| bottom decile | **−19%** or worse | delivery draining out |
-| lower quartile | −6% | |
-| median | +5% | ordinary week |
-| upper quartile | +14% | |
-| top decile | **+29%** or better | genuine accumulation |
+| | reading |
+|---|---|
+| within **±10%** | noise, ignore it |
+| beyond **±20%** | worth a look |
+| beyond **±30%** | top or bottom tenth of the board |
 
-So in practice: **within ±10% is noise**, beyond **±20%** is worth a look, and beyond roughly
-**±30%** puts the name in the top or bottom tenth of the board. `+1%` is nothing happening;
-`−22%` is a real drain; `+116%` is exceptional.
+Measured across the whole board: bottom decile **−19%**, median **+5%**, top decile **+29%**.
 
-Note this is a *relative* scale, not percentage points. **+19pp on a 29% base is +66%**, while
-**+19pp on a 60% base is only +32%** — the same move in points, two different events. That is
-why the column reports the ratio rather than the difference.
+---
 
-**`wtdDeliv7 %` / `vs100D %`** answer a shorter-horizon version of the same question — the last
-7 calendar days against a 100-day baseline that *overlaps* the recent weeks. Similar-sounding
-numbers, deliberately different windows.
+#### The small print
 
-**Leak-free.** NSE publishes delivery around 6pm, so today's figure does not exist at a 15:15
-decision. Every value here is read through the last **completed** session.
+* **`*4d`** appears in the **weekly** view only: the week is still forming and has 4 sessions in
+  it so far — the noisiest figure in the cell. **No star = the week is finished.** Daily buckets
+  never carry it, because a session is done once its delivery publishes.
+* A name that did not trade in a bucket shows `–`, and is never marked as forming.
+* In the **daily** view the `%` compares the **last 5 sessions together** to the Base, not the
+  newest single day. A one-day reading jumps a median **14.9pp per session** versus **3.6pp** for
+  a five-day one — 4.1× jumpier. A number that repaints that hard every morning is not a read.
+* The Base always ends where the `%` window starts, so what it overlaps differs by view: the
+  daily view excludes all five sessions shown; the weekly view ends before the *current* week and
+  so overlaps the four older weeks you can see. Switching horizon therefore moves the `%` for two
+  reasons at once — a different baseline length **and** a different overlap.
 
-**Does a high Base % actually pay? Measured — promising, not proven.**
+⚠️ **A short baseline drifts with the stock.** If delivery declines slowly for two months, a
+30-session base declines with it and the `%` can read near zero — the fall has *become* the new
+normal. `KALYANKJIL` shows this: **+24% on a 15-session base, +16% on 30, −7% on 60**, same week.
+Read the **numbers** for the trend and the **%** for "unusual versus recent". On a long slow
+drift, only the numbers will tell you.
+
+---
+
+#### Does a high Base % actually pay? Measured — promising, not proven
 
 Joined to 8 years of this engine's own footprint triggers (n=692, regime-gated, net of 22bps),
 split into thirds by the Base %:
@@ -431,30 +446,29 @@ split into thirds by the Base %:
 | mid | 230 | +10.2 bps | 54.3% |
 | **HIGH** | 231 | **+30.3 bps** | **60.2%** |
 
-Top third minus bottom is **+16.6 bps (t = +1.39)** — economically large against a ~+20 bps
-edge, and unlike the sector-tilt column it *survives* removing the market's own overnight gap
-(cross-sectional excess **+20.0 bps, t = +1.85**), so it is not a which-nights-you-traded
-artifact. It is also genuinely new information, not the delivery leg the footprint already
-uses — correlation with `delivTr` is only **+0.16**. Same result in the deployable book
-(top-5/night, ≤2 per sector): **+16.4 bps**.
+Top third minus bottom is **+16.6 bps (t = +1.39)** — large against a ~+20 bps edge, and unlike
+the sector-tilt column it *survives* removing the market's own overnight gap (cross-sectional
+excess **+20.0 bps, t = +1.85**). It is genuinely new information too, not the delivery leg the
+footprint already uses (correlation with `delivTr` only **+0.16**).
 
-**But it is not significant and not stable.** t ≈ 1.4 clustered by night, and HIGH beat low in
-only **5 of 9 years** (it fails 2018, 2019, 2025, 2026). So nothing in the engine reads it, and
-you should treat a big Base % as a tiebreaker between names you already like — not as a reason
-to take a trade you otherwise would not.
+**But it is not significant and not stable** — t ≈ 1.4 clustered by night, and HIGH beat low in
+only **5 of 9 years**. So nothing in the engine reads it. Treat a big Base % as a **tiebreaker
+between names you already like**, never as a reason to take a trade you otherwise would not.
 
-*It would become wireable only on a pre-registered re-test clearing |t| ≥ 2 clustered by night
-AND ≥ 7 of 9 years. Judging it after the fact is how two earlier "edges" here were retracted.*
+*It becomes wireable only on a pre-registered re-test clearing |t| ≥ 2 clustered by night AND
+≥ 7 of 9 years.*
 
 **Context, not a signal.** Delivery's own forward IC is weak (~0.03–0.07). It earns its place as
-one leg of the accumulation footprint, alongside close strength, volume and relative strength —
+one leg of the accumulation footprint — alongside close strength, volume and relative strength —
 never as a reason to buy on its own.
 
-**Two honest limits of the number itself.** About **1 week in 4 is holiday-shortened** (15 of the
-last 61), and a 4-day week is noisier than a 5-day one though it renders identically. And a
-single huge-turnover day can dominate a week's figure — measured, the biggest day is a median
-32% of weekly turnover and exceeds 70% in only **1.3%** of weeks, so this is rare rather than
-routine, but a block deal can still lift one week on its own.
+**Two honest limits.** About **1 week in 4 is holiday-shortened** (15 of the last 61) and renders
+identically to a full one. And a single huge-turnover day can dominate a bucket — measured, the
+biggest day is a median 32% of weekly turnover and exceeds 70% in only **1.3%** of weeks, so it
+is rare rather than routine, but a block deal can still lift one reading on its own.
+
+**Leak-free.** NSE publishes delivery around 6pm, so today's figure does not exist at a 15:15
+decision. Every value here is read through the last **completed** session.
 """
 
 
