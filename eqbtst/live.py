@@ -1118,8 +1118,16 @@ DELIV_BASE_BY_HORIZON = {
     "positional": 60,   # weakest cell in the grid; kept for the clean ladder, see above
 }
 
+# BUCKET GRANULARITY also follows the hold. For a one-night carry, five WEEKLY buckets smear
+# away the detail that matters — what the last five SESSIONS did. For a multi-week hold, daily
+# buckets are noise and weeks are the readable unit.
+DELIV_BUCKET_BY_HORIZON = {
+    "intraday": "day", "btst": "day", "swing": "week", "positional": "week",
+}
 
-def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None) -> pd.DataFrame:
+
+def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None,
+                bucket: str = "week") -> pd.DataFrame:
     """Turnover-weighted delivery % for each of the last `n_weeks` WEEKS, per symbol,
     plus that stock's OWN long-run norm — the 'are the big players building or leaving' read.
 
@@ -1154,8 +1162,9 @@ def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None) -> pd
     Cached per as-of DATE (never on today()), so Replay gets its own answer.
     """
     base_days = int(base_days or _DELIV_WK_NORM)
+    bucket = "day" if str(bucket).startswith("d") else "week"
     key = (pd.Timestamp(date).date() if date is not None else data.last_trading_date().date(),
-           int(n_weeks), base_days)
+           int(n_weeks), base_days, bucket)
     hit = _DELIV_WK.get(key)
     if hit is not None:
         return hit
@@ -1169,17 +1178,30 @@ def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None) -> pd
         return res
 
     df = df.copy()
-    df["wk"] = df["trade_date"].dt.to_period("W-FRI")
-    wk = (df.assign(_num=df["deliv_per"] * df["turnover_lacs"])
-            .groupby(["symbol", "wk"], observed=True)[["_num", "turnover_lacs"]].sum())
-    wk = (wk["_num"] / wk["turnover_lacs"].replace(0, np.nan)).rename("d").reset_index()
-    weeks = sorted(wk["wk"].unique())[-n_weeks:]
-    if not weeks:
+    if bucket == "day":
+        # ONE BUCKET PER SESSION. A weekly grid smears exactly the detail a one-night carry
+        # needs. Within a single day the turnover weighting is a no-op, so a bucket is just
+        # that day's delivery %. The date axis is GLOBAL so every row lines up; a name that did
+        # not trade a given session shows a dash rather than silently shifting its history left.
+        slots = sorted(df["trade_date"].unique())[-n_weeks:]
+        grid = (df[df["trade_date"].isin(slots)]
+                .pivot_table("deliv_per", "symbol", "trade_date").reindex(columns=slots))
+        cut = pd.Timestamp(slots[0])
+    else:
+        df["wk"] = df["trade_date"].dt.to_period("W-FRI")
+        wk = (df.assign(_num=df["deliv_per"] * df["turnover_lacs"])
+                .groupby(["symbol", "wk"], observed=True)[["_num", "turnover_lacs"]].sum())
+        wk = (wk["_num"] / wk["turnover_lacs"].replace(0, np.nan)).rename("d").reset_index()
+        slots = sorted(wk["wk"].unique())[-n_weeks:]
+        if slots:
+            grid = wk[wk["wk"].isin(slots)].pivot(index="symbol", columns="wk", values="d")
+            grid = grid.reindex(columns=slots)
+            cut = pd.Timestamp(slots[-1].start_time)
+    if not len(slots):
         res = pd.DataFrame(columns=["norm", "partial", "cell"])
         _DELIV_WK.clear(); _DELIV_WK[key] = res
         return res
-    grid = wk[wk["wk"].isin(weeks)].pivot(index="symbol", columns="wk", values="d")
-    grid = grid.reindex(columns=weeks)
+    weeks = slots
 
     # BASELINE = the `base_days` trading days ending immediately BEFORE the CURRENT week.
     # It therefore overlaps the older weeks on display, and that is deliberate: the earlier
@@ -1187,7 +1209,6 @@ def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None) -> pd
     # yardstick, but gapping measured WORSE at both window lengths tested — 30d: +23.1 adjacent
     # vs +12.7 gapped; 100d: +21.3 vs +16.6. Adjacent is also the plainer statement: "this week
     # against this stock's recent normal", where recent means the past month or so.
-    cut = pd.Timestamp(weeks[-1].start_time)
     hist = df[df["trade_date"] < cut].sort_values("trade_date")
     def _norm(g):
         g = g.tail(base_days)
@@ -1199,29 +1220,43 @@ def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None) -> pd
     out = grid.copy()
     out.columns = [f"w{i+1}" for i in range(len(weeks))]
     out["norm"] = norm.reindex(out.index)
-    # a week is finished once the CALENDAR has passed its Friday (holiday-proof, same rule as
-    # weekly_frame) — otherwise the newest column is a part-week and must say so.
-    out["partial"] = bool(as_of < pd.Timestamp(weeks[-1].end_time).normalize())
-    # trading days actually printed in the newest week, PER SYMBOL — a "week" that is one
-    # session old is the noisiest number in the cell and must not look like a full one.
-    ndays = (df[df["wk"] == weeks[-1]].groupby("symbol").size()
-             if not df.empty else pd.Series(dtype=int))
-    out["cur_days"] = ndays.reindex(out.index).fillna(0).astype(int)
+    if bucket == "day":
+        out["partial"] = False          # a session is complete once its delivery is published
+        out["cur_days"] = 0
+    else:
+        # a week is finished once the CALENDAR has passed its Friday (holiday-proof, same rule
+        # as weekly_frame) — otherwise the newest column is a part-week and must say so.
+        out["partial"] = bool(as_of < pd.Timestamp(weeks[-1].end_time).normalize())
+        # trading days actually printed in the newest week, PER SYMBOL — a "week" one session
+        # old is the noisiest number in the cell and must not look like a full one.
+        ndays = df[df["wk"] == weeks[-1]].groupby("symbol").size()
+        out["cur_days"] = ndays.reindex(out.index).fillna(0).astype(int)
 
     wcols = [c for c in out.columns if c.startswith("w") and c[1:].isdigit()]
 
-    def _latest(r):
-        """Newest week that actually has a reading (a name may not have traded this week)."""
-        return next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan)
+    # WHAT THE % COMPARES. In WEEK mode it is the newest week — the leading number in the cell.
+    # In DAY mode it is the last 5 SESSIONS TOGETHER, not the newest single day: measured on the
+    # archive, a one-day reading against the base swings a median 14.9pp per session versus
+    # 3.6pp for a five-day one — 4.1x jumpier. A number that repaints that hard every morning
+    # is not a read, so the daily view keeps the five buckets for the eye and aggregates them
+    # for the %.
+    if bucket == "day":
+        recent = (df[df["trade_date"].isin(weeks)]
+                  .assign(_n=lambda x: x.deliv_per * x.turnover_lacs)
+                  .groupby("symbol")[["_n", "turnover_lacs"]].sum())
+        recent = (recent["_n"] / recent["turnover_lacs"].replace(0, np.nan)).reindex(out.index)
+    else:
+        recent = pd.Series(
+            [next((v for v in reversed([r[c] for c in wcols]) if pd.notna(v)), np.nan)
+             for _i, r in out.iterrows()], index=out.index)
+    out["recent"] = recent
 
     # ONE definition of the deviation, used by BOTH the column and the rendered string. They
     # were computed separately at first — the same duplicate-formula pattern that caused the
     # drift bugs in the sector-tilt port. Derive once, format from it.
-    out["dev_pct"] = [
-        (_latest(r) / r["norm"] - 1.0) * 100.0
-        if (pd.notna(r["norm"]) and r["norm"] > 0 and pd.notna(_latest(r))) else np.nan
-        for _i, r in out.iterrows()
-    ]
+    out["dev_pct"] = np.where(
+        out["norm"].notna() & (out["norm"] > 0) & out["recent"].notna(),
+        (out["recent"] / out["norm"].replace(0, np.nan) - 1.0) * 100.0, np.nan)
 
     def _cell(r):
         vals = [r[c] for c in wcols]                      # stored oldest -> newest
@@ -1522,7 +1557,7 @@ def universe_mtf_scan(date=None) -> dict:
             "turn₹L": turn_l,                                          # today's turnover (₹lacs)
             "wtd_deliv7": round(_wd, 1) if _wd == _wd else np.nan,     # NaN-safe (x==x)
             "deliv_vs_100d": round(_dv, 1) if _dv == _dv else np.nan,
-            "deliv 5wk": (dw.loc[sym, "cell"] if sym in dw.index else "—"),
+            "deliv trend": (dw.loc[sym, "cell"] if sym in dw.index else "—"),
             "s15m": _mtf["15m"], "s1h": _mtf["1h"], "s2h": _mtf["2h"],
             "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
             "bnds15m": _mtf["b15m"], "bnds1h": _mtf["b1h"], "bnds2h": _mtf["b2h"],
@@ -1959,7 +1994,7 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             # nearest/headroom/at_wall on every tick without a fetch
             "_wall_pair": r.get("_wall_pair"), "_sr_atr": r.get("_sr_atr"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
-            "deliv 5wk": r.get("deliv 5wk"),
+            "deliv trend": r.get("deliv trend"),
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],

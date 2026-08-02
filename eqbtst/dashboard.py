@@ -326,7 +326,12 @@ DELIV_HELP_FULL = """
 rather than squared off intraday. A larger slice being kept is the footprint of someone
 **building a position**, not trading it.
 
-**`deliv 5wk` — the trend, newest first**
+**The buckets follow your trade horizon.** Intraday and BTST show the **last 5 SESSIONS**
+(header: `deliv 5d`); Swing and Positional show the **last 5 WEEKS** (`deliv 5wk`). A one-night
+carry needs to see what the last few days did; a multi-week hold does not, and daily buckets
+would just be noise there.
+
+**The trend, newest first**
 
     41, 35, 40, 41, 42   Base - (+1%)
     ↑ this week          ↑ vs this stock's own normal rate
@@ -334,15 +339,20 @@ rather than squared off intraday. A larger slice being kept is the footprint of 
 * The **first** number is the **current week**; the rest go **backwards** in time. Newest sits
   on the **left**, so a *rising* delivery trend reads as **descending** numbers —
   `48, 43, 36, 33, 37` is accumulation **building**, not fading.
-* **`*4d`** means the week is **still forming** and has 4 trading days in it so far — the
-  noisiest figure in the cell. **No star = the week is complete.**
-* A name that did not trade in a week shows `–`, and is never marked as forming.
+* **`*4d`** (weekly view only) means the week is **still forming** and has 4 trading days in it
+  so far — the noisiest figure in the cell. **No star = the week is complete.** Daily buckets
+  never carry it: a session is finished once its delivery publishes.
+* A name that did not trade in a bucket shows `–`, and is never marked as forming.
+* In the **daily** view the `%` compares the **last 5 sessions together** to the Base, not the
+  newest single day. Measured: a one-day reading swings a median **14.9pp per session** against
+  the base versus **3.6pp** for a five-day one — 4.1× jumpier. A number that repaints that hard
+  every morning is not a read.
 
 **What "Base" is — and why it is there**
 
 The Base is **this stock's own normal delivery rate**: the turnover-weighted average delivery %
 over the trading days immediately before the current week. **How many days depends on your trade
-horizon**, and the column header names it (`deliv 5wk · base 30d`):
+horizon**, and the column header names it (`deliv 5d · base 30d`):
 
 | trade horizon | baseline |
 |---|---|
@@ -464,9 +474,10 @@ def _dw(df, as_of, horizon: str | None):
         return df
     try:
         bd = live.DELIV_BASE_BY_HORIZON.get(horizon or "btst", live._DELIV_WK_NORM)
-        cells = live.deliv_weeks(as_of, base_days=bd)["cell"]
+        bk = live.DELIV_BUCKET_BY_HORIZON.get(horizon or "btst", "week")
+        cells = live.deliv_weeks(as_of, base_days=bd, bucket=bk)["cell"]
         out = df.copy()
-        out["deliv 5wk"] = out["symbol"].map(cells).fillna("—")
+        out["deliv trend"] = out["symbol"].map(cells).fillna("—")
         return out
     except Exception:
         return df
@@ -731,8 +742,8 @@ SR_COLS = {
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
 DELIV_COLS = {
-    "deliv 5wk": st.column_config.TextColumn(
-        "deliv 5wk", width="medium",
+    "deliv trend": st.column_config.TextColumn(
+        "deliv trend", width="medium",
         # SHORT ON PURPOSE. Streamlit clips a dataframe column tooltip at roughly 1,100
         # characters with no scrollbar, and two attempts to force one via CSS failed because the
         # element is an internal component this stylesheet cannot reliably reach. So the tooltip
@@ -1403,8 +1414,8 @@ if tf == "Intraday":
         # takes its old slot beside the other delivery columns — it is a long text field, so it
         # scans poorly in the middle of numeric columns and costs nothing sitting further out.
         light_cols = (["symbol", "sector", "sector tilt", "ltp", "turn₹L", "day%"]
-                      + (["setup", "side", "deliv 5wk", "loc", "at_wall", "sup", "sup_t", "res",
-                          "res_t", "headroom", "big_wall", "big_gap"] if _P else ["deliv 5wk"])
+                      + (["setup", "side", "deliv trend", "loc", "at_wall", "sup", "sup_t", "res",
+                          "res_t", "headroom", "big_wall", "big_gap"] if _P else ["deliv trend"])
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W"])
 
@@ -1455,13 +1466,14 @@ if tf == "Intraday":
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
             _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
             # NAME THE ACTIVE BASELINE IN THE HEADER. It now moves with the trade horizon, so a
-            # bare "deliv 5wk" would leave the reader guessing which yardstick the % is against
+            # bare "deliv trend" would leave the reader guessing which yardstick the % is against
             # — and the answer changes the sign on real names (KALYANKJIL reads +24% on a 15-day
             # base and −7% on a 60-day one).
             _bd = live.DELIV_BASE_BY_HORIZON.get(_hz or "btst", live._DELIV_WK_NORM)
-            _cfg["deliv 5wk"] = st.column_config.TextColumn(
-                f"deliv 5wk · base {_bd}d", width="medium",
-                help=DELIV_COLS["deliv 5wk"].help if hasattr(DELIV_COLS["deliv 5wk"], "help")
+            _bk = live.DELIV_BUCKET_BY_HORIZON.get(_hz or "btst", "week")
+            _cfg["deliv trend"] = st.column_config.TextColumn(
+                f"deliv {'5d' if _bk == 'day' else '5wk'} · base {_bd}d", width="medium",
+                help=DELIV_COLS["deliv trend"].help if hasattr(DELIV_COLS["deliv trend"], "help")
                 else None)
             render_tilt_help()
             render_deliv_help()
@@ -1682,12 +1694,12 @@ if tf == "Intraday":
             return cols
 
         long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                     "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv 5wk",
+                     "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                      "entry", "stop", "t1", "t2", "atr%", "action"])
         sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
-                        "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv 5wk",
+                        "turn₹L", "day%", "wtd_deliv7", "deliv_vs_100d", "deliv trend",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                         "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"])
