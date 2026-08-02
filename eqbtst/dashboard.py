@@ -361,6 +361,12 @@ horizon**, and the column header names it (`deliv 5d · base 30d`):
 | Swing | 45 days |
 | Positional | 60 days |
 
+**The Base always ends where the % window starts** — so what it overlaps differs by view. In the
+**daily** view it excludes all five sessions on display; in the **weekly** view it ends before the
+*current* week and therefore overlaps the four older weeks you can see. Switching horizon
+therefore moves the % for two reasons at once: a different baseline length, and a different
+overlap with what is on screen.
+
 ⚠️ **A short baseline drifts with the stock.** If delivery declines slowly for two months, a
 30-day base declines with it and the % can read near zero — the fall has become the new normal.
 `KALYANKJIL` shows this: **+24% on a 15-day base, +16% on 30, −7% on 60**, same week. So read the
@@ -479,8 +485,14 @@ def _dw(df, as_of, horizon: str | None):
         out = df.copy()
         out["deliv trend"] = out["symbol"].map(cells).fillna("—")
         return out
-    except Exception:
-        return df
+    except Exception as e:
+        # SAY SO RATHER THAN LEAVE A STALE NUMBER. The header advertises this horizon's bucket
+        # and baseline whether or not this call succeeded, so a silent fallback would print
+        # last-computed values under a label describing different settings. Nothing upstream
+        # pre-seeds the column any more, so writing the reason here is the only honest option.
+        out = df.copy()
+        out["deliv trend"] = f"— unavailable ({type(e).__name__})"
+        return out
 
 
 def _wt(df, as_of, side=None):

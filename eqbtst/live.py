@@ -1285,7 +1285,13 @@ def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None,
         return f"{body}  Base - ({r['dev_pct']:+.0f}%)"
 
     out["cell"] = out.apply(_cell, axis=1)
-    _DELIV_WK.clear()                       # never hold two days of frames
+    # Keep one entry PER HORIZON for the current as-of date, and drop every other date. The
+    # earlier clear()-everything held a single entry, so flipping the horizon dropdown recomputed
+    # each time (~0.25s); stale DATES must still go, or a replay session would pin yesterday.
+    for k in [k for k in _DELIV_WK if k[0] != key[0]]:
+        _DELIV_WK.pop(k, None)
+    if len(_DELIV_WK) > 8:
+        _DELIV_WK.pop(next(iter(_DELIV_WK)), None)
     _DELIV_WK[key] = out
     return out
 
@@ -1485,7 +1491,12 @@ def universe_mtf_scan(date=None) -> dict:
 
     uni = liquid_universe(date).set_index("symbol")
     dm = deliv_momentum(date)                    # DCM-ported delivery conviction (one read/day)
-    dw = deliv_weeks(date)                       # 5-week delivery TREND + own norm (one read/day)
+    # NOTE the delivery TREND column is deliberately NOT built here. Its buckets and baseline
+    # both follow the trade horizon, which is chosen after this cached scan runs, so the column
+    # is attached at RENDER time (dashboard._dw). Pre-seeding a default here was worse than
+    # useless: on any failure of that render-time call the stale default survived while the
+    # header still advertised the horizon's settings — a silently mismatched column. Absent
+    # beats wrong, and _cols() drops a missing column cleanly.
     q = _fetch_quotes([fy_symbol(s) for s in uni.index])
     _nf = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
     idx_ret = _chp(_nf)
@@ -1557,7 +1568,6 @@ def universe_mtf_scan(date=None) -> dict:
             "turn₹L": turn_l,                                          # today's turnover (₹lacs)
             "wtd_deliv7": round(_wd, 1) if _wd == _wd else np.nan,     # NaN-safe (x==x)
             "deliv_vs_100d": round(_dv, 1) if _dv == _dv else np.nan,
-            "deliv trend": (dw.loc[sym, "cell"] if sym in dw.index else "—"),
             "s15m": _mtf["15m"], "s1h": _mtf["1h"], "s2h": _mtf["2h"],
             "s4h": _mtf["4h"], "s1D": _mtf["1D"], "s1W": _mtf["1W"],
             "bnds15m": _mtf["b15m"], "bnds1h": _mtf["b1h"], "bnds2h": _mtf["b2h"],
@@ -1994,7 +2004,7 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             # nearest/headroom/at_wall on every tick without a fetch
             "_wall_pair": r.get("_wall_pair"), "_sr_atr": r.get("_sr_atr"),
             "wtd_deliv7": r.get("wtd_deliv7"), "deliv_vs_100d": r.get("deliv_vs_100d"),
-            "deliv trend": r.get("deliv trend"),
+            # `deliv trend` is attached at RENDER time (horizon-dependent), not carried
             "day%": s["day_ret"], "structure": s["structure"], "bar_clr": s["bar_clr"],
             "character": s["character"], "vs_vwap%": s["vs_vwap"],
             "above_vwap": s["above_vwap"], "rsi7": s["rsi7"], "rsi14": s["rsi14"],
