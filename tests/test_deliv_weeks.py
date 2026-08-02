@@ -182,3 +182,16 @@ def test_cache_is_keyed_on_the_asof_date_not_today():
     live.deliv_weeks(d - pd.Timedelta(days=30))
     keys = {k[0] for k in live._DELIV_WK}
     assert len(keys) >= 1 and all(isinstance(k, type(d.date())) for k in keys)
+
+
+def test_column_config_exposes_help_as_a_dict_key_not_an_attribute():
+    """The dynamic per-horizon header once read its help back off the config object --
+    `DELIV_COLS["deliv trend"].help` -- which silently returned None, because
+    st.column_config returns a plain DICT. hasattr was False, the ternary fell through, and
+    the column rendered perfectly with NO TOOLTIP AT ALL. Nothing raised; hovering just did
+    nothing. This pins the shape so the same mistake cannot be made twice."""
+    import streamlit as st
+    cfg = st.column_config.TextColumn("label", width="medium", help="HELPTEXT")
+    assert isinstance(cfg, dict)
+    assert not hasattr(cfg, "help"), "attribute access must stay unavailable/unused"
+    assert cfg["help"] == "HELPTEXT"

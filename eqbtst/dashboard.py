@@ -793,6 +793,16 @@ SR_COLS = {
 }
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
+DELIV_HELP_SHORT = ("DELIVERY % — share of volume taken for delivery, not squared off intraday.\n\n"
+             "'48, 36, 44, 22, 48  Base -> (+3%)'\n"
+             "• FIRST = most recent; the rest go BACKWARDS (a RISING trend reads DESCENDING).\n"
+             "• Each number = one SESSION on Intraday/BTST, one WEEK on Swing/Positional — the "
+             "header says which.\n"
+             "• 'Base -> (+3%)' = vs this stock's OWN normal rate over the header's baseline "
+             "('base 30d' = the 30 sessions before them).\n\n"
+             "SCALE: ±10% noise · ±20% notable · ±30% top/bottom decile.\n\n"
+             "Full note + worked example: the '📦 delivery columns' expander.")
+
 DELIV_COLS = {
     "deliv trend": st.column_config.TextColumn(
         "deliv trend", width="medium",
@@ -810,15 +820,7 @@ DELIV_COLS = {
         # baseline became 15/30/45/60 sessions — describing a column that no longer existed,
         # under a header that plainly said otherwise. Rewritten to read correctly in BOTH modes
         # and to name the header as the source of truth for which one is active.
-        help="DELIVERY % — share of volume taken for delivery, not squared off intraday.\n\n"
-             "'48, 36, 44, 22, 48  Base -> (+3%)'\n"
-             "• FIRST = most recent; the rest go BACKWARDS (a RISING trend reads DESCENDING).\n"
-             "• Each number = one SESSION on Intraday/BTST, one WEEK on Swing/Positional — the "
-             "header says which.\n"
-             "• 'Base -> (+3%)' = vs this stock's OWN normal rate over the header's baseline "
-             "('base 30d' = the 30 sessions before them).\n\n"
-             "SCALE: ±10% noise · ±20% notable · ±30% top/bottom decile.\n\n"
-             "Full note + worked example: the '📦 delivery columns' expander."),
+        help=DELIV_HELP_SHORT),
     "wtd_deliv7": st.column_config.NumberColumn(
         "wtdDeliv7 %", format="%.1f%%",
         help="7-CALENDAR-day TURNOVER-WEIGHTED delivery % = SUM(deliv%×turnover)/SUM(turnover). "
@@ -1533,10 +1535,13 @@ if tf == "Intraday":
             # base and −7% on a 60-day one).
             _bd = live.DELIV_BASE_BY_HORIZON.get(_hz or "btst", live._DELIV_WK_NORM)
             _bk = live.DELIV_BUCKET_BY_HORIZON.get(_hz or "btst", "week")
+            # help MUST come from the shared constant. Reading it back off the config object
+            # (`DELIV_COLS[...].help`) silently returned None -- st.column_config returns a
+            # plain DICT, so the attribute never existed, hasattr was False, and the column
+            # lost its tooltip entirely while still rendering perfectly.
             _cfg["deliv trend"] = st.column_config.TextColumn(
-                f"deliv {'5d' if _bk == 'day' else '5wk'} · base {_bd}d", width="medium",
-                help=DELIV_COLS["deliv trend"].help if hasattr(DELIV_COLS["deliv trend"], "help")
-                else None)
+                f"deliv {'5d' if _bk == 'day' else '5wk'} · base {_bd}d",
+                width="medium", help=DELIV_HELP_SHORT)
             render_tilt_help()
             render_deliv_help()
 
