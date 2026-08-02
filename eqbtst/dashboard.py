@@ -421,16 +421,28 @@ the **Base % gives you the level**.
 
 #### How big is big
 
-| | reading |
-|---|---|
-| within **±10%** | noise, ignore it |
-| beyond **±20%** | worth a look |
-| beyond **±30%** | top or bottom tenth of the board |
+The `%` is a *relative* deviation, so it needs its own yardstick. Measured across 1,837 trading
+days, this is where each stock sits among the names on the board that day:
 
-Measured across the whole board on the shipped 30-session baseline: bottom decile **−23%**,
-median **+1%**, top decile **+30%**.
+| where it sits | typical value | how often |
+|---|---|---|
+| bottom 10% | **−22%** or worse | delivery draining out |
+| lower quarter | −10% | |
+| middle | +1% | ordinary week |
+| upper quarter | +14% | |
+| top 10% | **+28%** or better | genuine accumulation |
 
----
+In plain terms — on a typical day about **31%** of names read above +10%, **17%** above +20%, and
+only **9%** above +30%. So:
+
+* within **±10%** — ordinary, most of the board lives here
+* beyond **±20%** — top or bottom sixth
+* beyond **±30%** — the extremes, roughly the top or bottom tenth
+
+⚠️ **A fixed threshold is not a fixed rank.** The board widens and narrows: the top-10% cutoff
+has ranged from **+18% to +41%** across days. On a quiet day +19% already puts a name in the top
+tenth; on a wild one it takes +41%. Read the number against the rest of today's board, not
+against a memorised line.
 
 #### The small print
 
@@ -800,7 +812,8 @@ DELIV_HELP_SHORT = ("DELIVERY % — share of volume taken for delivery, not squa
              "header says which.\n"
              "• 'Base -> (+3%)' = vs this stock's OWN normal rate over the header's baseline "
              "('base 30d' = the 30 sessions before them).\n\n"
-             "SCALE: ±10% noise · ±20% notable · ±30% top/bottom decile.\n\n"
+             "SCALE: ±10% = ordinary · ±20% = top/bottom sixth · ±30% = the extremes "
+             "(~top/bottom tenth). Cutoffs drift daily.\n\n"
              "Full note + worked example: the '📦 delivery columns' expander.")
 
 DELIV_COLS = {
