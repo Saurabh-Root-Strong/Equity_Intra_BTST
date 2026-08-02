@@ -350,7 +350,7 @@ trend appears as *descending* numbers: `48, 43, 36, 33, 37` means delivery has b
 
 MANAPPURAM on 31-Jul, BTST horizon (`deliv 5d · base 30d`):
 
-    48, 36, 44, 22, 48   Base - (+3%)
+    48, 36, 44, 22, 48   Base -> (+3%)
 
 **Step 1 — the five numbers** are just the last five sessions, latest first. Both the recent
 figure and the Base come from the same formula:
@@ -415,7 +415,7 @@ normal rates run from about **15% to 66%**. So the same reading means opposite t
 62% looks twice as impressive as 31%. It is the opposite. The **numbers give you the direction**;
 the **Base % gives you the level**.
 
-`Base - (…)` is **not** a day-on-day change, **not** a slope, **not** a return.
+`Base -> (…)` is **not** a day-on-day change, **not** a slope, **not** a return.
 
 ---
 
@@ -806,9 +806,9 @@ DELIV_COLS = {
         # scale now sits ABOVE everything optional: whatever survives the clip contains the
         # numbers that make the column readable. The worked example moved to the expander.
         help="Weekly DELIVERY % — share of volume taken for delivery, not squared off intraday.\n\n"
-             "'41, 35, 40, 41, 42  Base - (+1%)'\n"
+             "'41, 35, 40, 41, 42  Base -> (+1%)'\n"
              "• FIRST = THIS week, rest go BACKWARDS (a RISING trend reads as DESCENDING).\n"
-             "• 'Base - (+1%)' = this week vs this stock's OWN normal rate — its 100-day average, "
+             "• 'Base -> (+1%)' = this week vs this stock's OWN normal rate — its 100-day average, "
              "measured BEFORE these 5 weeks. NOT a week-on-week change.\n\n"
              "SCALE:  ±10% = noise · ±20% = notable · ±30% = top/bottom decile.\n"
              "Bases differ per stock (15–66%), so the % is what makes rows comparable.\n\n"

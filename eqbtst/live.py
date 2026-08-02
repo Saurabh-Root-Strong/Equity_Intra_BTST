@@ -1281,8 +1281,8 @@ def deliv_weeks(date=None, n_weeks: int = 5, base_days: int | None = None,
         # RELATIVE, not percentage points: +19pp on a 29% base (+66%) and +19pp on a 60% base
         # (+32%) are different events, and only the relative form makes two rows comparable.
         if pd.isna(r["dev_pct"]):
-            return f"{body}  Base - (n/a)"
-        return f"{body}  Base - ({r['dev_pct']:+.0f}%)"
+            return f"{body}  Base -> (n/a)"
+        return f"{body}  Base -> ({r['dev_pct']:+.0f}%)"
 
     out["cell"] = out.apply(_cell, axis=1)
     # Keep one entry PER HORIZON for the current as-of date, and drop every other date. The
