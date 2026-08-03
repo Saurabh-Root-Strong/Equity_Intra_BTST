@@ -94,7 +94,20 @@ _UW_RANK       = 0.25     # composite rank <= this → UNDERWEIGHT
 _WATCH_BREADTH = 0.55     # accumulation breadth above this ...
 _WATCH_RS_MAX  = 0.35     # ... while momentum rank is still weak → WATCH (contrarian, held out)
 
-_REL_SLOPE_BPS = 290.0    # bps of 10d RELATIVE return per unit of (rank − 0.5)
+# RECALIBRATED upstream 2026-07-31 (290 -> 75). The old 290 came from a "~1.9%/10d tercile
+# spread" measured on a SAME-DAY-turnover panel — i.e. on inflated returns. On the lagged panel
+# the overweight basket beats an equal-weight sector benchmark by +0.31%/10d, and OW−UW spans
+# 0.42–0.72% over a rank spread of ~0.74, giving 57–97 bps per unit of rank; 75 is the midpoint.
+# Display estimate only: est_rel_bps is a monotone rescaling of rank and adds nothing to it.
+_REL_SLOPE_BPS = 75.0     # bps of 10d RELATIVE return per unit of (rank − 0.5)
+
+# THE WEIGHT MUST NOT KNOW THE RETURN IT IS WEIGHTING. A stock's SAME-DAY turnover explodes on
+# the day it jumps, so weighting a daily sector return by same-day turnover correlates the weight
+# with the outcome: measured upstream at +0.717%/day of fake drift versus +0.025%/day on lagged
+# weights, inflating rs_2w by ~6.6pp and reordering the buy list (3 of 6 top names change).
+# PRIOR-SESSION turnover is knowable at entry and is what a real basket would hold. Same defect
+# family as the Smart-Money-vs-Tilt panel that had to be retracted for exactly this reason.
+_LAG_LEADIN_DAYS = 15     # extra lead-in so the first in-window day still has a prior session
 
 _DISP_MIN      = 1.5      # rs_2w cross-sectional std below this = nothing to rotate on
 
@@ -154,26 +167,38 @@ _COLS = ["trade_date", "sector", "score", "rank", "rank_pos", "n_sectors", "tilt
 
 # ── loaders (read-only; the DCM archive is never written by this project) ──────────────
 def _sector_panel(start: str, end: str) -> pd.DataFrame:
-    """Turnover-weighted daily sector return + delivery ₹-value. Aggregated IN DuckDB."""
+    """Daily sector return weighted by PRIOR-SESSION turnover, + delivery ₹-value.
+
+    LAG() runs over the UNFILTERED per-symbol series so the weight is that stock's own previous
+    session, then the liquidity screen is applied to the CURRENT day — matching DCM exactly. The
+    delivery ₹-value leg keeps same-day turnover (it is a level, not a weighted return).
+    """
     ph = ",".join("?" * len(_SERIES))
     xh = ",".join("?" * len(_EXCLUDE_SECTORS))
+    lead = (pd.Timestamp(start) - pd.Timedelta(days=_LAG_LEADIN_DAYS)).strftime("%Y-%m-%d")
     sql = f"""
-        SELECT s.sector, b.trade_date,
-               SUM(b.turnover_lacs * b.deliv_per / 100.0) / 100.0             AS daily_dv_cr,
-               SUM(b.turnover_lacs * (b.close_price - b.prev_close)
-                     / NULLIF(b.prev_close, 0) * 100)
-                 / NULLIF(SUM(CASE WHEN b.prev_close > 0
-                              THEN b.turnover_lacs END), 0)                   AS wtd_ret_pct
-        FROM daily_data b
-        INNER JOIN v_sector_master s ON b.symbol = s.symbol
-        WHERE b.series IN ({ph})
-          AND s.sector NOT IN ({xh})
-          AND b.turnover_lacs >= ?
-          AND b.trade_date >= ? AND b.trade_date <= ?
-        GROUP BY s.sector, b.trade_date
-        ORDER BY s.sector, b.trade_date
+        WITH base AS (
+            SELECT s.sector, b.trade_date, b.turnover_lacs, b.deliv_per,
+                   (b.close_price - b.prev_close) / NULLIF(b.prev_close, 0) * 100 AS r,
+                   LAG(b.turnover_lacs) OVER (PARTITION BY b.symbol
+                                              ORDER BY b.trade_date)              AS w_lag
+            FROM daily_data b
+            INNER JOIN v_sector_master s ON b.symbol = s.symbol
+            WHERE b.series IN ({ph})
+              AND s.sector NOT IN ({xh})
+              AND b.trade_date >= ? AND b.trade_date <= ?
+        )
+        SELECT sector, trade_date,
+               SUM(turnover_lacs * deliv_per / 100.0) / 100.0                AS daily_dv_cr,
+               SUM(w_lag * r) / NULLIF(SUM(CASE WHEN r IS NOT NULL
+                                           THEN w_lag END), 0)               AS wtd_ret_pct
+        FROM base
+        WHERE turnover_lacs >= ? AND w_lag IS NOT NULL
+          AND trade_date >= ?
+        GROUP BY sector, trade_date
+        ORDER BY sector, trade_date
     """
-    params = [*_SERIES, *_EXCLUDE_SECTORS, TILT_MIN_TURNOVER_LACS, start, end]
+    params = [*_SERIES, *_EXCLUDE_SECTORS, lead, end, TILT_MIN_TURNOVER_LACS, start]
     with data._connect() as c:
         df = c.execute(sql, params).df()
     if not df.empty:
@@ -621,8 +646,12 @@ def _engine(start: str, end: str) -> pd.DataFrame:
 
     brd = _breadth(_deliv_panel(deliv_warmup, end))
     panel = panel.merge(brd, on=["trade_date", "sector"], how="left")
+    # EXACTLY DCM's persistence window: its SQL filters `trade_date > as_of - 620` with a
+    # 15-day lead-in for the LAG, so the panel spans 619 days back inclusive. A wider window
+    # (this used 660) changes which rows the LAG chain starts from for intermittently-traded
+    # symbols, which moved persistence in the 6th decimal and broke parity.
     pers = _persistence(_sector_panel(
-        (pd.Timestamp(start) - pd.Timedelta(days=_PERS_LOOKBACK_CAL + 40)).strftime("%Y-%m-%d"),
+        (pd.Timestamp(start) - pd.Timedelta(days=_PERS_LOOKBACK_CAL - 1)).strftime("%Y-%m-%d"),
         end))
     panel = panel.merge(pers.drop(columns=["pers_n"], errors="ignore"),
                         on=["trade_date", "sector"], how="left")
