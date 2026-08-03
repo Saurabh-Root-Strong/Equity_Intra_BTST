@@ -1844,7 +1844,20 @@ if tf == "Intraday":
 
     @st.fragment(run_every="5s")
     def _live_panel():
-        lb = _live_board()
+        # THE LOCK GUARD HAS TO LIVE HERE TOO. The one at the top of the script only covers
+        # page LOAD; this fragment re-runs every 5 seconds and touches the archive on each
+        # tick (quotes_board -> last_trading_date). A writer that grabs the DuckDB mid-session
+        # therefore blew past that guard and rendered a raw traceback with an "Ask ChatGPT"
+        # button — the same failure the top-of-script handler exists to prevent, just later.
+        try:
+            lb = _live_board()
+        except Exception as e:
+            st.error(f"⚠ **Archive unavailable right now.** {e}")
+            st.caption("This board only READS the archive. The live prices above are "
+                       "unaffected — it is the EOD-derived fields (prev close, volume "
+                       "baseline, ATR, delivery) that need it. It clears on its own the "
+                       "moment the other process lets go; this panel retries every 5s.")
+            return
         if not lb["ok"] or lb["board"].empty:
             st.warning("No live quotes right now (market closed / pre-open). Scan "
                        "populates 09:15–15:30.")
@@ -2024,7 +2037,16 @@ if tf == "🎬 Replay (practice)":
                          column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS})
     st.stop()
 # ── BTST board ─────────────────────────────────────────────────────────────────
-b = _board(pd.Timestamp(date).strftime("%Y-%m-%d"))
+# Guarded for the same reason as the live panel: the top-of-script check proves the archive
+# was readable a moment ago, not that it still is. A writer grabbing the DuckDB between the
+# two lines would traceback here, on the tab that matters most.
+try:
+    b = _board(pd.Timestamp(date).strftime("%Y-%m-%d"))
+except Exception as _e:
+    st.error(f"⚠ **Archive unavailable right now.** {_e}")
+    st.caption("This board only READS the archive — it never writes to it. Hit **↻ refresh** "
+               "once the other process releases the file; nothing here is broken.")
+    st.stop()
 risk_on = b["risk_on"]
 
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1])

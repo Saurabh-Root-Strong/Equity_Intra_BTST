@@ -72,8 +72,16 @@ import pandas as pd
 from . import config, data
 
 # ── MIRRORED FROM DCM sector_forward_tilt.py — do not tune here ───────────────────────
-_MOM_2W        = 10       # trading days for 2-week momentum / relative strength
-_MOM_1W        = 5        # trading days for 1-week momentum
+_MOM_2W        = 10       # trading days for 2-week momentum / relative strength (DISPLAY only)
+_MOM_1W        = 5        # trading days for 1-week momentum (DISPLAY only)
+# ── FORMATION WINDOWS — THE RANKING FACTORS (re-derived upstream 2026-07-31) ──────────
+# The engine used to rank on 10-day relative strength. On the corrected lagged-weight panel
+# that nets ~+0.39% per leg over a 10-15 day hold (t+1.7); ranking on LONG formation and
+# holding the SAME 2-3 weeks nets +0.70% (t+2.5) and is positive in all five eras. Upstream
+# deliberately selected on the WORST horizon in the band and the WORST era, not the best cell,
+# because adjacent horizons swung wildly from sampling noise.
+_MOM_3M        = 60       # ~3-month relative strength (ranking factor)
+_MOM_6M        = 120      # ~6-month relative strength (ranking factor)
 _DV_BASE       = 100      # trailing window for the delivery-flow baseline
 _DV_FLOW       = 5        # short delivery-flow window
 _MIN_HIST      = 12       # min sector daily rows before a sector is ranked
@@ -83,11 +91,21 @@ _MIN_SECTORS   = 8        # need a real cross-section to rank at all
 # by each caller — two call sites choosing their own warmup is a drift bug waiting to happen,
 # and a warmup even slightly longer than DCM's changes which names clear the delivery-history
 # gate, which moved accumulation breadth on a real date.
-_PANEL_CAL     = 260      # sector return/turnover panel window
+# 400, not the old 260: the ranking factor is now 6-MONTH relative strength (120 trading days),
+# and a 260-day window leaves only ~175 rows per sector — enough to compute rs_6m at the last
+# date but not to reproduce upstream's, because `shift(120)` then lands on a different row.
+# Symptom when this was still 260: most sectors matched EXACTLY while a handful drifted, which
+# reads like a formula bug and is actually a window bug.
+_PANEL_CAL     = 400      # sector return/turnover panel window (upstream: > as_of - 400)
 _DELIV_CAL     = 210      # per-symbol delivery panel window
 _MIN_LIQ_NAMES = 5        # below this a sector is "thin" (noisy rs/breadth)
 
-_W_RS2, _W_RS1, _W_DV5 = 0.60, 0.25, 0.15    # IC-proportional; momentum dominates
+# 0.50 rank(rs_6m) + 0.50 rank(rs_3m). The old 0.60/0.25/0.15 (rs_2w/rs_1w/dv5d) was
+# IC-fitted on the biased same-day-turnover panel. On corrected data over a 2-3 week hold,
+# delivery flow is a DRAG (pure dv5d fwd20 t-1.2; adding it cut the blend's t from +2.4 to
+# +1.9) and short formation is dominated at every hold >= 3 weeks. rs_2w / rs_1w / dv5d are
+# still computed and DISPLAYED — they are simply no longer ranked on.
+_W_RS6M, _W_RS3M = 0.50, 0.50
 
 _OW_RANK       = 0.75     # composite rank >= this → OVERWEIGHT
 _UW_RANK       = 0.25     # composite rank <= this → UNDERWEIGHT
@@ -99,7 +117,7 @@ _WATCH_RS_MAX  = 0.35     # ... while momentum rank is still weak → WATCH (con
 # the overweight basket beats an equal-weight sector benchmark by +0.31%/10d, and OW−UW spans
 # 0.42–0.72% over a rank spread of ~0.74, giving 57–97 bps per unit of rank; 75 is the midpoint.
 # Display estimate only: est_rel_bps is a monotone rescaling of rank and adds nothing to it.
-_REL_SLOPE_BPS = 75.0     # bps of 10d RELATIVE return per unit of (rank − 0.5)
+_REL_SLOPE_BPS = 110.0    # bps of 10d RELATIVE return per unit of (rank − 0.5)
 
 # THE WEIGHT MUST NOT KNOW THE RETURN IT IS WEIGHTING. A stock's SAME-DAY turnover explodes on
 # the day it jumps, so weighting a daily sector return by same-day turnover correlates the weight
@@ -159,7 +177,7 @@ TILT_HISTORY = config.LEDGER.parent / "sector_tilt_history.parquet"
 TILT_MEASUREMENT = config.LEDGER.parent / "sector_tilt_measurement.json"
 
 _COLS = ["trade_date", "sector", "score", "rank", "rank_pos", "n_sectors", "tilt",
-         "rs_2w", "rs_1w", "dv5d", "accum_breadth", "deliv_slope", "n_liq", "thin",
+         "rs_6m", "rs_3m", "rs_2w", "rs_1w", "dv5d", "accum_breadth", "deliv_slope", "n_liq", "thin",
          "divergence", "persistence", "revert", "est_rel_bps", "confidence",
          "reg_state", "reg_verdict", "reg_size_hint", "reg_conf_mult", "reg_divergence",
          "reg_med_trend", "reg_trend_strength", "reg_er20", "dispersion"]
@@ -179,7 +197,13 @@ def _sector_panel(start: str, end: str) -> pd.DataFrame:
     sql = f"""
         WITH base AS (
             SELECT s.sector, b.trade_date, b.turnover_lacs, b.deliv_per,
-                   (b.close_price - b.prev_close) / NULLIF(b.prev_close, 0) * 100 AS r,
+                   -- WINSORIZE the per-stock daily move at +/-25%. An uncapped print (a
+                   -- split, a bonus, an illiquid spike) is not a return and it distorts the
+                   -- whole sector's multi-month momentum — the factor now looks back six
+                   -- months, so one bad print poisons 120 bars rather than 10. Upstream
+                   -- measured the clip lifting top-3 picks from +0.48% to ~+1.0%/12d.
+                   LEAST(GREATEST((b.close_price - b.prev_close)
+                                  / NULLIF(b.prev_close, 0) * 100, -25), 25)      AS r,
                    LAG(b.turnover_lacs) OVER (PARTITION BY b.symbol
                                               ORDER BY b.trade_date)              AS w_lag
             FROM daily_data b
@@ -614,6 +638,10 @@ def _engine(start: str, end: str) -> pd.DataFrame:
     panel = panel.drop(columns="_one")
     panel["mom_2w"] = _grouped_compound(panel, _MOM_2W)
     panel["mom_1w"] = _grouped_compound(panel, _MOM_1W)
+    # long formation — the RANKING factors. NaN until a sector has that much history; the
+    # rank step below fills those with a neutral 0.5 rather than dropping the sector.
+    panel["mom_3m"] = _grouped_compound(panel, _MOM_3M)
+    panel["mom_6m"] = _grouped_compound(panel, _MOM_6M)
     gdv = panel.groupby("sector", sort=False)["daily_dv_cr"]
     # min_periods=1, matching DCM's `dv.iloc[:-1].tail(100).mean()` — it averages WHATEVER
     # history exists and gates only on _MIN_HIST rows of the sector. Demanding a full 100-row
@@ -636,6 +664,8 @@ def _engine(start: str, end: str) -> pd.DataFrame:
     if nf.empty:
         panel["rs_2w"] = panel["mom_2w"]
         panel["rs_1w"] = panel["mom_1w"]
+        panel["rs_3m"] = panel["mom_3m"]
+        panel["rs_6m"] = panel["mom_6m"]
     else:
         nd = pd.DatetimeIndex(nf["trade_date"])
         n2 = pd.Series(_compound(nf["nret"], _MOM_2W).to_numpy(), index=nd)
@@ -643,6 +673,10 @@ def _engine(start: str, end: str) -> pd.DataFrame:
         pd_ = pd.DatetimeIndex(panel["trade_date"])
         panel["rs_2w"] = panel["mom_2w"] - n2.reindex(pd_, method="ffill").to_numpy()
         panel["rs_1w"] = panel["mom_1w"] - n1.reindex(pd_, method="ffill").to_numpy()
+        n3 = pd.Series(_compound(nf["nret"], _MOM_3M).to_numpy(), index=nd)
+        n6 = pd.Series(_compound(nf["nret"], _MOM_6M).to_numpy(), index=nd)
+        panel["rs_3m"] = panel["mom_3m"] - n3.reindex(pd_, method="ffill").fillna(0.0).to_numpy()
+        panel["rs_6m"] = panel["mom_6m"] - n6.reindex(pd_, method="ffill").fillna(0.0).to_numpy()
 
     brd = _breadth(_deliv_panel(deliv_warmup, end))
     panel = panel.merge(brd, on=["trade_date", "sector"], how="left")
@@ -670,9 +704,12 @@ def _engine(start: str, end: str) -> pd.DataFrame:
     # ── cross-sectional ranks, one independent cross-section per date ──────────────
     byd = panel.groupby("trade_date")
     r_rs2 = byd["rs_2w"].rank(pct=True)
-    r_rs1 = byd["rs_1w"].rank(pct=True)
     r_dv5 = byd["dv5d"].rank(pct=True)
-    panel["score"] = _W_RS2 * r_rs2 + _W_RS1 * r_rs1 + _W_DV5 * r_dv5
+    # a sector without 6-month history is ranked MID-PACK, not dropped — matching upstream,
+    # which fills a missing formation rank with 0.5 rather than letting the sector vanish
+    r_6m = byd["rs_6m"].rank(pct=True).fillna(0.5)
+    r_3m = byd["rs_3m"].rank(pct=True).fillna(0.5)
+    panel["score"] = _W_RS6M * r_6m + _W_RS3M * r_3m
     panel["rank"] = panel.groupby("trade_date")["score"].rank(pct=True)
     panel["rank_pos"] = panel.groupby("trade_date")["score"].rank(ascending=False,
                                                                  method="min")
