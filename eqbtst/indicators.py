@@ -431,6 +431,18 @@ def walls(h, l, tol: float, w: int = 2) -> list[tuple[float, int]]:
     clusters spanned >1.5 ATR across price; all 122 were <=1.22 ATR — i.e. price sitting ON one
     level, whose pivots fall slightly both sides. Splitting here would have broken 116 real
     price-on-level singles into weaker halves to fix ZERO actual chains. Leave it global."""
+    return [(x, t) for x, t, _, _ in walls_ext(h, l, tol, w=w)]
+
+
+def walls_ext(h, l, tol: float, w: int = 2) -> list[tuple[float, int, float, float]]:
+    """`walls()` plus each cluster's LOW and HIGH member — (level, touches, lo, hi).
+
+    The extra two numbers exist because a cluster is quoted at its touch-weighted MEAN, and a
+    mean is the wrong number when PRICE IS INSIDE THE CLUSTER: the mean can land on the far
+    side of price, so a ceiling above a long renders as a floor below it (measured: 12.5% of
+    names on the weekly frame, 9.8% on the monthly). A caller that knows the trade's direction
+    can quote the EDGE facing the trade instead. Nothing else changes -- the level list, the
+    touch counts and the merge order are byte-identical to before."""
     his, los = pivots(h, l, w=w)
     lv: list[list] = []
     for x in sorted(his + los):
@@ -438,10 +450,12 @@ def walls(h, l, tol: float, w: int = 2) -> list[tuple[float, int]]:
             if abs(x - c[0]) <= tol:
                 c[0] = (c[0] * c[1] + x) / (c[1] + 1)     # running touch-weighted mean
                 c[1] += 1
+                c[2] = min(c[2], x)
+                c[3] = max(c[3], x)
                 break
         else:
-            lv.append([x, 1])
-    return [(round(x, 2), int(t)) for x, t in lv]
+            lv.append([x, 1, x, x])
+    return [(round(x, 2), int(t), round(lo, 2), round(hi, 2)) for x, t, lo, hi in lv]
 
 
 def zone_visits(candles: pd.DataFrame, level: float, atr_val: float,
@@ -482,7 +496,7 @@ def zone_visits(candles: pd.DataFrame, level: float, atr_val: float,
 
 def sr_levels(candles: pd.DataFrame, spot: float | None = None,
               lookback: int | None = None, tol_atr: float | None = None,
-              min_dist_atr: float = 0.25) -> dict:
+              min_dist_atr: float = 0.25, forming: bool = False) -> dict:
     """Nearest touch-counted support and resistance around `spot`, plus headroom.
 
     Deliberately reports the nearest wall on EACH side separately from the nearest
@@ -515,9 +529,24 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
     if not a or a <= 0:
         return {}
     hh, ll = h[-lookback:], l[-lookback:]
-    lv = walls(hh, ll, tol_atr * a)
+    lv_ext = walls_ext(hh, ll, tol_atr * a)
+    lv = [(x, t) for x, t, _, _ in lv_ext]
     if not lv:
         return {}
+    # THE PIVOT BLIND ZONE. pivots() needs +/-2 neighbours, so the LAST TWO BARS of this window
+    # can never be classified as a level, however extreme they are. That is correct for anti-
+    # repaint reasons, but it means "price is testing the high RIGHT NOW" is structurally
+    # unsayable -- and on a coarse frame the blind zone is enormous: two bars is two WEEKS on
+    # 1W and two MONTHS on 1M. Measured, it is the single largest source of a big-wall reading
+    # "clear" with a level plainly on the chart (50.2% of names on 1W, 57.0% on 1M).
+    # So report the blind zone's own extreme separately and let the caller use it as a level.
+    # CLOSED BARS ONLY: when the frame carries a forming bar it is excluded, because its high
+    # rises with every tick and a level that moves with price is not a level.
+    bz_h, bz_l = (hh[-2:-1], ll[-2:-1]) if forming else (hh[-2:], ll[-2:])
+    bz_h = bz_h[np.isfinite(bz_h)]
+    bz_l = bz_l[np.isfinite(bz_l)]
+    blind = (float(bz_l.min()) if len(bz_l) else float("nan"),
+             float(bz_h.max()) if len(bz_h) else float("nan"))
     md = min_dist_atr * a
     above = [(x, t) for x, t in lv if x > px + md]
     below = [(x, t) for x, t in lv if x < px - md]
@@ -540,7 +569,7 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
         "res_visits": zr["visits"], "res_time_pct": zr["time_pct"], "res_bars": zr["bars"],
         "head_up": round((min(up2) - px) / a, 2) if up2 else None,
         "head_dn": round((px - max(dn2)) / a, 2) if dn2 else None,
-        "atr": a, "levels": lv,
+        "atr": a, "levels": lv, "levels_ext": lv_ext, "blind": blind,
     }
 
 

@@ -183,3 +183,62 @@ def test_phantom_filter_is_a_no_op_on_ordinary_bars():
                        "volume": rng.integers(1e5, 1e6, 30)})
     assert len(live.drop_phantom_bars(df)) == 30
     assert live.drop_phantom_bars(pd.DataFrame()).empty
+
+
+# ── big-wall correctness: the three fixes of 2026-08-04 ────────────────────────────
+# Each guards a defect that made the one-frame-up read say "clear" while a level sat
+# plainly on the chart. Measured before/after: 62-73% of names misreported -> 2-6%.
+
+def test_walls_ext_edges_bracket_the_mean_and_match_walls():
+    """walls_ext must be walls() plus the cluster's extreme members — not a different merge."""
+    import numpy as np
+    from eqbtst import indicators as I
+    h = np.array([10, 12, 10, 12.4, 10, 20, 10, 12.2, 10, 11, 10, 30, 10], dtype=float)
+    l = np.array([9,  8,  9,  8,    9,  8,  9,  8,    9,  8,  9,  8,  9], dtype=float)
+    ext = I.walls_ext(h, l, tol=0.5)
+    assert ext, "no clusters built"
+    assert [(x, t) for x, t, _, _ in ext] == I.walls(h, l, tol=0.5)
+    for x, t, lo, hi in ext:
+        assert lo <= x <= hi, f"mean {x} outside its own members [{lo}, {hi}]"
+        if t == 1:
+            assert lo == hi == x
+
+
+def test_blind_zone_reports_the_bars_pivots_cannot_see():
+    """pivots() needs +/-2 neighbours, so the last two bars can never BE a level.
+
+    That is exactly where "price is testing the high right now" lives — two WEEKS on a
+    weekly frame. sr_levels must hand that extreme back separately.
+    """
+    import numpy as np
+    import pandas as pd
+    from eqbtst import indicators as I
+    n = 40
+    hi = np.full(n, 100.0)
+    lo = np.full(n, 90.0)
+    hi[10] = 120.0                      # a real pivot, mid-window
+    hi[-1] = 150.0                      # the blind zone: last bar, highest of all
+    df = pd.DataFrame({"open": lo, "high": hi, "low": lo, "close": lo})
+    sr = I.sr_levels(df, lookback=n)
+    assert sr, "no levels"
+    assert max(x for x, _ in sr["levels"]) < 150.0, "a last-bar high must not become a pivot"
+    assert sr["blind"][1] == 150.0, "blind-zone high not reported"
+    # ...and with a FORMING last bar it must be excluded, or the 'level' moves with price
+    sr_f = I.sr_levels(df, lookback=n, forming=True)
+    assert sr_f["blind"][1] != 150.0
+
+
+def test_single_touch_level_is_kept_by_the_big_wall_rule():
+    """One violent rejection IS a level. The gate used to require two touches, which is the
+    same bug already fixed for headroom — it made a lone spike read 'clear'."""
+    import numpy as np
+    import pandas as pd
+    from eqbtst import indicators as I
+    n = 40
+    hi = np.full(n, 100.0)
+    lo = np.full(n, 90.0)
+    hi[20] = 130.0                      # ONE touch, well above price, mid-window
+    df = pd.DataFrame({"open": lo, "high": hi, "low": lo, "close": lo})
+    sr = I.sr_levels(df, lookback=n)
+    one_touch = [x for x, t in sr["levels"] if t == 1 and x > 110]
+    assert one_touch, "the single rejection vanished from the level list"

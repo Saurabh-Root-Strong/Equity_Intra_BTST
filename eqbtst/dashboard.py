@@ -225,6 +225,11 @@ if last is None:
         sector_tilt.clear_cache()
         st.rerun()
     st.stop()
+    # st.stop() only raises inside a real script-run context. Imported (tests, tooling) it is
+    # a no-op and execution FALLS THROUGH to `last.date()` below, which then dies with a bare
+    # `AttributeError: 'NoneType' has no attribute 'date'` four lines from the actual cause.
+    # Re-raise so the lock names itself wherever this module is loaded.
+    raise RuntimeError(str(_err))
 tf = st.sidebar.radio("Timeframe",
                       ["BTST (overnight)", "Intraday", "🎬 Replay (practice)"],
                       index=0)
@@ -1240,7 +1245,7 @@ if tf == "Intraday":
                       "the range that usually fades).\n\n"
                       "Either way, the best setups are sorted to the top."))
             _room_f = pc3.selectbox(
-                "Upper-TF S/R (one frame up)", ["All", "✅ Has room", "🧱 Capped"],
+                "Upper-TF S/R (one frame up)", ["All", "✅ Has room", "⚠ Tight", "🧱 Capped"],
                 index=0, key="mtf_roomf",
                 help=("Filter on the ONE HIGHER frame's wall (the `big wall` column) — the level "
                       "your two trading frames are blind to. Per horizon that frame is: Intraday "
@@ -1250,10 +1255,26 @@ if tf == "Intraday":
                       "• **✅ Has room** — the higher-frame wall in the trade's direction is **∞ "
                       "clear** or **≥ 1 ATR away**, so the 1×ATR target has space. This is the "
                       "'horizon setup AND the upper frame is not blocking it' list.\n"
-                      "• **🧱 Capped** — the opposite: **< 0.5 ATR** from a defended higher-frame "
+                      "• **⚠ Tight** — **0.5 to 1.0 ATR**: the wall sits ON your 1×ATR target. "
+                      "These used to belong to NEITHER option, so flipping between 'room' and "
+                      "'capped' never showed them at all (3.4–8.5% of names, worst on Swing).\n"
+                      "• **🧱 Capped** — the opposite: **< 0.5 ATR** from a higher-frame "
                       "wall in the trade's direction — most likely to stall or reverse into the "
                       "big level (AVOID, or wait for a clean break of it — a break THROUGH is "
                       "often the real move, so capped is not automatically 'goes the other way').\n\n"
+                      "**WHAT COUNTS AS A WALL** (three fixes, 2026-08-04 — the read used to miss "
+                      "the level on ~62–73% of names, now ~2–6%):\n"
+                      "• a level touched **once** still counts (`×1`). It used to need two touches, "
+                      "so a single violent rejection read '∞ clear' with the level plainly on the "
+                      "chart. Touch count does NOT rank levels (measured), so it must not gate them.\n"
+                      "• a **`~`** suffix means the level is the high/low of the frame's last two "
+                      "bars. A pivot needs two bars either side of it, so the most recent two bars "
+                      "can never BE a level — two WEEKS on 1W, two MONTHS on 1M. That blind spot "
+                      "is exactly where 'price is testing the high right now' lives. Closed bars "
+                      "only, so it cannot repaint.\n"
+                      "• when price sits INSIDE a cluster of pivots, the wall is quoted at the "
+                      "cluster's near EDGE, not its average — an average can fall on the wrong "
+                      "side of price and turn a ceiling into a floor.\n\n"
                       "⚠ MEASURED — a CHARTIST screen, NOT a return edge. Backtested on 1,010 "
                       "footprint longs with a causal weekly-wall read: 'has room' longs earned "
                       "+7.5bps overnight vs +21.7 for 'capped' ones — room did NOT beat capped "
@@ -1473,6 +1494,11 @@ if tf == "Intraday":
                 _bg = pd.to_numeric(light["big_gap"], errors="coerce")
                 if _room_f == "✅ Has room":
                     light, _room_on = light[np.isinf(_bg) | (_bg >= 1.0)], True
+                elif _room_f == "⚠ Tight":
+                    # 0.5-1.0 ATR. These names belonged to NEITHER of the old two options, so
+                    # flipping between them never showed them (measured 3.4-8.5% of the universe,
+                    # worst on Swing). Not a third opinion -- the missing third of the range.
+                    light, _room_on = light[(_bg >= 0.5) & (_bg < 1.0)], True
                 elif _room_f == "🧱 Capped":
                     light, _room_on = light[_bg < 0.5], True
             light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
@@ -2101,8 +2127,11 @@ try:
                     if _t in _bk)
                 st.warning(
                     "**MEASURED, AND IT RUNS BACKWARDS FOR THIS BOOK — read this before you "
-                    "use the column.** The tilt is a genuine 1–2 WEEK signal in DCM (daily-IC "
-                    f"t≈9). Joined to this engine's own footprint triggers (n={_ms['n_signals']}, "
+                    "use the column.** DCM advertises the tilt as a 1–2 WEEK signal, but its "
+                    "headline daily-IC t≈9 was measured on a panel weighted by the SAME day's "
+                    "turnover — a lookahead, since fixed upstream but never re-measured, so "
+                    "treat that number as void. What IS measured is the line below. Joined to "
+                    f"this engine's own footprint triggers (n={_ms['n_signals']}, "
                     f"regime-gated, {_ms['cost_bps']:.0f}bps cost), the overnight payoff goes "
                     "the OTHER way:\n\n"
                     "| sector tilt | n | net overnight | win% |\n|---|---|---|---|\n" + _rows +

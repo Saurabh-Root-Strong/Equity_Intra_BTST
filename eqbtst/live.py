@@ -1343,6 +1343,8 @@ def mtf_structure(sym: str) -> dict:
     out.update({f"{p}{t}": 0 for t in _TFS for p in ("supt", "rest")})
     out.update({f"{p}{t}": float("inf") for t in _TFS for p in ("hup", "hdn")})
     out.update({f"wall{t}": [] for t in _TFS})
+    out.update({f"wallx{t}": [] for t in _TFS})
+    out.update({f"blind{t}": (float("nan"), float("nan")) for t in _TFS})
     out.update({f"atr{t}": float("nan") for t in _TFS})
 
     # Which frames have a bar that has NOT closed yet? Only the intraday ones, and only while
@@ -1366,7 +1368,8 @@ def mtf_structure(sym: str) -> dict:
         # only ~3 months, so it undercounted major bases -- NATIONALUM's ×5 year-base read ×2,
         # and universe-wide the nearest-wall touch count ran ~half). The structure LABEL and box
         # are untouched (they read the last STRUCT_LOOKBACK bars regardless of frame length).
-        sr = indicators.sr_levels(frame, lookback=sr_lb) if lab != "n/a" else {}
+        sr = (indicators.sr_levels(frame, lookback=sr_lb, forming=forming and _live_bar)
+              if lab != "n/a" else {})
         out[f"sup{tf}"] = sr.get("support", float("nan")) or float("nan")
         out[f"supt{tf}"] = int(sr.get("sup_touches", 0) or 0)
         out[f"res{tf}"] = sr.get("resistance", float("nan")) or float("nan")
@@ -1377,6 +1380,11 @@ def mtf_structure(sym: str) -> dict:
         out[f"hup{tf}"] = float("inf") if _hu is None else float(_hu)
         out[f"hdn{tf}"] = float("inf") if _hd is None else float(_hd)
         out[f"wall{tf}"] = sr.get("levels", [])
+        # (level, touches, lo, hi) + the pivot blind zone's extreme — both feed ONLY the
+        # one-frame-up big-wall check, which is the read that has to name the level a chartist
+        # can see. The pair's own sup/res/headroom are unchanged.
+        out[f"wallx{tf}"] = sr.get("levels_ext", [])
+        out[f"blind{tf}"] = sr.get("blind", (float("nan"), float("nan")))
         out[f"atr{tf}"] = sr.get("atr", float("nan"))
 
     try:
@@ -1419,7 +1427,12 @@ def mtf_structure(sym: str) -> dict:
             # is a multi-year object; anything less is starved.
             _mo = _monthly_hist().get(sym)
             _ok = _mo is not None and len(_mo) >= 12
-            out["wall1M"] = indicators.sr_levels(_mo).get("levels", []) if _ok else []
+            _sm = indicators.sr_levels(_mo) if _ok else {}
+            out["wall1M"] = _sm.get("levels", [])
+            out["wallx1M"] = _sm.get("levels_ext", [])
+            # monthly_frame() has already dropped the incomplete current month, so every bar
+            # here is closed -> forming=False (the default) is correct.
+            out["blind1M"] = _sm.get("blind", (float("nan"), float("nan")))
             out["atr1M"] = indicators.atr(_mo, min(14, len(_mo))) if (_mo is not None and len(_mo) >= 5) else float("nan")
     except Exception:
         pass
@@ -1590,9 +1603,11 @@ def universe_mtf_scan(date=None) -> dict:
                for t in _TFS for p in ("h", "l", "n")},
             # touch-counted S/R per frame — feeds the level read (add_setup picks the pair)
             **{f"sr_{p}{t}": _mtf.get(f"{p}{t}")
-               for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall", "atr")},
+               for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall", "atr",
+                                       "wallx", "blind")},
             # MONTHLY walls (Positional big-wall only) — carried explicitly, not a full frame
             "sr_wall1M": _mtf.get("wall1M"), "sr_atr1M": _mtf.get("atr1M"),
+            "sr_wallx1M": _mtf.get("wallx1M"), "sr_blind1M": _mtf.get("blind1M"),
             # carried for enrich_mtf (needs the authoritative live prev_close + EOD baselines):
             "_pc": pc, "_vol_med20": float(uni.loc[sym, "vol_med20"] or 0),
             "_rs_cum9": float(uni.loc[sym, "rs_cum9"] or 0),
@@ -1946,6 +1961,9 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
     # level is often the move -- but you must SEE it before you buy in.
     _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W", "1M")
     _LADDER = ("1h", "4h", "1D", "1W", "1M")      # the 4x confirmation-frame ladder, incl. month
+    # Same 0.25-ATR min-distance the pair path uses: a 1-touch pivot hugging price is inside the
+    # noise, a >=2-touch wall is never noise however close it sits.
+    _BIG_MIN_DIST_ATR = 0.25
     _hi = _TF_ORD.index(htf) if htf in _TF_ORD else -1
     _one = next((f for f in _LADDER if _TF_ORD.index(f) > _hi), None)
     _ctx = [_one] if _one else []
@@ -1959,16 +1977,47 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
         a = float(a) if (a is not None and a == a and float(a) > 0) else 0.0
         if px <= 0 or a <= 0 or not _ctx:
             big_w.append(""); big_g.append(np.inf); big_px.append(np.nan); continue
+        look_up = r.get("side") != "SHORT"          # long / no-side watch the ceiling; short the floor
+        md = _BIG_MIN_DIST_ATR * a
         walls = []
         for f in _ctx:
-            wl = r.get(f"sr_wall{f}")
-            if isinstance(wl, list):
-                walls += [(float(x), int(t), f) for x, t in wl if int(t) >= 2]
-        look_up = r.get("side") != "SHORT"          # long / no-side watch the ceiling; short the floor
-        side_walls = [(x, t, f) for x, t, f in walls if (x > px) == look_up]
+            wl = r.get(f"sr_wallx{f}") or r.get(f"sr_wall{f}")
+            for _lv in (wl if isinstance(wl, list) else []):
+                # tolerate both shapes: (level, touches) and (level, touches, lo, hi)
+                x, t = float(_lv[0]), int(_lv[1])
+                lo, hi = (float(_lv[2]), float(_lv[3])) if len(_lv) >= 4 else (x, x)
+                # (3) CLUSTER EDGE. A cluster is quoted at its touch-weighted MEAN. When price
+                # sits INSIDE the cluster that mean falls on the wrong side, so the ceiling over
+                # a long renders as a floor under it. Quote the edge facing the trade instead.
+                if look_up and x <= px < hi:
+                    x = hi
+                elif (not look_up) and x >= px > lo:
+                    x = lo
+                # (1) KEEP 1-TOUCH LEVELS. Identical rule to the pair path in _live_levels: a
+                # single violent rejection IS a level, and only the min-distance filter should
+                # drop it. This gate used to be a bare `t >= 2`, which is the same bug already
+                # found and fixed for headroom -- it made a lone spike-and-crash read "clear"
+                # while the level sat plainly on the chart.
+                if t >= 2 or (x > px + md if look_up else x < px - md):
+                    walls.append((x, t, f, ""))
+            # (2) THE PIVOT BLIND ZONE. pivots() needs +/-2 neighbours, so the last two bars of
+            # the frame can never BE a level -- two WEEKS on 1W, two MONTHS on 1M. That is where
+            # "price is testing the high right now" lives, and it was the single biggest source
+            # of a false "clear" (50.2% of names on 1W, 57.0% on 1M). Closed bars only, so it
+            # cannot repaint. Marked "~" because it is an untested extreme, not a defended level.
+            bz = r.get(f"sr_blind{f}")
+            if isinstance(bz, (list, tuple)) and len(bz) == 2:
+                e = bz[1] if look_up else bz[0]
+                try:
+                    e = float(e)
+                except (TypeError, ValueError):
+                    e = float("nan")
+                if e == e and ((e > px) if look_up else (e < px)):
+                    walls.append((e, 1, f, "~"))
+        side_walls = [w for w in walls if (w[0] > px) == look_up]
         if side_walls:
-            x, t, f = (min if look_up else max)(side_walls, key=lambda z: z[0])
-            big_w.append(f"{f} {x:.2f} ×{t}")
+            x, t, f, k = (min if look_up else max)(side_walls, key=lambda z: z[0])
+            big_w.append(f"{f} {x:.2f} ×{t}{k}")
             big_g.append(round(abs(x - px) / a, 2))
             big_px.append(x)                        # the wall PRICE, so the 5s tick re-derives the gap
         else:
