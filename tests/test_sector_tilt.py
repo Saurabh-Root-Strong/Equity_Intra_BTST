@@ -11,6 +11,8 @@ Two layers, on purpose:
 The parity layer is the one that matters: this module is a PORT, and a port that is not
 pinned to its source silently drifts the moment either side is edited.
 """
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -160,11 +162,20 @@ def test_gate_rule_is_written_down_before_the_measurement_runs():
 # ── PARITY: pinned against DCM's own implementation ───────────────────────────────
 def _dcm_available():
     import importlib.util
+    import os
     import sys
     from pathlib import Path
     from eqbtst import config
     if not config.DCM_DUCKDB.exists():
         return None
+    # DCM's ConnectionManager opens DuckDB READ-WRITE unless CLOUD_MODE is set, and DuckDB
+    # is many-readers-OR-one-writer. So importing DCM's engine here and calling it would take
+    # the EXCLUSIVE lock on the archive — locking out DCM's own dashboard, its nightly sync,
+    # and this board's own read-only connections, for as long as the test runs. That is both a
+    # hazard and a violation of this project's invariant that it only ever READS the archive.
+    # CLOUD_MODE=true is DCM's own documented switch for "open read-only so readers can share".
+    # Set it BEFORE the import; connection.py reads it at connect time.
+    os.environ.setdefault("CLOUD_MODE", "true")
     root = config.DCM_DUCKDB.parent.parent
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
@@ -281,3 +292,33 @@ def test_last_close_before_is_strictly_earlier():
     # the replay/intraday as-of MUST be strictly before the session being decided, or the
     # session's own outcome leaks into the decision.
     assert prev is not None and prev < last
+
+
+def test_upstream_momentum_inversion_gate_is_still_inert():
+    """DCM suppresses ALL overweights and zeroes est_rel_bps when `momentum_inverts` is True.
+
+    That branch is deliberately NOT ported, because upstream's recalibration hardcodes
+    `inv = False` on every regime branch, making the gate unreachable. That is an
+    assumption about ANOTHER repo's source, and upstream has already flip-flopped this
+    module once. If someone re-enables inversion there, this port would silently keep
+    publishing OVERWEIGHT badges DCM has suppressed — a divergence no output-parity test
+    catches, because it only fires on regimes that have not occurred yet.
+
+    So assert on the source itself: every assignment to `inv` must still be False.
+    """
+    import io, re
+    from eqbtst import config
+    src = getattr(config, "DCM_ROOT", None)
+    up = (Path(src) if src else Path(r"d:/Python Projects/Daily_Cash_Market")) \
+        / "src" / "analytics" / "sector_forward_tilt.py"
+    if not up.exists():
+        pytest.skip("DCM source not reachable")
+    text = io.open(up, encoding="utf-8").read()
+    assigns = re.findall(r"^\s*state,\s*mult,\s*inv\s*=\s*[^,]+,\s*[^,]+,\s*(\w+)",
+                         text, re.M)
+    assert assigns, "could not find the regime branches upstream — parser drifted, re-check"
+    assert set(assigns) == {"False"}, (
+        f"upstream re-enabled momentum inversion ({set(assigns)}); the OW-suppression and "
+        "est_rel_bps=0 branches must now be ported into sector_tilt.py"
+    )
+    assert "momentum_inverts=False" in text.replace(" ", ""), "upstream default changed"
