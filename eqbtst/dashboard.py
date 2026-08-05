@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import config, data, ledger, live, mtf, screen, sector_tilt
+from eqbtst import config, data, fno, ledger, live, mtf, screen, sector_tilt
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
 
@@ -223,6 +223,7 @@ if last is None:
         st.cache_data.clear()
         live.clear_universe_cache()
         sector_tilt.clear_cache()
+        fno.clear_cache()
         st.rerun()
     st.stop()
     # st.stop() only raises inside a real script-run context. Imported (tests, tooling) it is
@@ -239,6 +240,7 @@ if st.sidebar.button("↻ refresh"):
     st.cache_data.clear()
     live.clear_universe_cache()      # also drop the EOD universe cache (picks up a new sync)
     sector_tilt.clear_cache()        # lru_cache is invisible to st.cache_data.clear()
+    fno.clear_cache()
 test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", value=False,
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
@@ -820,6 +822,15 @@ DELIV_HELP_SHORT = ("DELIVERY % — share of volume taken for delivery, not squa
              "SCALE: ±10% = ordinary · ±20% = top/bottom sixth · ±30% = the extremes "
              "(~top/bottom tenth). Cutoffs drift daily.\n\n"
              "Full note + worked example: the '📦 delivery columns' expander.")
+
+# F&O positioning columns. Tooltips live in fno.py beside the code that builds the labels,
+# so a label change and its explanation cannot drift apart (they have, twice, in this file).
+FNO_COLS = {
+    "Fut Near": st.column_config.TextColumn("Fut Near", width="small", help=fno.HELP_FUT),
+    "Fut Next": st.column_config.TextColumn("Fut Next", width="small", help=fno.HELP_FUT),
+    "Opt Near": st.column_config.TextColumn("Opt Near", width="medium", help=fno.HELP_OPT),
+    "Opt Next": st.column_config.TextColumn("Opt Next", width="medium", help=fno.HELP_OPT),
+}
 
 DELIV_COLS = {
     "deliv trend": st.column_config.TextColumn(
@@ -1516,9 +1527,15 @@ if tf == "Intraday":
         # actually tradeable in that name. Holding a prime column for it pushed the reads you
         # do scan further right. NOTE it is still load-bearing — the universe carries no
         # turnover floor, so thin names appear, and the caption above the table keeps saying so.
+        # F&O positioning sits IMMEDIATELY AFTER the delivery read, by request and because the
+        # two answer the same question from opposite books: delivery is who took stock in the
+        # CASH market, near/next futures+options is what the DERIVATIVES book did in the same
+        # name on the same day. Twenty columns apart they would never be compared.
         light_cols = (["symbol", "sector", "sector tilt", "ltp", "day%"]
-                      + (["setup", "side", "deliv trend", "loc", "at_wall", "sup", "sup_t", "res",
-                          "res_t", "headroom", "big_wall", "big_gap"] if _P else ["deliv trend"])
+                      + (["setup", "side", "deliv trend"] + fno.COLS +
+                         ["loc", "at_wall", "sup", "sup_t", "res",
+                          "res_t", "headroom", "big_wall", "big_gap"]
+                         if _P else ["deliv trend"] + fno.COLS)
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W", "turn₹L"])
 
@@ -1567,7 +1584,7 @@ if tf == "Intraday":
                  f"selection choice that has paid.")
                 + " Raise a **delivery** slider or pick a **structure** to narrow further; "
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
-            _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS}
+            _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS}
             # NAME THE ACTIVE BASELINE IN THE HEADER. It now moves with the trade horizon, so a
             # bare "deliv trend" would leave the reader guessing which yardstick the % is against
             # — and the answer changes the sign on real names (KALYANKJIL reads +24% on a 15-day
@@ -1583,6 +1600,14 @@ if tf == "Intraday":
                 width="medium", help=DELIV_HELP_SHORT)
             render_tilt_help()
             render_deliv_help()
+            # WHICH SESSION THE F&O COLUMNS DESCRIBE. The bhavcopy publishes after the close, so
+            # on the Intraday tab these sit beside a LIVE price while describing yesterday's
+            # book. Saying the date is the difference between context and a silent lie.
+            _fmeta = fno.positioning(_ASOF_LIVE)[1]
+            if _fmeta.get("stale_days"):
+                st.warning("🧮 " + fno.stale_note(_fmeta))
+            else:
+                st.caption("🧮 " + fno.stale_note(_fmeta))
 
             def _side_table(df_, note=None, extra_cols=()):
                 if df_.empty:
@@ -1601,7 +1626,7 @@ if tf == "Intraday":
                         _anchor = next((c for c in ("deliv_vs_100d", "wtd_deliv7", "side")
                                         if c in _c), None)
                         _c.insert(_c.index(_anchor) + 1 if _anchor else 1, _e)
-                df_ = _wt(_dw(df_, _ASOF_LIVE, _hz), _ASOF_LIVE)   # side comes from each row's own `side`
+                df_ = fno.annotate(_wt(_dw(df_, _ASOF_LIVE, _hz), _ASOF_LIVE), _ASOF_LIVE)
                 st.dataframe(_fmt(df_)[_cols(df_, _c)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
                 # Denominator = the pool the SIDES were split from, not the raw scan. Quoting
@@ -1729,7 +1754,7 @@ if tf == "Intraday":
                         _side_table(_no)
                 _side_tabs()
             else:
-                _lt = _wt(_dw(light, _ASOF_LIVE, _hz), _ASOF_LIVE)
+                _lt = fno.annotate(_wt(_dw(light, _ASOF_LIVE, _hz), _ASOF_LIVE), _ASOF_LIVE)
                 st.dataframe(_fmt(_lt)[_cols(_lt, light_cols)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
                 _tally(len(light), sc["n_scanned"], "names",
