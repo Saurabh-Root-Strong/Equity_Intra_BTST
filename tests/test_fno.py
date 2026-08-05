@@ -93,3 +93,90 @@ def test_annotate_preserves_row_count_and_order():
     out = fno.annotate(df, last)
     assert len(out) == 3 and list(out["symbol"]) == ["WIPRO", "KOTAKBANK", "ZZZ"]
     assert list(out["x"]) == [1, 2, 3]
+
+
+def test_fno_block_is_in_BOTH_column_lists_at_the_same_place():
+    """The board builds its columns TWICE -- `light_cols` before any filter, `_sc` after one.
+
+    Adding a column to only one is a bug this board has now shipped twice: first `deliv trend`
+    (it JUMPED across the table when a filter was applied), then the F&O block (it VANISHED
+    entirely the moment "Has room" was selected). Both lists live in dashboard.py and nothing
+    but this test ties them together.
+
+    Asserted on the SOURCE, because building the real frames needs a live broker session.
+    """
+    import io
+    import re
+    from pathlib import Path
+    src = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
+                  encoding="utf-8").read()
+
+    # both lists must anchor the F&O block immediately after `deliv trend`
+    pat = r'"deliv trend"\]\s*\+\s*fno\.COLS'
+    hits = re.findall(pat, src)
+    assert len(hits) >= 2, (
+        f"expected the F&O block anchored after 'deliv trend' in BOTH the pre-filter and the "
+        f"enriched column lists, found {len(hits)}"
+    )
+    # and the enriched frame must actually carry them, or the columns render empty
+    assert re.search(r"enr\s*=\s*fno\.annotate\(", src), \
+        "enriched frame is never annotated -- the four columns would render blank under a filter"
+
+
+def test_no_side_path_also_carries_the_fno_block():
+    """The no-preset render path has its own column list too."""
+    import io
+    import re
+    from pathlib import Path
+    src = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
+                  encoding="utf-8").read()
+    assert re.search(r'\["deliv trend"\]\s*\+\s*fno\.COLS', src), \
+        "the no-preset column list dropped the F&O block"
+
+
+def test_every_table_that_shows_the_fno_block_can_actually_render_it():
+    """A column needs THREE things wired, in three different places, to appear:
+
+        1. its name in that table's column list
+        2. the frame annotated so the data exists
+        3. FNO_COLS in that table's column_config, or it renders with no tooltip
+
+    Miss (1) and the column vanishes -- which is exactly what happened on "Has room": the
+    block was in the pre-filter list and not the enriched one. Miss (2) and it renders blank.
+    Miss (3) and it renders bare. None of these fail loudly; the table just looks different.
+
+    So pin the COUNTS. Adding a table without the block, or a list without a config, moves a
+    number here and forces the author to decide deliberately rather than discover it later
+    from a screenshot.
+    """
+    import io
+    import re
+    from pathlib import Path
+    src = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
+                  encoding="utf-8").read()
+    lists = len(re.findall(r"fno\.COLS", src))
+    annot = len(re.findall(r"fno\.annotate\(", src))
+    cfgs = len(re.findall(r"\*\*FNO_COLS", src))
+    assert (lists, annot, cfgs) == (8, 6, 10), (
+        f"F&O column wiring moved: {lists} column lists / {annot} annotate calls / {cfgs} "
+        f"configs (expected 8 / 6 / 10). If you ADDED a table, wire all three and update "
+        f"this count. If a number DROPPED, a table just lost the block silently."
+    )
+
+
+def test_replay_annotates_with_the_prior_close_not_the_replayed_session():
+    """The F&O bhavcopy for session D publishes AFTER D's close.
+
+    A replay reconstructs a decision taken INSIDE session D, so reading D's own bhavcopy
+    feeds that session's outcome back into the decision -- the same lookahead class that
+    retracted two 'edges' in this stack. The replay must anchor on the prior close.
+    """
+    import io
+    import re
+    from pathlib import Path
+    src = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
+                  encoding="utf-8").read()
+    assert re.search(r"fno\.annotate\(bd,\s*_asof_replay\)", src), \
+        "replay must annotate with _asof_replay (prior close), never rdate"
+    assert not re.search(r"fno\.annotate\([^)]*\brdate\b", src), \
+        "replay is annotating with the replayed session itself — lookahead"
