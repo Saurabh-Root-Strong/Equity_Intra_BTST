@@ -62,7 +62,7 @@ def test_degrades_to_dashes_rather_than_raising():
     out = fno.positioning("1990-01-01")[0]
     assert out.empty
     ann = fno.annotate(df, "1990-01-01")
-    assert list(ann[fno.COLS].iloc[0]) == ["—"] * 4
+    assert list(ann[fno.COLS].iloc[0]) == ["—"] * len(fno.COLS)
 
 
 def test_names_without_fno_get_a_dash_not_a_guess():
@@ -77,7 +77,7 @@ def test_names_without_fno_get_a_dash_not_a_guess():
         pytest.skip(f"archive unavailable: {e}")
     df = pd.DataFrame({"symbol": ["KOTAKBANK", "ZZZNOTREAL"]})
     out = fno.annotate(df, last)
-    assert list(out[out.symbol == "ZZZNOTREAL"][fno.COLS].iloc[0]) == ["—"] * 4
+    assert list(out[out.symbol == "ZZZNOTREAL"][fno.COLS].iloc[0]) == ["—"] * len(fno.COLS)
     assert set(out.columns) >= set(fno.COLS)
 
 
@@ -152,15 +152,19 @@ def test_every_table_that_shows_the_fno_block_can_actually_render_it():
     import io
     import re
     from pathlib import Path
-    src = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
+    raw = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
                   encoding="utf-8").read()
+    # STRIP COMMENTS FIRST. The first version of this test counted prose: a comment that
+    # merely MENTIONED fno.COLS inflated the total, so editing documentation broke the test.
+    # A tripwire that fires on comments trains you to ignore it.
+    src = "\n".join(ln.split("#", 1)[0] for ln in raw.splitlines())
     lists = len(re.findall(r"fno\.COLS", src))
     annot = len(re.findall(r"fno\.annotate\(", src))
     cfgs = len(re.findall(r"\*\*FNO_COLS", src))
-    assert (lists, annot, cfgs) == (8, 6, 10), (
-        f"F&O column wiring moved: {lists} column lists / {annot} annotate calls / {cfgs} "
-        f"configs (expected 8 / 6 / 10). If you ADDED a table, wire all three and update "
-        f"this count. If a number DROPPED, a table just lost the block silently."
+    assert (lists, annot, cfgs) == (9, 6, 10), (
+        f"F&O column wiring moved: {lists} fno.COLS references / {annot} annotate calls / "
+        f"{cfgs} configs (expected 9 / 6 / 10). If you ADDED a table, wire all three and "
+        f"update this count. If a number DROPPED, a table just lost the block silently."
     )
 
 
@@ -180,3 +184,23 @@ def test_replay_annotates_with_the_prior_close_not_the_replayed_session():
         "replay must annotate with _asof_replay (prior close), never rdate"
     assert not re.search(r"fno\.annotate\([^)]*\brdate\b", src), \
         "replay is annotating with the replayed session itself — lookahead"
+
+
+def test_column_config_is_derived_from_COLS_not_hand_listed():
+    """FNO_COLS must be BUILT from fno.COLS, not typed out.
+
+    The two disagreed once already: the column list gained entries the config never got, so
+    the columns rendered with no tooltip. Deriving one from the other makes that unrepresentable
+    -- and it is why growing 4 -> 8 columns needed no config edit at all.
+    """
+    import io
+    import re
+    from pathlib import Path
+    from eqbtst import fno
+    src = io.open(Path(__file__).resolve().parent.parent / "eqbtst" / "dashboard.py",
+                  encoding="utf-8").read()
+    assert re.search(r"for c in fno\.COLS", src), "FNO_COLS is no longer derived from fno.COLS"
+    # and every column must have a tooltip mapped, or it renders bare
+    assert re.search(r"_FNO_HELP\s*=\s*\{", src)
+    for c in fno.COLS:
+        assert f'"{c}"' in src, f"{c} has no entry in the help map"

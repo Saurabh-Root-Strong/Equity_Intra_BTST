@@ -825,11 +825,17 @@ DELIV_HELP_SHORT = ("DELIVERY % — share of volume taken for delivery, not squa
 
 # F&O positioning columns. Tooltips live in fno.py beside the code that builds the labels,
 # so a label change and its explanation cannot drift apart (they have, twice, in this file).
+# Built from fno.COLS so the config can never drift out of step with the column list -- the
+# two have already disagreed once (the block vanished under a filter). Each expiry shows the
+# 1-DAY read then its CYCLE read, which is DCM's own ordering: backdrop beside today's move.
+# Futures carry the CYCLE read, options the 1-DAY read -- so the tooltips differ by
+# instrument, not by column name. See the block above fno.COLS for why.
+_FNO_HELP = {"Fut Near": fno.HELP_FUT_CYC, "Fut Next": fno.HELP_FUT_CYC,
+             "Opt Near": fno.HELP_OPT,     "Opt Next": fno.HELP_OPT}
 FNO_COLS = {
-    "Fut Near": st.column_config.TextColumn("Fut Near", width="small", help=fno.HELP_FUT),
-    "Fut Next": st.column_config.TextColumn("Fut Next", width="small", help=fno.HELP_FUT),
-    "Opt Near": st.column_config.TextColumn("Opt Near", width="medium", help=fno.HELP_OPT),
-    "Opt Next": st.column_config.TextColumn("Opt Next", width="medium", help=fno.HELP_OPT),
+    c: st.column_config.TextColumn(
+        c, width="small" if c.startswith("Fut") else "medium", help=_FNO_HELP[c])
+    for c in fno.COLS
 }
 
 DELIV_COLS = {

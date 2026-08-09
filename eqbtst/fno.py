@@ -38,6 +38,15 @@ WHAT THE LABELS MEAN
     🔥 Bull C.Buy+P.Wrt = both legs bullish · ❄️ Bear C.Wrt+P.Buy = both bearish ·
     📊 Range C+P.Wrt = both legs WRITTEN (short volatility) · ⚡ Vol Bet C+P.Buy = both bought.
     PCR is appended as context, not as the call.
+    CYCLE columns — the same reads taken over the MONTHLY EXPIRY CYCLE rather than one session:
+        "🟢 LB +13% | +2, +3, +2, +6" — cumulative OI change since the last monthly roll on
+        the SAME contract, then the last four DAILY steps, so a build still running is visually
+        distinct from one that stalled a week ago. "⚠" means TODAY moved AGAINST the build.
+        The CODE is PEER-RELATIVE (ranked against the other ~207 names); the number is raw.
+    THE FUTURES COLUMNS CARRY THE CYCLE READ, THE OPTIONS COLUMNS THE 1-DAY READ. Not a style
+    choice — see the block above COLS for the measurement behind each. Upstream also publishes
+    an options CYCLE label ("🟢 Bull | CE Buy3 PE Wrt5 /6d", the cycle's daily verdicts
+    counted); it is deliberately NOT carried, for the coverage reason recorded there.
 
 WHAT IT IS NOT — READ THIS BEFORE YOU TRADE OFF THESE COLUMNS
     1. NOT MEASURED IN THIS BOOK, AND THE NEAREST THINGS THAT WERE ARE NULL. CE/PE OI crossover
@@ -49,7 +58,13 @@ WHAT IT IS NOT — READ THIS BEFORE YOU TRADE OFF THESE COLUMNS
        says how far behind, and the board prints it rather than letting you assume it is today.
     3. NEXT-MONTH OI CHANGE IS NOISY EARLY IN THE CYCLE. A contract with a small base can print
        +143% off a handful of lots. Read the SIGN and the label, not the magnitude.
-    4. ONLY 208 OF THE ~268 NAMES ON THIS BOARD HAVE F&O AT ALL. SEBI's tightened eligibility
+    4. A BLANK IS UPSTREAM WITHHOLDING, NOT A GAP. Rather than print a large percentage off a
+       handful of lots, upstream refuses to label a contract that has not filled up. On the
+       futures cycle columns this is rare (0.0% near, 0.5% next); it is the reason the options
+       CYCLE read is not carried at all (100% blank on cycle day 1, 66.8% on day 6).
+    5. STILL NO MEASURED FORWARD INFORMATION. Upstream tested the cycle read at every horizon
+       and found under 0.08pp. It DESCRIBES positioning; it does not predict.
+    6. ONLY 208 OF THE ~268 NAMES ON THIS BOARD HAVE F&O AT ALL. SEBI's tightened eligibility
        phased many out (ACC's last futures bar was 2025-07-31, BATAINDIA's 2025-02-27). A "—"
        is a correct answer, not a gap in the data.
 """
@@ -64,11 +79,28 @@ import pandas as pd
 
 from eqbtst import config
 
-# The four columns this board shows. DCM computes a `far` month too; it is deliberately not
-# carried — far-month stock contracts are thin enough that the label is mostly noise.
+# DCM computes a `far` month too; deliberately not carried — far-month stock contracts are thin
+# enough that the label is mostly noise, and upstream blanks it behind a volume gate anyway.
+#
+# FOUR columns, and the choice of WHICH read each carries is measured, not stylistic.
+#
+# FUTURES -> the CYCLE read. Upstream also publishes a 1-day futures label, and it is fully
+# REDUNDANT: measured on 208/208 names, both expiries, the 1-day % is exactly the leading
+# element of the cycle cell's own step sequence ("+2" in "LB +13% | +2, +3, +2, +6"). Its only
+# unique content is its own CODE, computed from an absolute OI x price matrix while the cycle
+# code is peer-relative -- so the two share the LB/SB/SC/LU vocabulary and the colour scheme
+# but disagree on 31-35% of names where both are directional (LU beside SC, orange beside
+# blue, same contract). Showing both doubled the width and invited a comparison that is not
+# valid. The cycle read also flips direction 30.7% of the time against the daily read's 70.7%.
+#
+# OPTIONS -> the 1-DAY read. Here the cycle label is NOT a superset: it counts how the cycle's
+# sessions voted ("Bal | CE Wrt1 PE Wrt2 /6d") and carries neither today's leg verdict nor the
+# PCR level. It is also withheld early in every cycle by upstream's minimum-sessions guard --
+# measured 100% blank on cycle day 1, 66.8% on day 6, 29.5% by day 12. A column that says
+# nothing for the first four sessions of every month is worse than one that always reads.
 COLS = ["Fut Near", "Fut Next", "Opt Near", "Opt Next"]
-_SRC = {"Fut Near": "near_fut_label", "Fut Next": "next_fut_label",
-        "Opt Near": "near_opt_label", "Opt Next": "next_opt_label"}
+_SRC = {"Fut Near": "near_trend_label", "Fut Next": "next_trend_label",
+        "Opt Near": "near_opt_label",   "Opt Next": "next_opt_label"}
 
 # NSE serves ~1 year of date-addressable UDiFF F&O bhavcopy and DCM retains a rolling window;
 # before this there is simply nothing to read, which is a different answer from "no F&O".
@@ -193,24 +225,27 @@ def clear_cache() -> None:
     _breakdown.cache_clear()
 
 
-HELP_FUT = (
-    "**FUTURES positioning** on that expiry's own contract — open interest against price, from "
-    "the NSE F&O bhavcopy (EOD, via Daily_Cash_Market, same read as its sector pages).\n\n"
-    "🟢 **LB** long buildup — price ↑, OI ↑ (new longs)\n"
-    "🔴 **SB** short buildup — price ↓, OI ↑ (new shorts)\n"
-    "🔵 **SC** short covering — price ↑, OI ↓ (shorts buying back)\n"
-    "🟠 **LU** long unwinding — price ↓, OI ↓ (longs leaving)\n"
-    "⚪ flat · **⟳ rolling** = within 3 sessions of the monthly roll, where the OI change is "
-    "mechanical (everyone shifts to the next contract) and means nothing directional.\n\n"
-    "The % is the OI change vs the previous session, same contract.\n\n"
-    "⚠ **NEXT-month % is noisy early in the cycle** — a small OI base prints huge percentages "
-    "off a few lots. Read the sign and the label, not the size.\n\n"
-    "⚠ **EOD, not live.** The bhavcopy publishes after the close, so during a session this is "
-    "YESTERDAY's book beside a live price. The caption above the table says which date.\n\n"
-    "⚠ **CONTEXT ONLY — nothing in the engine reads it.** The nearest things measured in this "
-    "project came back null: CE/PE OI crossover IC ≈ 0, EOD OI walls did not bound next-day "
-    "range better than an ATR band, max pain did not pin (49% vs a 50% coin). "
-    "**—** = the name has no F&O; SEBI's tightened eligibility retired ~60 of this board's names."
+HELP_FUT_CYC = (
+    "**FUTURES positioning across the whole EXPIRY CYCLE** — not one session.\n\n"
+    "`🟢 LB +13% | +2, +3, +2, +6`\n\n"
+    "• **+13%** = cumulative OI change since the last monthly roll, on the SAME contract.\n"
+    "• **| +2, +3, +2, +6** = the last four DAILY steps, so a build still running reads "
+    "differently from one that stalled a week ago.\n"
+    "• **⚠** = TODAY moved AGAINST the cycle build.\n"
+    "• The code is **peer-relative** — ranked against the other ~207 F&O names, not an absolute "
+    "cutoff. The number beside it is raw.\n\n"
+    "🟢 **LB** long buildup (price ↑ OI ↑, new longs) · 🔴 **SB** short buildup "
+    "(price ↓ OI ↑, new shorts) · 🔵 **SC** short covering (price ↑ OI ↓, shorts buying "
+    "back) · 🟠 **LU** long unwinding (price ↓ OI ↓, longs leaving) · ⚪ flat.\n"
+    "**⟳ rolling** = within 3 sessions of the monthly roll, where the OI change is mechanical "
+    "(everyone shifts contract) and means nothing directional.\n\n"
+    "**WHY IT SITS BESIDE THE 1-DAY COLUMN:** upstream measured the daily read flipping "
+    "direction **70.7%** of the time against **30.7%** for this one. Alone the daily column is "
+    "close to noise; together, this is the backdrop and the daily is what moved today.\n\n"
+    "⚠ Blank early in a cycle is DELIBERATE — a contract that has not filled up would print a "
+    "huge percentage off a few lots, so upstream withholds it.\n\n"
+    "⚠ **CONTEXT ONLY.** Tested at every horizon upstream and found under 0.08pp of forward "
+    "information — a description of positioning, not a signal. **—** = no F&O in this name."
 )
 
 HELP_OPT = (
