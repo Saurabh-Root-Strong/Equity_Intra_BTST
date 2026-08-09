@@ -121,6 +121,11 @@ SR_DAILY_LOOKBACK = 180   # ~9 months: long enough to carry a multi-month daily 
 
 # --- regime gate (mandatory; gating revives net edge in 4 of 5 recent years) --
 REGIME_MA   = 50      # Nifty > its 50-day MA => risk-on => full size
+# Live gate refuses to answer off an archive staler than this many calendar days.
+# A failed sync otherwise returns a confident True/False from an old window; the
+# archive has 9 gaps longer than 4 days (worst 18). Backtest/replay paths are
+# unaffected -- they look the date up directly.
+REGIME_MAX_STALE_DAYS = 5
 
 # --- direction: LONG ONLY (proven, not a preference) --------------------------
 # The overnight equity drift is structurally long-biased. The mirror-image SHORT

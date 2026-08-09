@@ -307,7 +307,7 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
     # regime flips on ~6.7% of sessions and ~7.5% of validated signals land on a flip,
     # i.e. exactly at the turns where the gate earns its keep.
     if date is None and nifty.get("lp"):
-        risk_on = regime.is_risk_on_live(nifty.get("lp"))
+        risk_on = regime.is_risk_on_live(nifty.get("lp"), max_stale_days=config.REGIME_MAX_STALE_DAYS)
     # earnings guard: names reporting during the overnight hold can't be a BTST carry
     from . import events
     d0 = (pd.Timestamp(date) if date is not None else data.last_trading_date()).date()
@@ -786,7 +786,7 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
     _nf = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
     idx_ret = _chp(_nf)
     if date is None and _nf.get("lp"):          # gate on TODAY's index, not yesterday's
-        risk_on = regime.is_risk_on_live(_nf.get("lp"))
+        risk_on = regime.is_risk_on_live(_nf.get("lp"), max_stale_days=config.REGIME_MAX_STALE_DAYS)
     # pre-filter: up on the day + closing the daily bar in the upper half
     pre_up, pre_dn = [], []
     for fys, v in q.items():
@@ -1527,7 +1527,7 @@ def universe_mtf_scan(date=None) -> dict:
     _nf = _fetch_quotes([config.NIFTY_FYERS]).get(config.NIFTY_FYERS, {})
     idx_ret = _chp(_nf)
     if date is None and _nf.get("lp"):
-        risk_on = regime.is_risk_on_live(_nf.get("lp"))
+        risk_on = regime.is_risk_on_live(_nf.get("lp"), max_stale_days=config.REGIME_MAX_STALE_DAYS)
 
     # ── PHASE 1: cheap pass over the ONE batch quote — no per-name network here ──
     cand = []
