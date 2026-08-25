@@ -119,7 +119,10 @@ def test_fno_block_is_in_BOTH_column_lists_at_the_same_place():
         f"enriched column lists, found {len(hits)}"
     )
     # and the enriched frame must actually carry them, or the columns render empty
-    assert re.search(r"enr\s*=\s*fno\.annotate\(", src), \
+    # fno.annotate may be WRAPPED by another context annotator (arb.annotate adds the carry
+    # column around the same frame), so match it anywhere on the right-hand side rather than
+    # pinning it to the first call. What must stay true is that `enr` is annotated at all.
+    assert re.search(r"enr\s*=\s*(?:\w+\.annotate\(\s*)*fno\.annotate\(", src), \
         "enriched frame is never annotated -- the four columns would render blank under a filter"
 
 

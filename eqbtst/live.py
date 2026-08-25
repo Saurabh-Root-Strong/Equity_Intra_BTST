@@ -769,6 +769,285 @@ def _trigger_time(sym: str, ref_close: float, ref_avg_vol: float | None = None) 
     return _session_extras(sym, ref_close, ref_avg_vol).get("trigger")
 
 
+# The canonical daily structure enums are TREND_UP/TREND_DOWN/RANGE/BREAKOUT_UP/
+# BREAKOUT_DOWN/CONSOLIDATION. An earlier version of this set said "BREAKDOWN", which
+# is not a value indicators.struct_full ever returns -- it silently matched nothing and
+# dropped every fresh breakdown from the count. struct_full owns the vocabulary;
+# spelling one of its labels from memory is how that happened.
+_BEARISH_D = {"TREND_DOWN", "BREAKOUT_DOWN"}
+
+
+def add_downtrend_age(df: pd.DataFrame, symbols=None, max_back: int = 180) -> pd.DataFrame:
+    """How many SESSIONS the name's DAILY structure has been bearish. Zero broker cost.
+
+    WHY A DURATION AND NOT A CLOCK TIME
+        A short on this board has no moment in the session. `side` comes from
+        synthesize(htf, ltf, ltp) -> side_of(), and SHORT is decided by the HIGHER frame's
+        structure ENUM (TREND_DOWN / BREAKDOWN / COIL). Swept densely across and beyond the
+        box, not one SHORT-yielding combination changes side with price -- `loc` only bites
+        when the higher frame is a RANGE, which never yields SHORT. So the side flips when a
+        BAR CLOSES, not when price ticks, and a price-path replay would have stamped 09:15 on
+        every short every day. (test_columns.py pins that finding.)
+
+        The honest answer to "when did this short happen" is therefore an AGE, and the
+        cleanest frame to measure it on is the DAILY one -- it is what "this name has been in
+        a downtrend for three weeks" actually means.
+
+    WHY THE DAILY FRAME AND NOT THE TAB'S OWN 1h/4h
+        Cost and reach. _daily_hist() is ONE archive read per day, already warmed for the
+        1D/1W structure reads and already back-adjusted for splits and bonuses, so this adds
+        no network call at all and works with a dead broker token. The tab's own frames would
+        need per-name broker history and the ~60-day intraday limit truncates exactly the
+        names that have been bearish longest -- the ones the column is most useful for.
+        The trade-off is stated in the column's tooltip: it is a DAILY read beside an
+        intraday tab.
+
+    Returns `dn_age` (int sessions, NaN when not bearish or not computable). Never raises:
+    a missing name simply gets NaN.
+    """
+    if df is None or df.empty or "symbol" not in df.columns:
+        return df
+    out = df.copy()
+    if "dn_age" not in out.columns:
+        out["dn_age"] = np.nan
+    want = [x for x in (symbols if symbols is not None else out["symbol"]) if isinstance(x, str)]
+    want = [x for x in dict.fromkeys(want) if x in set(out["symbol"])]
+    if not want:
+        return out
+    try:
+        hist = _daily_hist()
+    except Exception:                                    # noqa: BLE001
+        return out
+    if not hist:
+        return out
+
+    lb = config.LOOKBACK
+
+    def _age(sym: str):
+        g = hist.get(sym)
+        if g is None or len(g) < lb + 2:
+            return np.nan
+        # Walk back one session at a time, relabelling the trailing window each step, and
+        # count consecutive bearish closes. Capped so a name bearish for years costs a
+        # bounded amount of work -- the cap is reported as ">N" by the caller, not as a
+        # smaller number, so it can never UNDERSTATE the age silently.
+        n = 0
+        for k in range(min(max_back, len(g) - lb)):
+            w = g.iloc[len(g) - lb - k:len(g) - k]
+            try:
+                st_ = indicators.struct_full(w)["struct"]
+            except Exception:                            # noqa: BLE001
+                break
+            if st_ not in _BEARISH_D:
+                break
+            n += 1
+        return float(n) if n else np.nan
+
+    ages = {s_: _age(s_) for s_ in want}
+    got = out["symbol"].map(ages)
+    out["dn_age"] = pd.to_numeric(out["dn_age"].where(got.isna(), got), errors="coerce")
+    return out
+
+
+def add_short_entry_times(df: pd.DataFrame, htf: str, ltf: str, symbols=None) -> pd.DataFrame:
+    """`entered` for the SHORT tab: the bar TODAY at which the name became a SHORT.
+
+    WHY IT CANNOT REUSE add_trigger_times
+        That one marks the ACCUMULATION footprint (day_ret >= RET_TH, close-in-range,
+        close above VWAP, RS, volume on pace). Every leg is long-directional, so it is None
+        on a short by construction -- which is why the column was blank there.
+
+    WHY IT IS NOT A PRICE REPLAY EITHER
+        A first attempt replayed today's 5m closes through synthesize() with the boxes held
+        fixed. That is wrong for most names: swept over the six real structure enums, the
+        large majority of SHORT-yielding combinations are SHORT at EVERY price, because the
+        side is decided by the higher frame's structure ENUM. Only a RANGE/CONSOLIDATION
+        higher frame under a BREAKOUT_DOWN lower frame actually moves with price. Holding the
+        boxes fixed would therefore have stamped the first bar of the session on nearly every
+        short -- a fake 09:15.
+
+    WHAT IT ACTUALLY DOES
+        Recomputes the STRUCTURE ITSELF at each of today's lower-frame bar closes -- resample
+        the 15m series to htf/ltf, run struct_full over the trailing window ENDING AT THAT
+        BAR, synthesize, side_of -- and returns the first bar of today whose verdict is
+        SHORT. That is the same pipeline the live board runs, evaluated at past bars.
+
+        Resolution is one LOWER-FRAME bar (typically 1h), not 5 minutes, because the side
+        cannot change between bar closes for the structure-driven majority.
+
+        None when the name was ALREADY short at today's first bar -- the flip predates today,
+        and `dn age` carries that duration instead. None is the honest answer there; a time
+        would be inventing one.
+
+    COST: one 15m fetch per name (60 days, the same call mtf_structure makes) and ~7 pure
+    struct_full evaluations. NEVER RAISES.
+    """
+    if df is None or df.empty or "symbol" not in df.columns:
+        return df
+    from . import mtf as _mtf_mod
+    out = df.copy()
+    if "entered" not in out.columns:
+        out["entered"] = None
+    for c in ("at", "since%"):
+        if c not in out.columns:
+            out[c] = np.nan
+    want = [x for x in (symbols if symbols is not None else out["symbol"]) if isinstance(x, str)]
+    want = [x for x in dict.fromkeys(want) if x in set(out["symbol"])]
+    if not want:
+        return out
+    _FREQ = {"1h": "60min", "2h": "120min", "4h": "240min"}
+    lb = config.LOOKBACK
+
+    def _frame(f, tf):
+        return f if tf == "15m" else _resample_ohlcv(f, _FREQ.get(tf, "60min"))
+
+    def _one(sym: str):
+        try:
+            f = fetch_intraday(sym, tf="15m", lookback_days=_MTF_FETCH_DAYS)
+            if f is None or f.empty:
+                return sym, (None, None)
+            f = indicators.adjust_corporate_actions(f)
+            hf, lf = _frame(f, htf), _frame(f, ltf)
+            if hf is None or lf is None or len(lf) < lb + 1 or len(hf) < lb + 1:
+                return sym, (None, None)
+            def _side_at(ts):
+                lw = lf[lf["ts"] <= ts].tail(lb)
+                hw = hf[hf["ts"] <= ts].tail(lb)
+                if len(lw) < 5 or len(hw) < 5:
+                    return None, None
+                sh, sl = indicators.struct_full(hw), indicators.struct_full(lw)
+                px = float(lw["close"].iloc[-1])
+                syn = _mtf_mod.synthesize(
+                    {"struct": sh["struct"], "hi": sh.get("hi"), "lo": sh.get("lo"),
+                     "n": int(sh.get("n", 0))},
+                    {"struct": sl["struct"], "hi": sl.get("hi"), "lo": sl.get("lo"),
+                     "n": int(sl.get("n", 0))}, px)
+                return _mtf_mod.side_of(syn["tag"], syn.get("dir", "NONE")), px
+
+            today = lf["ts"].dt.date.max()
+            todays = lf[lf["ts"].dt.date == today]
+            prior = lf[lf["ts"].dt.date < today]
+            # THE PREVIOUS SESSION'S CLOSE IS THE BASELINE, not "was it short at 09:15".
+            # Those are different questions and conflating them loses the most interesting
+            # case: a name that broke down ON today's opening bar is short at the first bar,
+            # and reporting None for it hides a flip that genuinely happened today. Only a
+            # name that was ALREADY short when yesterday closed has a flip predating today.
+            was_short = False
+            if len(prior):
+                _s, _ = _side_at(prior["ts"].iloc[-1])
+                was_short = _s == "SHORT"
+            if was_short:
+                return sym, (None, None)
+            for ts in todays["ts"]:
+                side, px = _side_at(ts)
+                if side == "SHORT":
+                    return sym, (pd.Timestamp(ts).strftime("%H:%M"), round(px, 2))
+            return sym, (None, None)
+        except Exception:                                # noqa: BLE001
+            return sym, (None, None)
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_SCAN_WORKERS, len(want))) as ex:
+            res = dict(ex.map(_one, want))
+    except Exception:                                    # noqa: BLE001
+        return out
+
+    m = out["symbol"].map(lambda s_: res.get(s_) or (None, None))
+    trg, tpx = m.map(lambda t: t[0]), m.map(lambda t: t[1])
+    out["entered"] = out["entered"].where(trg.isna(), trg)
+    out["at"] = pd.to_numeric(out["at"].where(tpx.isna(), tpx), errors="coerce")
+    if "ltp" in out.columns:
+        _since = [round(100 * (l / p - 1), 2) if (p and l and p > 0) else np.nan
+                  for l, p in zip(out["ltp"], tpx)]
+        out["since%"] = pd.to_numeric(
+            [n if n == n else o for n, o in zip(_since, out["since%"])], errors="coerce")
+    return out
+
+
+def add_trigger_times(df: pd.DataFrame, symbols=None) -> pd.DataFrame:
+    """Attach the CAUSAL footprint trigger (`entered` / `at` / `since%`) to a scan frame.
+
+    WHY THIS IS SEPARATE FROM THE SCAN
+        universe_mtf_scan is STRUCTURE-first and deliberately cheap: one 15m fetch per name,
+        resampled locally. It never evaluates the BTST footprint, so it has no trigger time
+        to report -- which is why the 3-tab universe table shipped with no `entered` column
+        at all while every other board had one.
+
+        The trigger cannot be derived from what that scan already holds. It is a 5-MINUTE
+        resolution wall-clock read (a 4h bar only exists at 09:15/13:15 and could never
+        report a 12:30 trigger), so it needs today's 5m bars -- one more fetch per name.
+
+    WHY IT TAKES A `symbols` SUBSET
+        That fetch is the whole cost. Applied to every scanned name it roughly doubles the
+        scan and pushes into the Fyers rate limit that already produces the "unreadable, not
+        neutral" rows. Applied only to the names that took a SIDE it is ~20-30 fetches.
+        Names with no side have no trade whose start could be timed, so the column would be
+        an em-dash for them anyway.
+
+    COST AND CACHING
+        _session_extras memoises per symbol per 5-minute bucket, so a caller inside a 5s
+        fragment pays this once per bucket, not every tick. Fan-out is bounded by the same
+        _SCAN_WORKERS pool the scan uses.
+
+    NEVER RAISES. A trigger is context on a structure table; a rate-limited fetch must cost
+    you the column, never the board. Missing names simply keep None -> "—" at render.
+    """
+    if df is None or df.empty or "symbol" not in df.columns:
+        return df
+    out = df.copy()
+    want = [s for s in (symbols if symbols is not None else out["symbol"]) if isinstance(s, str)]
+    want = [s for s in dict.fromkeys(want) if s in set(out["symbol"])]
+    # `at` / `since%` seed as float NaN, NOT Python None. A column of None is object dtype,
+    # and any caller that renders without going through the dashboard's _fmt() coercion
+    # prints the literal string "None" in every cell -- which reads as a bug rather than as
+    # "nothing fired". NaN renders blank everywhere. `entered` stays object: _fmt turns it
+    # into the em-dash that says the same thing in a text column.
+    if "entered" not in out.columns:
+        out["entered"] = None
+    for c in ("at", "since%"):
+        if c not in out.columns:
+            out[c] = np.nan
+    if not want:
+        return out
+
+    idx = out.set_index("symbol")
+
+    def _one(sym: str):
+        try:
+            # `_pc` / `_vol_med20` / `_rs_cum9` are carried by universe_mtf_scan precisely
+            # so the footprint can be re-evaluated later without re-deriving them. Falling
+            # back to None keeps this usable on frames that lack them.
+            r = idx.loc[sym]
+            if isinstance(r, pd.DataFrame):        # duplicate symbol -- take the first row
+                r = r.iloc[0]
+            return sym, _session_extras(sym, r.get("_pc"), r.get("_vol_med20"),
+                                        rs_cum9=r.get("_rs_cum9"))
+        except Exception:                          # noqa: BLE001
+            return sym, {}
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_SCAN_WORKERS, len(want))) as ex:
+            res = dict(ex.map(_one, want))
+    except Exception:                              # noqa: BLE001
+        return out
+
+    m = out["symbol"].map(lambda s_: res.get(s_) or {})
+    trg = m.map(lambda d: d.get("trigger"))
+    tpx = m.map(lambda d: d.get("trig_px"))
+    out["entered"] = out["entered"].where(trg.isna(), trg)
+    out["at"] = pd.to_numeric(
+        out["at"].where(tpx.isna(), tpx.map(lambda v: round(v, 2) if v else np.nan)),
+        errors="coerce")
+    if "ltp" in out.columns:
+        _since = [round(100 * (l / p - 1), 2) if (p and l and p > 0) else np.nan
+                  for l, p in zip(out["ltp"], tpx)]
+        out["since%"] = pd.to_numeric(
+            [n if n == n else o for n, o in zip(_since, out["since%"])], errors="coerce")
+    return out
+
+
 def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
     """Timeframe-driven stock list: scan the liquid universe on the chosen bar
     timeframe (1h/2h/15m). Bounded API: ONE batch-quote call pre-filters to the

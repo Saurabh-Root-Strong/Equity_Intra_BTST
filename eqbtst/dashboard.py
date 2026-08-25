@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import config, data, fno, ledger, live, mtf, screen, sector_tilt
+from eqbtst import arb, config, data, fno, ledger, live, mtf, screen, sector_tilt
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
 
@@ -93,9 +93,17 @@ def _fmt(df):
     d = df.copy()
     if "entered" in d.columns:
         d["entered"] = d["entered"].where(d["entered"].notna(), "—")
+    # NULLABLE dtypes, not plain float. `pd.to_numeric` alone leaves numpy NaN, and this
+    # Streamlit renders a NaN cell as the literal string "None" -- the exact thing the
+    # em-dash above exists to prevent, just one column to the right. Reported from a
+    # screenshot: `entered` read "—" while `at` and `since%` beside it read "None".
+    # Float64/Int64 carry pd.NA, which crosses Arrow as a real null and renders BLANK,
+    # while staying numeric so the column still sorts and formats.
     for c in ("at", "since%", "cvwap%", "rsCum%", "est_close", "vol×", "turn₹L", "wt%"):
         if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")   # None -> NaN -> renders blank
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype("Float64")
+    if "dn_age" in d.columns:
+        d["dn_age"] = pd.to_numeric(d["dn_age"], errors="coerce").astype("Int64")
     for c in _STRUCT_COLS:                                 # terse enum -> glyph+word (display only)
         if c not in d.columns:
             continue
@@ -224,6 +232,7 @@ if last is None:
         live.clear_universe_cache()
         sector_tilt.clear_cache()
         fno.clear_cache()
+        arb.clear_cache()
         st.rerun()
     st.stop()
     # st.stop() only raises inside a real script-run context. Imported (tests, tooling) it is
@@ -232,7 +241,8 @@ if last is None:
     # Re-raise so the lock names itself wherever this module is loaded.
     raise RuntimeError(str(_err))
 tf = st.sidebar.radio("Timeframe",
-                      ["BTST (overnight)", "Intraday", "🎬 Replay (practice)"],
+                      ["BTST (overnight)", "Intraday", "🎬 Replay (practice)",
+                       "🧮 Arbitrage"],
                       index=0)
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
@@ -241,6 +251,7 @@ if st.sidebar.button("↻ refresh"):
     live.clear_universe_cache()      # also drop the EOD universe cache (picks up a new sync)
     sector_tilt.clear_cache()        # lru_cache is invisible to st.cache_data.clear()
     fno.clear_cache()
+    arb.clear_cache()
 test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", value=False,
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
@@ -274,6 +285,48 @@ try:
             st.warning("⚠ DECAY — edge underperforming; size forced to 0.")
 except Exception as _e:
     st.sidebar.caption(f"calibration unavailable: {_e}")
+
+
+# ── arbitrage spreads (CONTEXT — nothing here is wired to a decision) ──────────
+# Deliberately NOT a menu of arbitrage strategies. The classic list was triaged against
+# what an Indian retail cash account can execute and what this archive can compute, and
+# almost none of it survives -- cash-and-carry nets ~2.6% annualised after Securities
+# Transaction Tax and physical settlement, the reverse leg needs an overnight cash short
+# India does not offer retail, and ETF-NAV / ADR / convertible / merger arb are either
+# Authorised-Participant-only or have no data here. The reasoning, with the measured
+# numbers behind every claim, lives in the arb.py module docstring. What is left is the
+# CARRY SPREAD, read as a confirmation on the cash footprint rather than traded.
+try:
+    _mk = arb.market(date)
+    with st.sidebar.expander("🧮 Arbitrage spreads (context)", expanded=False):
+        _na = _mk["nifty_ann"]
+        if _na == _na:                       # not NaN
+            _e2 = "🟢" if _na >= 4 else ("🟡" if _na >= 0 else "🔴")
+            st.metric("Cost of carry (Nifty)", f"{_e2} {_na:+.1f}%",
+                      help=arb.HELP_MARKET)
+            st.caption(f"{_mk['pctile']:.0f}th percentile of the last 2 years · "
+                       f"median +6.2% · negative on only 5.8% of sessions")
+        if _mk["roll_med"] == _mk["roll_med"]:
+            st.caption(f"roll (near→next) **{_mk['roll_med']:+.1f}%** — the lending rate. "
+                       f"Measured null as a signal (t +1.5); weather, not forecast.")
+        if _mk["n"]:
+            st.caption(f"⚠️ **{_mk['n_exdiv']} of {_mk['n']}** names carry a likely pending "
+                       f"**ex-dividend** — their overnight gap averages −1.2bps against "
+                       f"+8.4bps for the rest. Flagged in the `carry` column.")
+        if _mk["stale_days"]:
+            st.warning(f"F&O bhavcopy is **{_mk['stale_days']}d** behind "
+                       f"({_mk['asof']:%d %b}) — carry is that stale.")
+        st.caption("✅ in `carry` = top carry quintile — a **tie-breaker, not a trigger**. "
+                   "With the close-strength footprint it measured **+20.9bps** overnight "
+                   "(t +5.9) against **+10.2bps** for close-strength alone. Real ordering, "
+                   "but **no combination clears the 22bps cost floor**. Prefer ✅ among names "
+                   "the engine already picked; never open one because of it. "
+                   "**Nothing here filters the board.**")
+        st.info("📄 Full triage of all 21 classic arbitrages, the per-name carry board and "
+                "the evidence behind these numbers → switch **Timeframe** to "
+                "**🧮 Arbitrage**.")
+except Exception as _e:
+    st.sidebar.caption(f"arbitrage spreads unavailable: {_e}")
 
 
 def render_price_band():
@@ -832,6 +885,32 @@ DELIV_HELP_SHORT = ("DELIVERY % — share of volume taken for delivery, not squa
 # instrument, not by column name. See the block above fno.COLS for why.
 _FNO_HELP = {"Fut Near": fno.HELP_FUT_CYC, "Fut Next": fno.HELP_FUT_CYC,
              "Opt Near": fno.HELP_OPT,     "Opt Next": fno.HELP_OPT}
+# `carry` rides with the F&O block: same instrument (the futures), same status
+# (CONTEXT, wired to no decision). It is a separate module because it is a SPREAD read
+# -- futures against cash -- not a positioning label. See arb.py for the measurement.
+ARB_COLS = {"carry": st.column_config.TextColumn(
+    "carry", width="small", help=arb.HELP_CARRY)}
+# How long the name has been bearish on the DAILY frame, in sessions. Numeric so the tab
+# sorts by it -- "how long has this been broken" is the question you scan a short list with.
+ARB_DN_AGE = st.column_config.NumberColumn(
+    "dn age", width="small", format="%d",
+    help=("**SESSIONS THE DAILY STRUCTURE HAS BEEN BEARISH** (TREND_DOWN or "
+          "BREAKOUT_DOWN), counted back from the last close and stopping at the first "
+          "session that was not.\n\n"
+          "**Why an age and not a clock time.** A short here has no moment in the "
+          "session. The side comes from the higher timeframe’s STRUCTURE, which changes "
+          "when a bar CLOSES — usually days before today — not when price ticks. So there "
+          "is no 09:15 to show; the honest answer is how long it has been in this state.\n\n"
+          "**This is a DAILY read beside an intraday tab**, deliberately: it is free (the "
+          "EOD archive is already loaded and back-adjusted for splits and bonuses), it "
+          "works with a dead broker token, and it reaches past the broker’s ~60-day "
+          "intraday limit — which would truncate exactly the names that have been bearish "
+          "longest.\n\n"
+          "Blank = not currently bearish on the daily frame. That is common and correct: "
+          "this tab reads its side on the 1h/4h frames, so a name can be SHORT there while "
+          "its DAILY structure is still a range.\n\n"
+          "**Not a trade.** This list is *names to AVOID or EXIT, never to short.*"))
+
 FNO_COLS = {
     c: st.column_config.TextColumn(
         c, width="small" if c.startswith("Fut") else "medium", help=_FNO_HELP[c])
@@ -898,6 +977,16 @@ overnight if flagged 🌙 BTST-CARRY — never just because you bought it intrad
 = ATR risk geometry (trade management), **not** a price forecast. `action=EARNINGS` =
 excluded (reports results during the hold).
 """
+
+if tf == "🧮 Arbitrage":
+    # Its own LANE, not a tab inside another board, because it answers a different question
+    # from every other page here: not "what do I trade tonight" but "which of the classic
+    # arbitrages are even real for this account". It renders from EOD only -- no Fyers token,
+    # no live quotes -- so it works when the broker session is dead, and st.stop() keeps the
+    # live lanes from also drawing.
+    arb.render_page(date, st)
+    st.stop()
+    raise SystemExit  # st.stop() is a no-op outside a script-run context (tests, tooling)
 
 if tf == "Intraday":
     st.title("Live Intraday Board  ·  Fyers")
@@ -1543,10 +1632,10 @@ if tf == "Intraday":
         # pushing the delivery and F&O reads toward the right edge. Kept (it confirms the
         # split, and the no-preset table has no tabs) but demoted.
         light_cols = (["symbol", "sector", "sector tilt", "ltp", "day%"]
-                      + (["setup", "deliv trend"] + fno.COLS +
+                      + (["setup", "deliv trend"] + fno.COLS + ["carry"] +
                          ["loc", "at_wall", "sup", "sup_t", "res",
                           "res_t", "headroom", "big_wall", "big_gap"]
-                         if _P else ["deliv trend"] + fno.COLS)
+                         if _P else ["deliv trend"] + fno.COLS + ["carry"])
                       + ["wtd_deliv7", "deliv_vs_100d",
                          "s15m", "s1h", "s2h", "s4h", "s1D", "s1W", "turn₹L", "side"])
 
@@ -1595,7 +1684,7 @@ if tf == "Intraday":
                  f"selection choice that has paid.")
                 + " Raise a **delivery** slider or pick a **structure** to narrow further; "
                   "levels, RSI and a verdict are added on your Lower TF once you filter.")
-            _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS}
+            _cfg = {**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS, **ARB_COLS}
             # NAME THE ACTIVE BASELINE IN THE HEADER. It now moves with the trade horizon, so a
             # bare "deliv trend" would leave the reader guessing which yardstick the % is against
             # — and the answer changes the sign on real names (KALYANKJIL reads +24% on a 15-day
@@ -1620,7 +1709,7 @@ if tf == "Intraday":
             else:
                 st.caption("🧮 " + fno.stale_note(_fmeta))
 
-            def _side_table(df_, note=None, extra_cols=()):
+            def _side_table(df_, note=None, extra_cols=(), timed=False):
                 if df_.empty:
                     st.caption("No name is on this side right now. That is a reading of the "
                                "tape, not an error — in a one-way market one side empties.")
@@ -1628,6 +1717,65 @@ if tf == "Intraday":
                 if note:
                     st.warning(note)
                 _c = list(light_cols)
+                # `entered` ON THE LONG TAB ONLY. universe_mtf_scan is a STRUCTURE scan --
+                # it never evaluates the BTST footprint, so it ships no trigger time and this
+                # table had no `entered` column at all while every other board had one
+                # (reported from a screenshot). The trigger needs today's 5m bars, one fetch
+                # per name, so it is computed per-tab rather than for all ~250 scanned: the
+                # full fan-out trips the same rate limit that already produces the
+                # "unreadable, not neutral" rows.
+                #
+                # NOT ON THE SHORT TAB, and this is not a cost decision -- the column CANNOT
+                # fill there. `entered` is the ACCUMULATION footprint trigger and every leg
+                # is long-directional: day_ret >= RET_TH (+1% UP on the day), close-in-range
+                # >= CLR_TH, close >= CVWAP_TH above session VWAP, cumulative RS > RS_MIN,
+                # volume on pace for VOL_TH x normal. A name the structure calls SHORT is
+                # down on the day, so `day_ret >= +1%` is false at every bar and the trigger
+                # is None by construction. Shipped that way once: three columns of "—" on the
+                # SHORT tab, bought with ~17 network fetches per 5-minute bucket.
+                # There is also nothing to time. The short side's own banner says it: +4.4bps
+                # against a ~22bps round trip, "a weakness screen, not an entry signal". A
+                # short ENTRY time would be timing a trade this board says not to take.
+                if timed == "SHORT":
+                    # `entered` HERE MEANS: the bar TODAY at which this became a SHORT --
+                    # structure recomputed at each of today's lower-frame bar closes and put
+                    # through the same synthesize()/side_of() the live board runs. It is NOT
+                    # the accumulation footprint (that is long-only by construction, which is
+                    # why this column was blank), and it is NOT a fixed-box price replay
+                    # (that stamps a fake 09:15 on the structure-driven majority).
+                    # Blank = the flip predates today; `dn age` carries that duration.
+                    df_ = live.add_short_entry_times(df_, _P["htf"], _P["ltf"],
+                                                    symbols=list(df_["symbol"]))
+                    if "ltp" in _c:
+                        _base = _c.index("ltp")
+                        for _i, _e in enumerate(("entered", "at", "since%")):
+                            if _e in df_.columns and _e not in _c:
+                                _c.insert(_base + _i, _e)
+                    # `dn age` is the COMPANION to that time, not a replacement. Most shorts
+                    # turned before today, so `entered` is legitimately blank for them -- the
+                    # side is decided by the higher frame's structure ENUM, which changes on a
+                    # BAR CLOSE, often days back. The age answers those rows: sessions the
+                    # DAILY structure has been bearish. Free (the EOD archive is already
+                    # warmed for the 1D/1W reads and back-adjusted), works with a dead broker
+                    # token, and reaches past the broker's ~60-day intraday limit, which
+                    # truncates exactly the names that have been bearish longest.
+                    # Together: `entered` = it happened TODAY at HH:MM; `dn age` = it has been
+                    # broken for N sessions. Blank in both = short on the intraday frames only.
+                    df_ = live.add_downtrend_age(df_, symbols=list(df_["symbol"]))
+                    if "ltp" in _c and "dn_age" not in _c:
+                        _c.insert(_c.index("ltp"), "dn_age")
+                elif timed:
+                    df_ = live.add_trigger_times(df_, symbols=list(df_["symbol"]))
+                    # sits immediately BEFORE ltp -- when-then-what. `at`/`since%` ride along
+                    # so the entry price lands next to the live one.
+                    # ANCHOR ONCE. Re-reading _c.index("ltp") inside the loop walks the
+                    # anchor right as each insert shifts it, which lands `at`/`since%` AFTER
+                    # ltp instead of before it.
+                    if "ltp" in _c:
+                        _base = _c.index("ltp")
+                        for _i, _e in enumerate(("entered", "at", "since%")):
+                            if _e in df_.columns and _e not in _c:
+                                _c.insert(_base + _i, _e)
                 for _e in extra_cols:                 # per-side columns (e.g. the short verdict)
                     if _e in df_.columns and _e not in _c:
                         # LANDS WITH THE DELIVERY BLOCK, not beside `side`. It used to sit right
@@ -1637,9 +1785,10 @@ if tf == "Intraday":
                         _anchor = next((c for c in ("deliv_vs_100d", "wtd_deliv7", "side")
                                         if c in _c), None)
                         _c.insert(_c.index(_anchor) + 1 if _anchor else 1, _e)
-                df_ = fno.annotate(_wt(_dw(df_, _ASOF_LIVE, _hz), _ASOF_LIVE), _ASOF_LIVE)
+                df_ = arb.annotate(fno.annotate(_wt(_dw(df_, _ASOF_LIVE, _hz), _ASOF_LIVE), _ASOF_LIVE), _ASOF_LIVE)
                 st.dataframe(_fmt(df_)[_cols(df_, _c)], use_container_width=True,
-                             hide_index=True, column_config=_cfg)
+                             hide_index=True,
+                             column_config={**_cfg, "dn_age": ARB_DN_AGE})
                 # Denominator = the pool the SIDES were split from, not the raw scan. Quoting
                 # the scan made "3 of 243 (1%)" appear under tabs that summed to 106, implying
                 # the split ran over the whole universe when a price band had already cut it.
@@ -1694,19 +1843,19 @@ if tf == "Intraday":
                     with tL:
                         st.caption("Setups pointing UP: an uptrend coiling for continuation, a break "
                                    "at the top of the higher-TF range, or a pullback INTO an uptrend.")
-                        _side_table(_lo, extra_cols=("long_note",))
+                        _side_table(_lo, extra_cols=("long_note",), timed=True)
                     with tS:
                         _cash_ok = mtf.SHORTABLE_IN_CASH.get(preset, False)
                         _edge = mtf.SHORT_EDGE_BPS.get(preset, 0.0)
                         if _cash_ok:
-                            _side_table(_sh, extra_cols=("short_note",), note=(
+                            _side_table(_sh, extra_cols=("short_note",), timed="SHORT", note=(
                                 "⚠ **Intraday only — square off before the close.** Measured on this "
                                 "universe (43,042 down-structure days, 2018–2026): a same-day short "
                                 f"earns **{_edge:+.1f}bps** before the ~22bps round-trip cost. That is "
                                 "the BEST case on this board and it is still under the cost floor — "
                                 "a weakness screen, not an entry signal."))
                         else:
-                            _side_table(_sh, extra_cols=("short_note",), note=(
+                            _side_table(_sh, extra_cols=("short_note",), timed="SHORT", note=(
                                 f"🛑 **This horizon cannot hold a short — twice over.**\n\n"
                                 f"**1. Mechanically:** Indian cash equity has no overnight short — it "
                                 f"must be squared off the SAME DAY. The *{_P['hold']}* hold is "
@@ -1765,7 +1914,7 @@ if tf == "Intraday":
                         _side_table(_no)
                 _side_tabs()
             else:
-                _lt = fno.annotate(_wt(_dw(light, _ASOF_LIVE, _hz), _ASOF_LIVE), _ASOF_LIVE)
+                _lt = arb.annotate(fno.annotate(_wt(_dw(light, _ASOF_LIVE, _hz), _ASOF_LIVE), _ASOF_LIVE), _ASOF_LIVE)
                 st.dataframe(_fmt(_lt)[_cols(_lt, light_cols)], use_container_width=True,
                              hide_index=True, column_config=_cfg)
                 _tally(len(light), sc["n_scanned"], "names",
@@ -1812,7 +1961,7 @@ if tf == "Intraday":
         # The F&O labels are EOD and do not move on a 5s price tick, so they are attached ONCE
         # here rather than inside the refresh fragment -- everything downstream (including
         # live.refresh_prices) inherits them.
-        enr = fno.annotate(enr, _ASOF_LIVE)
+        enr = arb.annotate(fno.annotate(enr, _ASOF_LIVE), _ASOF_LIVE)
         if enr.empty:
             st.info("Matches found, but none could be read on the Lower TF (thin candles). "
                     "Try a coarser Lower TF.")
@@ -1826,7 +1975,7 @@ if tf == "Intraday":
         # to the pre-filter list only, the four columns VANISHED the moment any filter was
         # applied (reported on "Has room"). Any column added to one list must be added to
         # both, or the board silently shows a different shape once you narrow it.
-        _sc = (["setup", "deliv trend"] + fno.COLS +
+        _sc = (["setup", "deliv trend"] + fno.COLS + ["carry"] +
                ["loc", "at_wall", "sup", "sup_t", "res",
                 "res_t", "headroom", "big_wall", "big_gap"]) if _P else []
 
@@ -1842,8 +1991,16 @@ if tf == "Intraday":
             # the table, which for a context column is the same as not existing. The two travel
             # TOGETHER so the badge is never orphaned from the sector it describes: "🔴 UW #19/24"
             # with no sector name beside it is a verdict about nothing you can see.
+            # `entered` LEADS the relocated block. It is declared before `ltp` in both lists,
+            # but this very function used to hop ltp/day%/sector over it -- which left the fire
+            # TIME stranded past the whole S/R block while the price it fired against sat at
+            # column 3. Reported from a screenshot. Reading order is when-then-what: a name
+            # that triggered at 10:55 is a different read from one that triggered at 09:30,
+            # and that question comes BEFORE the price. Rows that never fired show "—", so it
+            # costs one narrow column.
             if "setup" in cols:
-                move = [c for c in ("ltp", "day%", "sector", "sector tilt") if c in cols]
+                move = [c for c in ("entered", "ltp", "day%", "sector", "sector tilt")
+                        if c in cols]
                 cols = [c for c in cols if c not in move]
                 i = cols.index("setup") + 1
                 cols = cols[:i] + move + cols[i:]
@@ -1882,7 +2039,7 @@ if tf == "Intraday":
                 else:
                     lo = _wt(_dw(lo, _ASOF_LIVE, _hz), _ASOF_LIVE, "LONG")
                     st.dataframe(_fmt(lo)[_cols(lo, long_cols)], use_container_width=True,
-                                 hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS})
+                                 hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS, **ARB_COLS})
                     _tally(len(lo), sc["n_scanned"], "names",
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
             with tsh:
@@ -1898,7 +2055,7 @@ if tf == "Intraday":
                     sh = _wt(_dw(sh, _ASOF_LIVE, _hz), _ASOF_LIVE, "SHORT")
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                  hide_index=True,
-                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS, **FNO_COLS})
+                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS, **FNO_COLS, **ARB_COLS})
                     _tally(len(sh), sc["n_scanned"], "names",
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
 
@@ -1954,7 +2111,7 @@ if tf == "Intraday":
         # Annotate ONCE on the parent frame so every sub-table (carry / forming / short)
         # inherits the columns. Attaching per-table is how the structure lane ended up with
         # the block in one list and not the other.
-        bd = fno.annotate(bd, _ASOF_LIVE)
+        bd = arb.annotate(fno.annotate(bd, _ASOF_LIVE), _ASOF_LIVE)
         counts = bd["action"].value_counts().to_dict()
         scounts = bd["sell"].value_counts().to_dict()
         h1, h2, h3, h4 = st.columns(4)
@@ -1970,9 +2127,9 @@ if tf == "Intraday":
         # sector tilt otherwise — the short list carries no delivery read, so the two
         # DCM-sourced context blocks sit together instead.
         buy_cols = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt", "ltp", "est_close", "day%", "clr", "character", "vol×",
-                    "RS%", "rsCum%", "cvwap%", "delivTr"] + fno.COLS + ["turn₹L", "btst", "book", "wt%", "exp_ON", "band_lo", "band_hi",
+                    "RS%", "rsCum%", "cvwap%", "delivTr"] + fno.COLS + ["carry"] + ["turn₹L", "btst", "book", "wt%", "exp_ON", "band_lo", "band_hi",
                     "entry", "stop", "t1", "t2", "risk%", "atr%", "action"]
-        sell_cols = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt"] + fno.COLS + ["ltp", "day%", "clr", "character", "vol×",
+        sell_cols = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt"] + fno.COLS + ["carry"] + ["ltp", "day%", "clr", "character", "vol×",
                      "RS%", "short", "entry", "s_stop", "s_t1", "s_t2", "atr%", "sell"]
         t_buy, t_sell = st.tabs(["🟢 BUY (long — validated overnight edge)",
                                  "🔴 SELL (intraday short — square off same day)"])
@@ -1990,19 +2147,19 @@ if tf == "Intraday":
                            "exit next 09:15–09:30.")
                 carry = _wt(carry, _ASOF_LIVE, "LONG")
                 st.dataframe(_fmt(carry)[_cols(carry, buy_cols)], use_container_width=True, hide_index=True,
-                             column_config={**LIVE_COLS, **FNO_COLS})
+                             column_config={**LIVE_COLS, **FNO_COLS, **ARB_COLS})
             # ⏳ FORMING — watch list, may flip to CARRY near the close
             st.markdown("#### ⏳ FORMING — building (watch)")
             if forming.empty:
                 b = _wt(bd.sort_values("clr", ascending=False).head(10), _ASOF_LIVE, "LONG")
                 st.caption("No footprint building yet — top-10 by close-strength meanwhile:")
                 st.dataframe(_fmt(b)[_cols(b, buy_cols)], use_container_width=True, hide_index=True,
-                             column_config={**LIVE_COLS, **FNO_COLS})
+                             column_config={**LIVE_COLS, **FNO_COLS, **ARB_COLS})
             else:
                 st.caption(f"{len(forming)} building — may flip to 🌙 BTST-CARRY near the close.")
                 forming = _wt(forming, _ASOF_LIVE, "LONG")
                 st.dataframe(_fmt(forming)[_cols(forming, buy_cols)], use_container_width=True, hide_index=True,
-                             column_config={**LIVE_COLS, **FNO_COLS})
+                             column_config={**LIVE_COLS, **FNO_COLS, **ARB_COLS})
         with t_sell:
             st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Holding "
                        "these short OVERNIGHT is proven -EV (net −42bps, win 20% on 8yr — "
@@ -2015,7 +2172,7 @@ if tf == "Intraday":
             else:
                 s = _wt(s, _ASOF_LIVE, "SHORT")
                 st.dataframe(_fmt(s)[_cols(s, sell_cols)], use_container_width=True, hide_index=True,
-                             column_config={**LIVE_COLS, **SELL_COLS, **FNO_COLS})
+                             column_config={**LIVE_COLS, **SELL_COLS, **FNO_COLS, **ARB_COLS})
         st.caption(f"updated {dt.datetime.now():%H:%M:%S} • hover any header for what+why. "
                    "VWAP · RSI7/14 · tone appear in the table when you pick a 1h/2h/15m "
                    "timeframe above.")
@@ -2076,10 +2233,10 @@ if tf == "🎬 Replay (practice)":
         st.info(f"It's **{rtime}** — before the 15:10 window, so names show as ⏳ **FORMING** "
                 "(building). Move the slider to **15:15** to see which flip to 🌙 BTST-CARRY.")
     render_tilt_help()
-    buy_cols = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt"] + fno.COLS + ["ltp", "day%", "structure", "clr", "character",
+    buy_cols = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt"] + fno.COLS + ["carry"] + ["ltp", "day%", "structure", "clr", "character",
                 "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "rsCum%", "cvwap%", "btst", "entry",
                 "stop", "t1", "t2", "atr%", "action"]
-    sell_cols_r = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt"] + fno.COLS + ["ltp", "day%", "structure", "clr", "character",
+    sell_cols_r = ["symbol", "entered", "at", "since%", "time", "sector", "sector tilt"] + fno.COLS + ["carry"] + ["ltp", "day%", "structure", "clr", "character",
                    "vs_vwap%", "rsi7", "rsi14", "tone", "vol×", "RS%", "entry",
                    "s_stop", "s_t1", "s_t2", "atr%", "sell"]
     # THE REPLAY AS-OF IS THE DAY BEFORE, NOT THE REPLAYED DAY. A replay reconstructs a
@@ -2094,7 +2251,7 @@ if tf == "🎬 Replay (practice)":
     # SAME LOOKAHEAD RULE FOR F&O. The bhavcopy for `rdate` publishes AFTER that session's
     # close, so reading it inside a replay of that session is exactly the leak the comment
     # above forbids. Anchor on the prior close; a None as-of yields "—", never rdate.
-    bd = fno.annotate(bd, _asof_replay)
+    bd = arb.annotate(fno.annotate(bd, _asof_replay), _asof_replay)
     rt_long, rt_short = st.tabs(["🟢 LONG (BTST-CARRY / FORMING)", "🔴 SHORT (intraday)"])
     with rt_long:
         long_side = bd[bd["action"].isin(["BTST-CARRY", "FORMING"])]
@@ -2103,7 +2260,7 @@ if tf == "🎬 Replay (practice)":
             long_side = bd.sort_values("clr", ascending=False).head(10)
         long_side = _wt(long_side, _asof_replay, "LONG")
         st.dataframe(_fmt(long_side)[_cols(long_side, buy_cols)], use_container_width=True, hide_index=True,
-                     column_config={**LIVE_COLS, **TF_COLS, **FNO_COLS})
+                     column_config={**LIVE_COLS, **TF_COLS, **FNO_COLS, **ARB_COLS})
         st.caption("Practice: note the FORMING names now, scrub to 15:15, see which held into "
                    "🌙 BTST-CARRY — those were the overnight picks. VWAP/RSI/tone point-in-time.")
     with rt_short:
@@ -2116,7 +2273,7 @@ if tf == "🎬 Replay (practice)":
             sh = _wt(sh, _asof_replay, "SHORT")
             _c = [c for c in sell_cols_r if c in sh.columns]
             st.dataframe(_fmt(sh)[_c], use_container_width=True, hide_index=True,
-                         column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS, **FNO_COLS})
+                         column_config={**LIVE_COLS, **TF_COLS, **SELL_COLS, **FNO_COLS, **ARB_COLS})
     st.stop()
 # ── BTST board ─────────────────────────────────────────────────────────────────
 # Guarded for the same reason as the live panel: the top-of-script check proves the archive
@@ -2261,14 +2418,14 @@ else:
     show["range (74%)"] = show.apply(
         lambda r: f"{r['range_lo']:.1f} – {r['range_hi']:.1f}"
         if pd.notna(r.get("range_lo")) else "—", axis=1)
-    show = fno.annotate(_wt(show, _ASOF_EOD, "LONG"), _ASOF_EOD)
+    show = arb.annotate(fno.annotate(_wt(show, _ASOF_EOD, "LONG"), _ASOF_EOD), _ASOF_EOD)
     cols = (["action", "symbol", "sector", "sector tilt", "entry≈", "band (68%)", "range (74%)",
-             "exp_move%", "clr", "delivTr", "delivTd"] + fno.COLS +
+             "exp_move%", "clr", "delivTr", "delivTd"] + fno.COLS + ["carry"] +
             ["vol×", "day%", ">vwap%", "RS10%", "wt%"])
     cols = _cols(show, cols)
     st.dataframe(show[cols].round(2), use_container_width=True, hide_index=True,
                  column_config={
-                     **FNO_COLS,
+                     **FNO_COLS, **ARB_COLS,
                      "symbol": st.column_config.TextColumn("symbol", pinned=True),
                      "delivTr": st.column_config.NumberColumn(
                          "delivTr", help="TRAILING delivery% (3-day avg through yesterday) — "
