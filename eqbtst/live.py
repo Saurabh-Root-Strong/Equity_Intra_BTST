@@ -605,7 +605,13 @@ def _live_action(pa: dict, day_ret: float, rs_cum, vsurge, risk_on: bool,
 
 
 # ── tier 2: per-symbol deep state (VWAP + RSI) ─────────────────────────────────
-_RES = {"1D": "D", "4h": "240", "2h": "120", "1h": "60", "15m": "15", "5m": "5"}
+_RES = {"1D": "D", "4h": "240", "2h": "120", "1h": "60", "15m": "15", "5m": "5",
+        "10m": "10", "1m": "1"}
+# "1m" and "10m" are the SCALPER lane's frames (eqbtst/scalp.py). Both are native Fyers
+# resolutions -- verified against /history at 375 and 38 candles per session -- so they
+# need no resampling here. NOTE 375 is not divisible by 10, so a 10-minute series ends
+# every session on a FIVE-minute stub; the ">15" guard below deliberately does not fold
+# it, and scalp._resample owns that rule for the frames that lane builds.
 # lookback days per tf — coarse bars = fewer/day, need more days for ATR14/RSI14/structure(20).
 # 4h ≈ 1.5 bars/day → 30d ≈ 45 bars; 2h ≈ 3/day → fine at 15d; intraday minutes plenty at 10d.
 # 1D ≈ 0.68 bars/calendar-day → 300d ≈ 200 bars. NOT more: Fyers rejects a daily range beyond
@@ -1181,6 +1187,26 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
 _REPLAY_CACHE = Path(__file__).resolve().parent.parent / "data" / "replay"
 
 
+_DUPE_NOTE = """The broker returns BYTE-IDENTICAL duplicate candles when range_from == range_to.
+
+Verified on RELIANCE for 2026-08-25: the 15m series came back 50 rows / 25 unique with 24 rows
+exact duplicates of another row; 1m came back 750 / 375; 5m 150 / 75. A multi-day range does
+NOT do it -- only the degenerate single-date form, which is exactly what _fetch_day_candles and
+fetch_intraday_range use, and neither of them de-duplicated.
+
+Nothing about a doubled series looks wrong. The range BOX is unchanged (min and max do not care
+how many times a bar appears), so every structure label still renders and every chart still
+draws -- while every VOLUME figure doubles, and a 20-bar structure window silently covers only
+TEN real bars. Replay has been reading half the history it claimed to."""
+
+
+def _dedupe_candles(f: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate timestamps from a broker candle frame. See _DUPE_NOTE."""
+    if f is None or getattr(f, "empty", True) or "ts" not in getattr(f, "columns", []):
+        return f
+    return f.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
+
+
 def _fetch_day_candles(date, resolution: str = "15") -> pd.DataFrame:
     """All liquid-universe intraday candles for a past trading DATE (long format:
     symbol, ts, ohlcv). Cached to parquet per (date, res) — fetched once, then any
@@ -1203,6 +1229,7 @@ def _fetch_day_candles(date, resolution: str = "15") -> pd.DataFrame:
                 continue
             f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
             f["ts"] = pd.to_datetime(f["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            f = _dedupe_candles(f)      # range_from == range_to doubles every bar -- _DUPE_NOTE
             f["symbol"] = sym
             frames.append(f)
         except Exception:
@@ -1238,6 +1265,7 @@ def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
                 continue
             f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
             f["ts"] = pd.to_datetime(f["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            f = _dedupe_candles(f)      # range_from == range_to doubles every bar -- _DUPE_NOTE
             f["symbol"] = sym
             frames.append(f)
         except Exception:
@@ -2776,7 +2804,7 @@ def fetch_intraday_range(sym: str, date, resolution: str = "15") -> pd.DataFrame
         return pd.DataFrame()
     f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
     f["ts"] = pd.to_datetime(f["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-    return f
+    return _dedupe_candles(f)       # range_from == range_to doubles every bar -- see _DUPE_NOTE
 
 
 def _events_upcoming(d0) -> set:
