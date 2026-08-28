@@ -59,12 +59,33 @@ WHAT IT IS NOT — READ THIS BEFORE YOU TRADE OFF THESE COLUMNS
     3. NEXT-MONTH OI CHANGE IS NOISY EARLY IN THE CYCLE. A contract with a small base can print
        +143% off a handful of lots. Read the SIGN and the label, not the magnitude.
     4. A BLANK IS UPSTREAM WITHHOLDING, NOT A GAP. Rather than print a large percentage off a
-       handful of lots, upstream refuses to label a contract that has not filled up. On the
-       futures cycle columns this is rare (0.0% near, 0.5% next); it is the reason the options
-       CYCLE read is not carried at all (100% blank on cycle day 1, 66.8% on day 6).
+       handful of lots, upstream refuses to label a contract that has not filled up. It is
+       also the reason the options CYCLE read is not carried at all (100% blank on cycle
+       day 1, 66.8% on day 6).
+       THIS IS NOT RARE, AND AN EARLIER VERSION OF THIS NOTE UNDERSTATED IT BADLY by
+       quoting the MID-CYCLE rate (0.0% near, 0.5% next) as though it held all month. Three
+       guards blank these columns and they stack around the monthly roll:
+         * cycle day 0        the cumulative has no anchor yet -- 100% of names, all expiries
+         * pre-expiry (3d)    the near contract is being closed out market-wide -- near only
+         * fill-up guard      the next contract is still ramping -- next only, and it ratchets
+                              through the cycle (measured Aug-2026: 0% -> 13% -> 33% -> 100%)
+       Net: FUT NEAR IS BLANK FOR 5 CONSECUTIVE SESSIONS PER CYCLE (~25% of all sessions) and
+       FUT NEXT FOR ROUGHLY 8-10 (~45%). Measured across the Jul and Aug 2026 cycles, both of
+       which show the identical shape. The columns recover in full on cycle day 1.
+       A "-" here is the engine declining to make a claim, and around the roll that is the
+       CORRECT state -- see note 7.
     5. STILL NO MEASURED FORWARD INFORMATION. Upstream tested the cycle read at every horizon
        and found under 0.08pp. It DESCRIBES positioning; it does not predict.
-    6. ONLY 208 OF THE ~268 NAMES ON THIS BOARD HAVE F&O AT ALL. SEBI's tightened eligibility
+    7. THE BLANK IS THE SAFE STATE; THE FIRST POPULATED DAY IS THE ONE TO DISTRUST. On
+       2026-08-27 -- cycle day 1, the session these columns come back -- the archive held a
+       corrupt F&O ingest: futures OI 98.6% below the prior session, traded contracts 207x
+       above it, prices correct so nothing looked wrong. Every upstream guard passed it,
+       because the cycle read is PEER-RELATIVE: when a whole session is wrong every name is
+       wrong by the same amount, so nothing is an outlier. It rendered at stale_days=0,
+       "same session as the board". Upstream now refuses such a session at the write
+       (FUTSTK OI outside [0.33, 3.0]x the previous session), but the lesson stands: these
+       columns fail LOUDLY as a dash and QUIETLY as a number.
+    8. ONLY 208 OF THE ~268 NAMES ON THIS BOARD HAVE F&O AT ALL. SEBI's tightened eligibility
        phased many out (ACC's last futures bar was 2025-07-31, BATAINDIA's 2025-02-27). A "—"
        is a correct answer, not a gap in the data.
 """
