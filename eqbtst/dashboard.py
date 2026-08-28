@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import arb, config, data, fno, ledger, live, mtf, screen, sector_tilt
+from eqbtst import (arb, config, data, fno, ledger, live, mtf, scalp, screen,
+                    sector_tilt)
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
 
@@ -233,6 +234,7 @@ if last is None:
         sector_tilt.clear_cache()
         fno.clear_cache()
         arb.clear_cache()
+        scalp.clear_cache()
         st.rerun()
     st.stop()
     # st.stop() only raises inside a real script-run context. Imported (tests, tooling) it is
@@ -252,6 +254,7 @@ if st.sidebar.button("↻ refresh"):
     sector_tilt.clear_cache()        # lru_cache is invisible to st.cache_data.clear()
     fno.clear_cache()
     arb.clear_cache()
+    scalp.clear_cache()
 test_mode = st.sidebar.checkbox("🧪 Test mode (show live board off-hours)", value=False,
                                 help="Bypass the market-closed gate so you can exercise the "
                                      "UI now. Off-hours Fyers data is UNRELIABLE (indicative "
@@ -1039,7 +1042,36 @@ if tf == "Intraday":
 
     # ---- STRUCTURE-FIRST scan: full liquid universe, narrowed by the HTF/LTF filter ----
     if view == "🔬 Structure scan":
-        st.caption(
+        # ── SCALPER MODE ────────────────────────────────────────────────────────────────
+        # Top-right of this lane, above everything it changes. It is a LANE SWITCH, not a
+        # fifth horizon preset, and it deliberately sits ABOVE the horizon dropdown rather
+        # than beside the table: a control that reorders the widgets rendered above it reads
+        # as a glitch, and scalper mode replaces the whole control block, not just the frames.
+        #
+        # WHY IT CANNOT BE A PRESET. At a five-minute hold the delivery columns, the F&O
+        # block and `carry` all describe end-of-day or overnight state that cannot change
+        # inside the trade, and every one of them costs an archive read. See eqbtst/scalp.py.
+        _hd, _tg = st.columns([3, 1])
+        _scalper = _tg.toggle(
+            "⚡ **Scalper Mode**", value=False, key="scalper_mode",
+            help=("Switch this lane to a **1-minute trigger inside a 5-minute box**, for a "
+                  "1-5 minute hold (10 at the outside).\n\n"
+                  "**What changes:** the delivery, F&O positioning, `carry` and sector-tilt "
+                  "columns all disappear -- every one is an end-of-day or multi-week number "
+                  "that cannot move inside a five-minute trade. They are replaced by expected "
+                  "5-minute movement, YOUR round-trip cost, and whether the first can pay for "
+                  "the second.\n\n"
+                  "**The cost floor also changes**, and in your favour: an intraday square-off "
+                  "pays ~5-12bps, not the 22bps delivery figure the rest of this board uses "
+                  "(delivery STT is 0.1% on BOTH legs; intraday is 0.025% on the sell leg "
+                  "only).\n\n"
+                  "⚠ It is a **VETO, not a trigger**. Direction over five minutes measured "
+                  "46.2% up across 457k observations -- the board will not give you a side."))
+        if _scalper:
+            scalp.render_page(st)
+            st.stop()
+            raise SystemExit   # st.stop() is a no-op outside a script-run context
+        _hd.caption(
             "**Structure-first.** The **entire F&O universe** appears — **no 1-day-bar pre-screen, "
             "no turnover floor** (the price band above still applies). Set a **Higher-TF** and/or "
             "**Lower-TF** structure (and/or a delivery slider) below; only names where the filters "
