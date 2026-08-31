@@ -518,6 +518,54 @@ def quotes_board(date: pd.Timestamp | None = None) -> dict:
             "market_open": market_open()}
 
 
+# ── headline index strip (board header) ───────────────────────────────────────────────
+# THE SYMBOL STRINGS ARE VERIFIED, NOT GUESSED, and that is not pedantry: Fyers does NOT
+# error on a wrong index name. NSE:BANKNIFTY-INDEX and NSE:NIFTYFINSERVICE-INDEX -- the two
+# spellings a reader would reach for first -- both return a row with lp=None rather than a
+# 404, so a guessed name ships as a blank cell that looks exactly like "market closed".
+# Checked live 2026-08-31: the three below returned 24080.4 / 58024.95 / 26293.65.
+INDEX_STRIP: tuple = (
+    ("NIFTY 50",          "NSE:NIFTY50-INDEX"),
+    ("NIFTY BANK",        "NSE:NIFTYBANK-INDEX"),
+    ("NIFTY FIN SERVICE", "NSE:FINNIFTY-INDEX"),
+)
+
+_IDX_CACHE: dict = {}
+
+
+def index_quotes() -> tuple[list[dict], str | None]:
+    """([{name, lp, chp}], HH:MM:SS taken) for the header strip. NEVER raises.
+
+    ONE batched /quotes call for all three (_fetch_quotes chunks at 50), so this costs the
+    same as the single Nifty quote the regime read already makes.
+
+    MEMOISED ON A CLOCK BUCKET, and the bucket WIDENS WHEN THE MARKET IS SHUT: the strip
+    lives in a 5s fragment, and off-hours those quotes are the same indicative junk the
+    TEST MODE banner warns about -- refetching them twelve times a minute buys nothing and
+    spends the /quotes budget. 5s live, 60s closed.
+    """
+    ttl = 5 if market_open() else 60
+    key = int(time.time() // ttl)
+    hit = _IDX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    _IDX_CACHE.clear()                     # single-entry: the previous bucket is dead weight
+    try:
+        q = _fetch_quotes([sym for _, sym in INDEX_STRIP])
+    except Exception:                      # noqa: BLE001 -- a header must never kill the page
+        q = {}
+    rows = []
+    for name, sym in INDEX_STRIP:
+        v = q.get(sym) or {}
+        lp, chp = v.get("lp"), v.get("chp")
+        rows.append({"name": name,
+                     "lp": float(lp) if lp is not None else None,
+                     "chp": float(chp) if chp is not None else None})
+    out = (rows, dt.datetime.now().strftime("%H:%M:%S") if any(r["lp"] for r in rows) else None)
+    _IDX_CACHE[key] = out
+    return out
+
+
 def _chp(v: dict):
     return float(v["chp"]) if v and v.get("chp") is not None else None
 

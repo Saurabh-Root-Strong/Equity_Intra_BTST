@@ -1017,6 +1017,37 @@ if tf == "Intraday":
         st.warning("🧪 **TEST MODE** — market is closed; data below is UNRELIABLE off-hours "
                    "Fyers (indicative prices, junk volume). Layout/flow testing only.")
 
+    # ── HEADLINE INDEX STRIP ──────────────────────────────────────────────────────────
+    # Deliberately AFTER the token and market-closed gates, not under the title: both of
+    # those st.stop() the page, so rendering above them would put three blank tiles on a
+    # screen whose actual problem is a dead token -- an unreadable quote and an unusable
+    # session would look identical.
+    #
+    # ITS OWN 5s FRAGMENT so the prices stay live without re-running the whole page (a full
+    # rerun re-scans the universe). live.index_quotes() widens its own memo to 60s when the
+    # market is shut, so this does not spend the /quotes budget on off-hours junk.
+    #
+    # INTRADAY LANE ONLY, on purpose. BTST and Arbitrage are EOD engines that are documented
+    # to work with a dead broker session; hanging live quotes off them would break that. And
+    # Replay must never see a live price at all -- that is a lookahead, and sealing the
+    # future is the entire point of that lane.
+    @st.fragment(run_every="5s")
+    def _render_index_strip():
+        rows, stamp = live.index_quotes()
+        for col, r in zip(st.columns(len(rows)), rows):
+            if r["lp"] is None:
+                # A MISSING QUOTE IS SAID OUT LOUD. Fyers returns lp=None for an unknown
+                # index name rather than erroring, so a silent blank here would read as
+                # "market closed" when it actually means the symbol is wrong.
+                col.metric(r["name"], "—", help="Quote unavailable for this index right now.")
+            else:
+                col.metric(r["name"], f"{r['lp']:,.2f}",
+                           None if r["chp"] is None else f"{r['chp']:+.2f}%")
+        if stamp:
+            st.caption(f"indices {stamp}" + ("" if live.market_open() else
+                                             " · off-hours indicative, not a real print"))
+    _render_index_strip()
+
     render_price_band()          # shared by BOTH lanes (structure scan + live snapshot)
     # ── VIEW TOGGLE — the old "Timeframe → stock list" dropdown is gone. Two lanes:
     #    • Live snapshot  = the validated 5s BTST accumulation board (unchanged, falls through).
