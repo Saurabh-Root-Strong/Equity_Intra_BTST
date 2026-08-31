@@ -96,3 +96,18 @@ def test_badge_survives_a_frame_without_the_column():
     """An older cached frame predating this feature must not crash the column."""
     row = pd.Series({"tilt": "OVERWEIGHT", "rank_pos": 1, "n_sectors": 24})
     assert "Days" not in ST.badge(row, "LONG")
+
+
+# ── regressions found in the post-ship audit ──────────────────────────────────────────
+def test_a_non_trading_as_of_returns_nothing_not_the_previous_session():
+    """`_tilt_cached` slices the as-of row out of the tenure history. That slice must be
+    the REQUESTED date: on a Sunday the history's last row is Friday's, and returning it
+    would answer a question nobody asked, stamped with a date it does not describe
+    (meta["as_of"] carries the requested key). The single-date engine it replaced returned
+    empty here, which is what makes the board print "— tilt unavailable".
+    """
+    import pandas as pd
+    for weekend in ("2026-08-29", "2026-08-30"):        # Sat, Sun
+        df, meta = ST.sector_tilt(weekend)
+        assert df.empty, f"{weekend} is not a session; it must not borrow Friday's tilt"
+        assert meta["available"] is False

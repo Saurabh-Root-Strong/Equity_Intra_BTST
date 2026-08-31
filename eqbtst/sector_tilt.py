@@ -217,8 +217,25 @@ def _sector_panel(start: str, end: str) -> pd.DataFrame:
     """Daily sector return weighted by PRIOR-SESSION turnover, + delivery ₹-value.
 
     LAG() runs over the UNFILTERED per-symbol series so the weight is that stock's own previous
-    session, then the liquidity screen is applied to the CURRENT day — matching DCM exactly. The
+    session, and the liquidity screen is applied to THAT LAGGED VALUE — matching DCM. The
     delivery ₹-value leg keeps same-day turnover (it is a level, not a weighted return).
+
+    TWO FIXES THAT BROUGHT THIS BACK IN LINE WITH UPSTREAM (both were live drift, and this
+    docstring previously asserted the opposite of the first one):
+
+    1. THE FILTER IS ON w_lag, NOT SAME-DAY turnover_lacs. A same-day floor admits a stock
+       BECAUSE it moved that day — the weight was already lagged for exactly this reason
+       while the FILTER was left same-day. Upstream measured the outcome-conditioning:
+       mean daily return of the same-day-filtered universe +0.223%/day at the 1 Cr floor
+       versus +0.072%/day when the same floor is applied to the prior session.
+
+    2. CORPORATE ACTIONS ARE DROPPED, NOT CLIPPED (ABS(raw_r) < 40). Winsorizing a 1:1
+       bonus (raw ~ -50%) turns it into a -25% print indistinguishable from a real crash,
+       which then sits inside every 10-bar window it touches. NSE price bands make a
+       genuine >40% cash move impossible, so this is a corporate-action filter, not a
+       return filter. MEASURED on the window ending 2026-08-28: KIRLPNU -50.5% and
+       TDPOWERSYS -49.2% (both Capital Goods) and GOODLUCK -65.9% (Metals & Mining) —
+       exactly the two sectors whose rs_2w had drifted furthest from DCM.
     """
     ph = ",".join("?" * len(_SERIES))
     xh = ",".join("?" * len(_EXCLUDE_SECTORS))
@@ -233,6 +250,10 @@ def _sector_panel(start: str, end: str) -> pd.DataFrame:
                    -- to ~+1.0%/12d, and KEPT it through the revert to the short blend.
                    LEAST(GREATEST((b.close_price - b.prev_close)
                                   / NULLIF(b.prev_close, 0) * 100, -25), 25)      AS r,
+                   -- raw move kept UNCLIPPED so a corporate action can be DROPPED below
+                   -- rather than clipped into a fake crash. See the docstring.
+                   (b.close_price - b.prev_close)
+                       / NULLIF(b.prev_close, 0) * 100                            AS raw_r,
                    LAG(b.turnover_lacs) OVER (PARTITION BY b.symbol
                                               ORDER BY b.trade_date)              AS w_lag
             FROM daily_data b
@@ -246,7 +267,7 @@ def _sector_panel(start: str, end: str) -> pd.DataFrame:
                SUM(w_lag * r) / NULLIF(SUM(CASE WHEN r IS NOT NULL
                                            THEN w_lag END), 0)               AS wtd_ret_pct
         FROM base
-        WHERE turnover_lacs >= ? AND w_lag IS NOT NULL
+        WHERE w_lag >= ? AND ABS(raw_r) < 40
           AND trade_date >= ?
         GROUP BY sector, trade_date
         ORDER BY sector, trade_date
@@ -260,20 +281,34 @@ def _sector_panel(start: str, end: str) -> pd.DataFrame:
 
 
 def _liquid_counts(start: str, end: str) -> pd.DataFrame:
-    """Liquid constituent count per (sector, date) → the `thin` flag."""
+    """Liquid constituent count per (sector, date) → the `thin` flag.
+
+    Judged on the PRIOR session, like every other universe rule here. A same-day floor
+    counts a stock as liquid on the day it spiked, which inflates n_liq on volatile days
+    and makes the thin flag flicker with the news. The LAG needs a lead-in, so the window
+    is opened _LAG_LEADIN_DAYS earlier and the extra rows are dropped after ranking.
+    """
     ph = ",".join("?" * len(_SERIES))
     xh = ",".join("?" * len(_EXCLUDE_SECTORS))
+    lead = (pd.Timestamp(start) - pd.Timedelta(days=_LAG_LEADIN_DAYS)).strftime("%Y-%m-%d")
     sql = f"""
-        SELECT s.sector, b.trade_date, COUNT(*) AS n_liq
-        FROM daily_data b
-        INNER JOIN v_sector_master s ON b.symbol = s.symbol
-        WHERE b.series IN ({ph})
-          AND s.sector NOT IN ({xh})
-          AND b.turnover_lacs >= ?
-          AND b.trade_date >= ? AND b.trade_date <= ?
-        GROUP BY s.sector, b.trade_date
+        WITH liq AS (
+            SELECT b.symbol, b.trade_date,
+                   LAG(b.turnover_lacs) OVER (PARTITION BY b.symbol
+                                              ORDER BY b.trade_date) AS w_lag
+            FROM daily_data b
+            WHERE b.series IN ({ph})
+              AND b.trade_date >= ? AND b.trade_date <= ?
+        )
+        SELECT s.sector, liq.trade_date, COUNT(*) AS n_liq
+        FROM liq
+        INNER JOIN v_sector_master s ON liq.symbol = s.symbol
+        WHERE s.sector NOT IN ({xh})
+          AND liq.w_lag >= ?
+          AND liq.trade_date >= ?
+        GROUP BY s.sector, liq.trade_date
     """
-    params = [*_SERIES, *_EXCLUDE_SECTORS, TILT_MIN_TURNOVER_LACS, start, end]
+    params = [*_SERIES, lead, end, *_EXCLUDE_SECTORS, TILT_MIN_TURNOVER_LACS, start]
     with data._connect() as c:
         df = c.execute(sql, params).df()
     if not df.empty:
@@ -831,7 +866,15 @@ def _tilt_cached(as_of_key: str) -> pd.DataFrame:
     h = _tilt_hist_cached(as_of_key)
     if h is None or h.empty:
         return pd.DataFrame(columns=_COLS)
-    return h[h["trade_date"] == h["trade_date"].max()].reset_index(drop=True)
+    last = h["trade_date"].max()
+    # THE AS-OF MUST BE A REAL SESSION. The history runs to `end=as_of_key`, so on a
+    # Sunday its last row is Friday's — returning that would answer a question nobody
+    # asked, stamped with a date it does not describe (`meta["as_of"]` is the REQUESTED
+    # key). The single-date engine this replaced returned EMPTY there, which is what makes
+    # the caller print "— tilt unavailable" instead of a stale verdict. Keep that contract.
+    if pd.Timestamp(last).normalize() != pd.Timestamp(as_of_key).normalize():
+        return pd.DataFrame(columns=_COLS)
+    return h[h["trade_date"] == last].reset_index(drop=True)
 
 
 def clear_cache() -> None:

@@ -67,3 +67,27 @@ def test_second_call_is_served_from_the_memo(monkeypatch):
     live.index_quotes()
     live.index_quotes()
     assert len(calls) == 1        # one batched call, not one per render tick
+
+
+def test_a_zero_price_is_rejected_not_rendered(monkeypatch):
+    """lp <= 0 is not a price. A zero LTP with a -100% change is a known broker failure
+    mode off-hours; rendering it would put "0.00 / -100.00%" in the header as a real
+    print. It must read as absent instead."""
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": 0, "chp": -100.0},
+        "NSE:NIFTYBANK-INDEX": {"lp": 58024.95, "chp": 0.92},
+        "NSE:FINNIFTY-INDEX": {"lp": -1.0, "chp": -100.0},
+    })
+    live._IDX_CACHE.clear()
+    rows, _ = live.index_quotes()
+    assert rows[0]["lp"] is None and rows[0]["chp"] is None
+    assert rows[2]["lp"] is None and rows[2]["chp"] is None
+    assert rows[1]["lp"] == 58024.95          # the good one survives
+
+
+def test_a_non_numeric_price_does_not_raise(monkeypatch):
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": "n/a", "chp": "n/a"}})
+    live._IDX_CACHE.clear()
+    rows, stamp = live.index_quotes()
+    assert all(r["lp"] is None for r in rows) and stamp is None

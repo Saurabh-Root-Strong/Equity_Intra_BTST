@@ -558,10 +558,26 @@ def index_quotes() -> tuple[list[dict], str | None]:
     for name, sym in INDEX_STRIP:
         v = q.get(sym) or {}
         lp, chp = v.get("lp"), v.get("chp")
-        rows.append({"name": name,
-                     "lp": float(lp) if lp is not None else None,
-                     "chp": float(chp) if chp is not None else None})
-    out = (rows, dt.datetime.now().strftime("%H:%M:%S") if any(r["lp"] for r in rows) else None)
+        # lp <= 0 IS NOT A PRICE. An index cannot print zero, and a zero LTP with a -100%
+        # change is a KNOWN broker failure mode off-hours (the same trap catalogued on the
+        # MCX side). Rendering it would put "0.00 / -100.00%" on the header as though it
+        # were a real print -- the worst possible failure for a number people glance at.
+        # Treat it as absent, which the strip already knows how to say.
+        try:
+            lp = float(lp) if lp is not None else None
+        except (TypeError, ValueError):
+            lp = None
+        if lp is not None and lp <= 0:
+            lp, chp = None, None
+        try:
+            chp = float(chp) if chp is not None else None
+        except (TypeError, ValueError):
+            chp = None
+        rows.append({"name": name, "lp": lp, "chp": chp})
+    # `is not None`, NOT truthiness: a legitimate 0.0 would be falsy, and more importantly
+    # the stamp must describe whether a quote ARRIVED, not whether it was non-zero.
+    out = (rows, dt.datetime.now().strftime("%H:%M:%S")
+           if any(r["lp"] is not None for r in rows) else None)
     _IDX_CACHE[key] = out
     return out
 
