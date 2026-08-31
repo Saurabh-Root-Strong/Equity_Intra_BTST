@@ -992,6 +992,12 @@ if tf == "🧮 Arbitrage":
     raise SystemExit  # st.stop() is a no-op outside a script-run context (tests, tooling)
 
 if tf == "Intraday":
+    # The index strip is RESERVED here and FILLED further down. Streamlit renders in
+    # execution order, so a container claims the top of the page now while the code that
+    # fills it still runs after the token and market-closed gates. Rendering it inline up
+    # here instead would put three tiles above an error on a dead token -- the quotes need
+    # the same token the gate is about to reject.
+    _index_slot = st.container()
     st.title("Live Intraday Board  ·  Fyers")
     with st.expander("❓ How to use this board — purpose, the two lanes, where BTST-CARRY is"):
         st.markdown(HELP_INTRADAY)
@@ -1046,7 +1052,8 @@ if tf == "Intraday":
         if stamp:
             st.caption(f"indices {stamp}" + ("" if live.market_open() else
                                              " · off-hours indicative, not a real print"))
-    _render_index_strip()
+    with _index_slot:                      # fills the container reserved above the title
+        _render_index_strip()
 
     render_price_band()          # shared by BOTH lanes (structure scan + live snapshot)
     # ── VIEW TOGGLE — the old "Timeframe → stock list" dropdown is gone. Two lanes:
