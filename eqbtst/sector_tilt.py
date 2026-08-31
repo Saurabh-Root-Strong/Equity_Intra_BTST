@@ -164,6 +164,29 @@ _REG_UNKNOWN = {"reg_state": "UNKNOWN", "reg_verdict": "SELECTIVE", "reg_size_hi
                 "reg_trend_strength": "moderate", "reg_er20": float("nan")}
 
 _PERS_LOOKBACK_CAL = 620  # ~2 trading years, CALENDAR window (matches DCM's SQL)
+# ── tenure ────────────────────────────────────────────────────────────────────────────
+# "How many consecutive sessions has this sector held its current call?" — DCM's
+# `days_in_tilt`, rendered there as "Days -> 3".
+#
+# COMPUTED FROM OUR OWN ENGINE HISTORY, NOT DCM's, AND NOT BY PORTING DCM's REBUILD.
+# Upstream carries a whole second code path for this (_tilt_history + _tenure_days +
+# _liquid_name_counts_hist + get_accum_breadth_history) for one reason: its runtime keeps
+# only the as-of row, so it has to RE-DERIVE the past and cannot reproduce the WATCH and
+# `thin` overlays without extra queries. It therefore SUPPRESSES the UNDERWEIGHT streak
+# whenever the breadth history is unavailable, because measured it ran 5.7% wrong by a
+# median 6 sessions.
+#
+# None of that applies here. `_engine(start, end)` is already a DATE-RANGE panel that
+# models WATCH and thin natively, so the streak is an exact groupby over output we can
+# have for free. MEASURED: one date 1.79s, 97 dates 2.45s -- +0.66s, 1.37x, because the
+# archive reads are range-based already and were being thrown away.
+#
+# SEMANTICS ARE DCM's, deliberately: OVERWEIGHT and UNDERWEIGHT only. NEUTRAL is the
+# RESIDUAL bucket -- every overlay (thin, revert, WATCH) demotes into it -- so a NEUTRAL
+# streak measures "nothing else fired", not a call being held. 0 means NOT ESTABLISHED and
+# MUST render blank, never "0 days".
+_TENURE_LOOKBACK = 90     # sessions walked back; longer streaks render as "90+"
+_TENURE_LEADIN_CAL = 150  # calendar days pulled to cover that many SESSIONS
 _PERS_FWD          = 10   # forward horizon persistence is measured over
 _PERS_MIN_OBS      = 30   # min realized forward windows before a sector's persistence is used
 
@@ -758,11 +781,57 @@ def _engine(start: str, end: str) -> pd.DataFrame:
         ["trade_date", "score"], ascending=[True, False]).reset_index(drop=True)
 
 
+def _tenure_days(hist: pd.DataFrame, current: pd.Series) -> pd.Series:
+    """Consecutive trailing sessions each sector has held its CURRENT tilt.
+
+    OVERWEIGHT / UNDERWEIGHT only — see the note above _TENURE_LOOKBACK. Returns 0 for
+    "not established" (not directional, or no history in the window); callers render 0 as
+    blank. Walks the dates DESCENDING and stops at the first session that is not the
+    current label; a gap (sector absent that day -> NaN) also breaks the streak, because a
+    sector that dropped out of the ranked cross-section did not hold the call through it.
+    """
+    if hist is None or hist.empty:
+        return pd.Series(0, index=current.index, dtype=int)
+    wide = hist.pivot_table(index="trade_date", columns="sector",
+                            values="tilt", aggfunc="last").sort_index()
+    out = {}
+    for sec, cur in current.items():
+        if sec not in wide.columns or cur not in ("OVERWEIGHT", "UNDERWEIGHT"):
+            out[sec] = 0
+            continue
+        n = 0
+        for v in wide[sec].values[::-1]:
+            if v != cur:                   # NaN (not ranked that day) also breaks it
+                break
+            n += 1
+        out[sec] = n
+    return pd.Series(out, dtype=int)
+
+
+@functools.lru_cache(maxsize=4)
+def _tilt_hist_cached(as_of_key: str) -> pd.DataFrame:
+    """The trailing tilt panel behind the tenure badge. Same cache discipline as
+    _tilt_cached: keyed on the as-of DATE, so Replay is safe by construction."""
+    start = (pd.Timestamp(as_of_key)
+             - pd.Timedelta(days=_TENURE_LEADIN_CAL)).strftime("%Y-%m-%d")
+    return _engine(start=start, end=as_of_key)
+
+
 # ── public API ────────────────────────────────────────────────────────────────────────
 @functools.lru_cache(maxsize=4)
 def _tilt_cached(as_of_key: str) -> pd.DataFrame:
-    """One archive read per as-of DATE (not per today()) — Replay-safe by construction."""
-    return _engine(start=as_of_key, end=as_of_key)
+    """One archive read per as-of DATE (not per today()) — Replay-safe by construction.
+
+    SLICED OUT OF THE TENURE HISTORY rather than run as its own single-date engine call.
+    `_engine` is causal — a date's factors read only that date's trailing windows — so the
+    as-of row is bit-identical either way. VERIFIED on 2026-08-28 and 2026-08-21: same 24
+    sectors, labels identical, and score / rank / rank_pos / thin all max-diff 0.
+    Computing it twice cost a second full engine run (5.14s -> 2.45s for the pair).
+    """
+    h = _tilt_hist_cached(as_of_key)
+    if h is None or h.empty:
+        return pd.DataFrame(columns=_COLS)
+    return h[h["trade_date"] == h["trade_date"].max()].reset_index(drop=True)
 
 
 def clear_cache() -> None:
@@ -771,6 +840,7 @@ def clear_cache() -> None:
     sync followed by a full one) would serve the first, incomplete read for the life of the
     process. Mirrors live.clear_universe_cache()."""
     _tilt_cached.cache_clear()
+    _tilt_hist_cached.cache_clear()
 
 
 def sector_tilt(as_of) -> tuple[pd.DataFrame, dict]:
@@ -793,6 +863,16 @@ def sector_tilt(as_of) -> tuple[pd.DataFrame, dict]:
     if df.empty:
         return df, {"as_of": key, "available": False,
                     "error": err or "no ranked sector cross-section for this date"}
+    # TENURE. Never let it break the board: the badge is context, and a failed history
+    # read must cost the streak, not the column. 0 = not established -> renders blank.
+    try:
+        df = df.copy()
+        df["days_in_tilt"] = _tenure_days(
+            _tilt_hist_cached(key), df.set_index("sector")["tilt"]
+        ).reindex(df["sector"]).fillna(0).astype(int).values
+    except Exception:                          # noqa: BLE001
+        df = df.copy()
+        df["days_in_tilt"] = 0
     meta = {
         "as_of": key, "available": True,
         "state": df["reg_state"].iloc[0], "verdict": df["reg_verdict"].iloc[0],
@@ -843,6 +923,15 @@ def badge(row: pd.Series | None, side: str | None = None) -> str:
     pos, n = row.get("rank_pos"), row.get("n_sectors")
     if pd.notna(pos) and pd.notna(n):
         txt += f" #{int(pos)}/{int(n)}"
+    # Tenure sits immediately after the rank, the way DCM prints it. 0 is NOT ESTABLISHED
+    # (NEUTRAL/WATCH, or no history) and renders as nothing at all -- "Days -> 0" would
+    # assert the call was made today, which is the opposite of what 0 means.
+    days = row.get("days_in_tilt")
+    if pd.notna(days) and int(days or 0) > 0:
+        d = int(days)
+        txt += f" · Days → {_TENURE_LOOKBACK}+" if d >= _TENURE_LOOKBACK else f" · Days → {d}"
+        if d == 1:
+            txt += " NEW"
     if side in ("LONG", "SHORT") and tilt in ("OVERWEIGHT", "UNDERWEIGHT"):
         agree = (tilt == "OVERWEIGHT") == (side == "LONG")
         txt += f" · {'with' if agree else 'against'} your {side}"
