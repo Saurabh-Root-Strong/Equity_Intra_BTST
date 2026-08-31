@@ -91,3 +91,64 @@ def test_a_non_numeric_price_does_not_raise(monkeypatch):
     live._IDX_CACHE.clear()
     rows, stamp = live.index_quotes()
     assert all(r["lp"] is None for r in rows) and stamp is None
+
+
+# ── points (`ch`) next to the percent ─────────────────────────────────────────────────
+def test_points_are_derived_from_the_price_that_is_displayed(monkeypatch):
+    """The tile prints lp, so the points must come from lp - prev_close. Deriving keeps
+    the three numbers on the tile arithmetically consistent with each other."""
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": 24080.4, "prev_close_price": 24175.65,
+                              "ch": -95.25, "chp": -0.39},
+    })
+    live._IDX_CACHE.clear()
+    rows, _ = live.index_quotes()
+    assert rows[0]["ch"] == pytest.approx(-95.25)
+    # chp is re-derived too, so it carries full precision rather than the broker's 2dp
+    assert rows[0]["chp"] == pytest.approx((24080.4 / 24175.65 - 1) * 100)
+
+
+def test_a_disagreeing_broker_change_loses_to_the_derived_one(monkeypatch):
+    """If `ch` contradicts lp and prev_close, the version that matches the visible price
+    wins — otherwise the tile shows a move that its own numbers do not support."""
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": 100.0, "prev_close_price": 90.0,
+                              "ch": -999.0, "chp": -999.0},
+    })
+    live._IDX_CACHE.clear()
+    rows, _ = live.index_quotes()
+    assert rows[0]["ch"] == pytest.approx(10.0)
+    assert rows[0]["chp"] == pytest.approx(11.111111, rel=1e-5)
+
+
+def test_a_zero_previous_close_drops_the_move_but_keeps_the_level(monkeypatch):
+    """prev_close is the denominator: at 0 the percent is meaningless (this is how a
+    -100% print appears). The LEVEL is still a real number, so it survives."""
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": 24080.4, "prev_close_price": 0, "ch": 0, "chp": -100.0},
+    })
+    live._IDX_CACHE.clear()
+    rows, _ = live.index_quotes()
+    assert rows[0]["lp"] == pytest.approx(24080.4)
+    assert rows[0]["ch"] is None and rows[0]["chp"] is None
+
+
+def test_points_absent_when_there_is_no_previous_close(monkeypatch):
+    """No prev_close and no broker `ch` — show the percent alone rather than invent one."""
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": 24080.4, "chp": -0.39},
+    })
+    live._IDX_CACHE.clear()
+    rows, _ = live.index_quotes()
+    assert rows[0]["ch"] is None
+    assert rows[0]["chp"] == pytest.approx(-0.39)      # broker value kept as the fallback
+
+
+def test_a_rejected_price_takes_the_points_with_it(monkeypatch):
+    monkeypatch.setattr(live, "_fetch_quotes", lambda syms: {
+        "NSE:NIFTY50-INDEX": {"lp": 0, "prev_close_price": 24175.65, "ch": -24175.65,
+                              "chp": -100.0},
+    })
+    live._IDX_CACHE.clear()
+    rows, _ = live.index_quotes()
+    assert rows[0]["lp"] is None and rows[0]["ch"] is None and rows[0]["chp"] is None

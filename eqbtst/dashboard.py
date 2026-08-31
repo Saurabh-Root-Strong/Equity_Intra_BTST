@@ -1047,8 +1047,17 @@ if tf == "Intraday":
                 # "market closed" when it actually means the symbol is wrong.
                 col.metric(r["name"], "—", help="Quote unavailable for this index right now.")
             else:
-                col.metric(r["name"], f"{r['lp']:,.2f}",
-                           None if r["chp"] is None else f"{r['chp']:+.2f}%")
+                # POINTS then PERCENT: "-95.25 (-0.39%)". The points answer "how far did
+                # it move", which a percent alone does not on an index whose levels differ
+                # by 2.4x across the strip -- +0.92% on BANK is ~530 points, +0.03% on FIN
+                # SERVICE is ~8. Streamlit colours the delta from the leading sign, so the
+                # points must come first for the arrow to match the move.
+                bits = []
+                if r.get("ch") is not None:
+                    bits.append(f"{r['ch']:+,.2f}")
+                if r["chp"] is not None:
+                    bits.append(f"({r['chp']:+.2f}%)" if bits else f"{r['chp']:+.2f}%")
+                col.metric(r["name"], f"{r['lp']:,.2f}", " ".join(bits) or None)
         if stamp:
             st.caption(f"indices {stamp}" + ("" if live.market_open() else
                                              " · off-hours indicative, not a real print"))

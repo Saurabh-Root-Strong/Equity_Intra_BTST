@@ -557,7 +557,8 @@ def index_quotes() -> tuple[list[dict], str | None]:
     rows = []
     for name, sym in INDEX_STRIP:
         v = q.get(sym) or {}
-        lp, chp = v.get("lp"), v.get("chp")
+        lp, chp, ch = v.get("lp"), v.get("chp"), v.get("ch")
+        prev = v.get("prev_close_price")
         # lp <= 0 IS NOT A PRICE. An index cannot print zero, and a zero LTP with a -100%
         # change is a KNOWN broker failure mode off-hours (the same trap catalogued on the
         # MCX side). Rendering it would put "0.00 / -100.00%" on the header as though it
@@ -568,12 +569,31 @@ def index_quotes() -> tuple[list[dict], str | None]:
         except (TypeError, ValueError):
             lp = None
         if lp is not None and lp <= 0:
-            lp, chp = None, None
-        try:
-            chp = float(chp) if chp is not None else None
-        except (TypeError, ValueError):
-            chp = None
-        rows.append({"name": name, "lp": lp, "chp": chp})
+            lp, chp, ch = None, None, None
+        for _n in ("chp", "ch", "prev"):
+            try:
+                _v = {"chp": chp, "ch": ch, "prev": prev}[_n]
+                _v = float(_v) if _v is not None else None
+            except (TypeError, ValueError):
+                _v = None
+            if _n == "chp":
+                chp = _v
+            elif _n == "ch":
+                ch = _v
+            else:
+                prev = _v
+        # PREFER THE DERIVED MOVE over the broker's own `ch`/`chp`. Both agree today
+        # (NIFTY50: lp 24080.4 - prev 24175.65 = -95.25, exactly the quoted `ch`), but the
+        # tile PRINTS lp, so deriving from lp guarantees the points and the percent always
+        # reconcile with the price shown next to them. A quote where they disagree is a
+        # broker glitch, and the version that matches the visible price is the honest one.
+        # prev <= 0 makes both meaningless (it is the denominator) -- drop them, not lp.
+        if lp is not None and prev is not None and prev > 0:
+            ch = lp - prev
+            chp = (lp / prev - 1.0) * 100.0
+        elif prev is not None and prev <= 0:
+            ch, chp = None, None
+        rows.append({"name": name, "lp": lp, "chp": chp, "ch": ch})
     # `is not None`, NOT truthiness: a legitimate 0.0 would be falsy, and more importantly
     # the stamp must describe whether a quote ARRIVED, not whether it was non-zero.
     out = (rows, dt.datetime.now().strftime("%H:%M:%S")
