@@ -138,8 +138,19 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
     df["rs_d"] = (df["close_price"] / df.groupby("symbol")["close_price"].shift(1) - 1) - df["idx_ret"]
     _w = config.RS_LOOKBACK - 1
     g2 = df.groupby("symbol", group_keys=False)["rs_d"]
-    df["rs_cum9"] = g2.transform(lambda s: s.rolling(_w).sum())          # through this row
-    df["rs_cum9_prior"] = g2.transform(lambda s: s.shift(1).rolling(_w).sum())  # excl. this row
+    # ONE MISSING INDEX SESSION MUST NOT DELETE THE WHOLE LEG. index_data and daily_data are
+    # synced separately, and the index side runs a session behind often enough to matter
+    # (caught live 2026-09-04: stocks at 09-04, Nifty at 09-03). A plain rolling(_w).sum()
+    # propagates that single NaN into rs_cum9 for EVERY name, _rs_context then returns None,
+    # and _first_formed drops the RS leg entirely -- so the live footprint quietly ran on four
+    # of its five validated legs. min_periods sums the sessions that exist instead: an 8-of-9
+    # day cumulative is a slightly shorter window, which is a small, honest degradation, where
+    # NaN was a silent change to the signal's definition. Two or more missing sessions still
+    # give NaN, and the staleness check below is what surfaces that.
+    _mp = _w - 1
+    df["rs_cum9"] = g2.transform(lambda s: s.rolling(_w, min_periods=_mp).sum())
+    df["rs_cum9_prior"] = g2.transform(
+        lambda s: s.shift(1).rolling(_w, min_periods=_mp).sum())
     # delivery through the PRIOR row too — replay's "today" IS this row, and today's
     # delivery is not published until ~6pm, so replay must not read it.
     df["deliv_trail_prior"] = df.groupby("symbol")["deliv_per"].transform(
@@ -1735,6 +1746,7 @@ def mtf_structure(sym: str) -> dict:
     out.update({f"{p}{t}": float("inf") for t in _TFS for p in ("hup", "hdn")})
     out.update({f"wall{t}": [] for t in _TFS})
     out.update({f"wallx{t}": [] for t in _TFS})
+    out.update({f"wallk{t}": [] for t in _TFS})
     out.update({f"blind{t}": (float("nan"), float("nan")) for t in _TFS})
     out.update({f"atr{t}": float("nan") for t in _TFS})
 
@@ -1775,6 +1787,10 @@ def mtf_structure(sym: str) -> dict:
         # one-frame-up big-wall check, which is the read that has to name the level a chartist
         # can see. The pair's own sup/res/headroom are unchanged.
         out[f"wallx{tf}"] = sr.get("levels_ext", [])
+        # (level, touches, n_lows, n_highs) -- what BUILT each level. Lets the confluence
+        # read tell a demand SHELF (price turned UP there) from a FLIPPED ceiling, instead
+        # of calling everything under price "support" by position alone.
+        out[f"wallk{tf}"] = sr.get("levels_kind", [])
         out[f"blind{tf}"] = sr.get("blind", (float("nan"), float("nan")))
         out[f"atr{tf}"] = sr.get("atr", float("nan"))
 
@@ -1995,7 +2011,7 @@ def universe_mtf_scan(date=None) -> dict:
             # touch-counted S/R per frame — feeds the level read (add_setup picks the pair)
             **{f"sr_{p}{t}": _mtf.get(f"{p}{t}")
                for t in _TFS for p in ("sup", "supt", "res", "rest", "hup", "hdn", "wall", "atr",
-                                       "wallx", "blind")},
+                                       "wallx", "wallk", "blind")},
             # MONTHLY walls (Positional big-wall only) — carried explicitly, not a full frame
             "sr_wall1M": _mtf.get("wall1M"), "sr_atr1M": _mtf.get("atr1M"),
             "sr_wallx1M": _mtf.get("wallx1M"), "sr_blind1M": _mtf.get("blind1M"),
@@ -2179,6 +2195,49 @@ def drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
 _STALE_CACHE: dict = {}
 
 
+_IDX_STALE_CACHE: dict = {}
+
+
+def index_staleness() -> dict:
+    """Is the INDEX series behind the STOCK series inside the same archive?
+
+    A separate question from archive_staleness(), which asks whether the archive as a whole
+    is behind the market. This asks whether its two halves agree with EACH OTHER -- and they
+    are synced independently, so they drift apart. When they do, every per-stock number that
+    is measured RELATIVE TO THE INDEX loses its newest session: relative strength, the RS leg
+    of the accumulation footprint, and anything else that subtracts an index return.
+
+    It was invisible until it was hunted: rs_cum9 came back NaN for all 249 names and the
+    only symptom on screen was a footprint that had quietly stopped applying one of its five
+    legs. Returns {lag_days, stock_date, index_date, ok}.
+    """
+    from . import data as _data
+    key = dt.date.today()
+    if key in _IDX_STALE_CACHE:
+        return _IDX_STALE_CACHE[key]
+    out = {"ok": False, "lag_days": 0, "stock_date": None, "index_date": None}
+    try:
+        sd = _data.last_trading_date()
+        nf = _data.load_nifty()
+        if nf is None or nf.empty:
+            _IDX_STALE_CACHE[key] = out
+            return out
+        idx = pd.Timestamp(nf["trade_date"].max())
+        # Count SESSIONS the archive itself knows about, not calendar days -- a weekend must
+        # not read as a two-day lag.
+        sessions = _data.load_nifty(start=str(idx.date()))
+        lag = 0
+        if idx < pd.Timestamp(sd):
+            eod = _data.load_eod(start=str(idx.date()))
+            lag = int(eod["trade_date"].nunique() - 1) if not eod.empty else 1
+        out = {"ok": True, "lag_days": max(0, lag),
+               "stock_date": pd.Timestamp(sd), "index_date": idx}
+    except Exception:
+        pass
+    _IDX_STALE_CACHE[key] = out
+    return out
+
+
 def archive_staleness() -> dict:
     """Is the EOD archive behind the market? data.last_trading_date() only returns the
     archive's OWN max date, so it cannot detect its own staleness — it is a mirror, not a
@@ -2263,7 +2322,98 @@ def refresh_light_prices(board: pd.DataFrame) -> pd.DataFrame:
     return b
 
 
-def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
+def _level_arrival(cndl, level_px, atr_v, tf: str, near_atr: float | None = None,
+                   ltp: float | None = None):
+    """(label, price_at_arrival, bars_in_zone) for the CURRENT stay at `level_px`.
+
+    The zone is the same +/- near_atr x ATR band the confluence filter itself uses, so the
+    clock and the flag can never disagree about whether price is "at" the level. A bar counts
+    as in-zone if its RANGE intersects the band -- a wick into the shelf is a test of it, and
+    demanding the CLOSE inside would miss exactly the rejection bars a chartist is watching
+    for.
+
+    Label format follows the frame, because "09:15" is meaningless on a daily trigger: an
+    intraday frame stamps HH:MM (with the date prefixed once the stay crosses a session), a
+    1D/1W frame stamps the date. Returns (None, None, 0) when it cannot be established.
+    """
+    from . import config as _cfg
+    if cndl is None or len(cndl) == 0:
+        return None, None, 0
+    try:
+        lv = float(level_px)
+        a = float(atr_v)
+    except (TypeError, ValueError):
+        return None, None, 0
+    if lv != lv or a != a or a <= 0:
+        return None, None, 0
+    band = (near_atr if near_atr is not None else _cfg.SR_CONF_NEAR_ATR) * a
+    lo, hi = lv - band, lv + band
+    d = cndl.sort_values("ts")
+    # COPY: to_numpy can hand back a read-only view of the frame's buffer, and the last bar
+    # is widened by the live price below. Mutating a view would also be a silent write into
+    # the caller's candle frame -- deep_state's, which other columns are still reading.
+    h = np.array(d["high"].to_numpy(float), dtype=float, copy=True)
+    l = np.array(d["low"].to_numpy(float), dtype=float, copy=True)
+    c = d["close"].to_numpy(float)
+    ts = d["ts"].to_numpy()
+    # THE LAST BAR MUST INCLUDE THE LIVE PRICE, or the clock and the flag are reading two
+    # different prices. The flag fires on `ltp`; these are candle ranges, and the newest one
+    # is still forming (or, off-hours, is a zero-range indicative stub -- measured live at a
+    # 3-11% gap from the quote on WIPRO/GAIL/SUNTV). Widening it by `ltp` is the same rule
+    # refresh_prices already applies to bar_clr, and it makes the two agree by construction.
+    if ltp is not None:
+        try:
+            _p = float(ltp)
+        except (TypeError, ValueError):
+            _p = float("nan")
+        if _p == _p and _p > 0:
+            h[-1] = max(h[-1], _p)
+            l[-1] = min(l[-1], _p)
+    inz = (l <= hi) & (h >= lo)
+    if not inz[-1]:
+        # Defensive: the filter guarantees price is in the band, so this is reachable only
+        # when no live price was supplied. Report the most recent stay if there was one --
+        # a past visit dated honestly beats a bare "just now" that hides the level's history.
+        _prev = np.flatnonzero(inz)
+        if not len(_prev):
+            return "just now", (float(c[-1]) if len(c) else None), 0
+        j = int(_prev[-1])
+        k = j
+        while k > 0 and inz[k - 1]:
+            k -= 1
+        _t = pd.Timestamp(ts[k])
+        # "was" MATTERS. This branch reports a stay that has already ENDED, and printing it
+        # bare would read exactly like a current one -- the column would say price has been on
+        # the shelf since 09:15 when it left at 11:15. A past visit is useful information; a
+        # past visit disguised as a live one is a lie about where price is standing.
+        _lab = f"was {_t:%d-%b}" if tf in ("1D", "1W") else f"was {_t:%d %H:%M}"
+        return _lab, float(c[k]), int(j - k + 1)
+    i = len(inz) - 1
+    while i > 0 and inz[i - 1]:
+        i -= 1
+    t0 = pd.Timestamp(ts[i])
+    bars = len(inz) - i
+    if tf in ("1D", "1W"):
+        lab = f"{t0:%d-%b}"
+    else:
+        lab = f"{t0:%H:%M}" if t0.date() == pd.Timestamp(ts[-1]).date() else f"{t0:%d %H:%M}"
+    return lab, float(c[i]), int(bars)
+
+
+def sd_label(kind: str, role: str) -> str:
+    """What to CALL the level, given what built it. A flipped level is still a floor under a
+    long -- it is just a floor made of an old ceiling -- so the role word stays and the kind
+    qualifies it. Saying 'SUP' for both would be the very conflation this read exists to end."""
+    if kind == "SHELF":
+        return "SUP" if role == "SUP" else "RES"
+    if kind == "FLIP":
+        return "SUP-flip" if role == "SUP" else "RES-flip"
+    return "SUP?" if role == "SUP" else "RES?"
+
+
+def add_setup(board: pd.DataFrame, ltf: str, htf: str,
+              conf_tol_bps: float | None = None,
+              conf_kind: str | None = None) -> pd.DataFrame:
     """Attach the HTFxLTF chartist synthesis to every row: setup tag, quality rank, the
     plain-English read, and `loc` (where the LTP sits inside the higher-TF range box).
 
@@ -2415,26 +2565,141 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str) -> pd.DataFrame:
             big_w.append(""); big_g.append(np.inf); big_px.append(np.nan)
     b["big_wall"], b["big_gap"], b["_big_wall_px"] = big_w, big_g, big_px
 
-    # NO CONFLUENCE FLAG — DELIBERATELY. The sister project's one POSITIVE level result was
-    # pivot-meets-CALL-WALL confluence (+9.8pp, overhead only), and it is tempting to mirror
-    # it here as "a 1h wall sitting on a 4h wall". That mirror is broken, for a reason worth
-    # writing down: those two wall sets are derived from THE SAME PRICE SERIES (4h is a
-    # resample of the same candles as 1h), so a 4h swing high usually IS a 1h swing high.
-    # Agreement between them is close to tautological, not confirmatory.
-    # MEASURED, rather than argued: a 1h/4h "confluence" flag fired on 196 of 197 names at a
-    # 25bps tolerance, and a NULL version — one frame's walls randomly displaced 1-5% —
-    # still fired on 148. Tightening to 10bps and requiring proximity to price gave 70.6%
-    # real vs 31.0% null. A flag that fires on most names, and whose shuffled control also
-    # fires constantly, carries no information; it would have looked like confirmation on
-    # every chart you opened. The validated version worked because OPEN INTEREST is an
-    # INDEPENDENT source from price. Cash equity names here have no chain, so that second
-    # source does not exist, and the honest move is to ship no flag rather than a decorative
-    # one. Touch counts and headroom stay: those are descriptions, not claims.
+    # ── S/R CONFLUENCE — THE SAME LEVEL ON BOTH FRAMES OF THE HORIZON ────────────────────
+    # "Price is resting on a support the 1h shows AND the 4h shows at the same price."
+    #
+    # THIS FLAG DID NOT EXIST FOR A YEAR, AND THE REASON IS STILL TRUE: the two frames are
+    # RESAMPLES OF ONE SERIES (4h is built from the same candles as 1h), so a 4h swing high
+    # usually IS a 1h swing high, and agreement between them is close to tautological. An
+    # ATR-scale tolerance fired on 196 of 197 names, with a displaced-wall NULL still firing
+    # on 148 -- a flag that fires on everything, whose shuffled control also fires on
+    # everything, carries no information.
+    #
+    # What makes it separable is (a) a PRICE-relative tolerance, not an ATR one, and (b) the
+    # requirement that PRICE IS ACTUALLY AT the shared level. Both are validated in
+    # config.SR_CONF_TOL_BPS's note: 43,101 causal observations on the 1D/1W pair, against
+    # the same displaced-wall null and conditioned on a daily level already being underfoot
+    # (so the test is "do the frames AGREE", not "is there a level"). At 25bps it fires on
+    # 8.3% of that control group vs 5.2% for the null, and carries next-day -0.210pp t=-3.68
+    # where the null carries +0.048pp t=+0.64.
+    #
+    # AND THE SIGN IS BACKWARDS TO THE CHARTIST STORY. A support both frames agree on is a
+    # level that BREAKS, not one that bounces: -0.21pp next day, -0.29pp over 5 days,
+    # -0.89pp over 20 days, negative in 8 of 8 years. Overnight it is flat (-0.003pp,
+    # t=-0.13), so it neither helps nor hurts the one validated trade here. The columns are
+    # therefore a CHARTIST SCREEN and a RISK MAP -- where the shelf is, so you can place a
+    # stop under it and size for a break -- never a reason to buy the dip.
+    #
+    # DIRECTION FOLLOWS THE TRADE, exactly like big_wall: a long (and a no-side row) wants a
+    # FLOOR underfoot, a short wants a CEILING overhead. Levels are taken from the pair's own
+    # two frames (NOT the one-frame-up wall -- that is big_wall's separate job), the level is
+    # quoted at the TRIGGER frame's price because that is where the stop goes, and touches are
+    # MAXed across the frames, never summed (one swing seen twice is not two swings).
+    # HOW CLOSE THE TWO FRAMES MUST AGREE is a user control, not a constant: how many
+    # names survive depends entirely on it, and the honest range runs from 'very few and
+    # meaningful' to 'half the board and no better than chance'. config.SR_CONF_MEASURED
+    # carries the measured cost of each setting; the UI prints it beside the slider.
+    _CONF_TOL = float(config.SR_CONF_TOL_BPS if conf_tol_bps is None else conf_tol_bps) / 1e4
+    _CONF_NEAR = float(config.SR_CONF_NEAR_ATR)
+    conf, conf_gap, conf_px, conf_side, conf_kd = [], [], [], [], []
+    for _, r in b.iterrows():
+        px, a = r.get("ltp"), r.get("_sr_atr")
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            px = 0.0
+        a = float(a) if (a is not None and a == a and float(a) > 0) else 0.0
+        wl, wh = r.get(f"sr_wall{ltf}"), r.get(f"sr_wall{htf}")
+        if px <= 0 or a <= 0 or not isinstance(wl, list) or not isinstance(wh, list) \
+                or not wl or not wh:
+            conf.append(""); conf_gap.append(np.inf)
+            conf_px.append(np.nan); conf_side.append(""); conf_kd.append("")
+            continue
+        # WHICH SIDE OF PRICE DOES THIS ROW CARE ABOUT? A long needs a floor under it, a
+        # short a ceiling over it. A row with NO side has no trade to serve, and defaulting it
+        # to "floor" made a third of the feature unreachable: nearly every confluence hit on
+        # this board carries a no-side tag, and 10 of 30 such names on the live board had a
+        # RESISTANCE confluence that could never be displayed. A no-side row therefore takes
+        # whichever side price is actually standing on, and the label says which.
+        _side = str(r.get("side") or "")
+        if _side == "SHORT":
+            sides = [False]                      # ceiling only
+        elif _side == "LONG":
+            sides = [True]                       # floor only
+        else:
+            sides = [True, False]                # no side: report whichever is nearer
+        near, tol = _CONF_NEAR * a, _CONF_TOL * px
+        # PREFER THE KIND-ANNOTATED WALL LIST. sr_wallk carries (level, touches, n_lows,
+        # n_highs) so the read can tell a level price BOUNCED UP FROM (swing lows = a demand
+        # shelf) from an old ceiling price broke above (swing highs = a polarity flip). The
+        # plain sr_wall list has no such memory -- it merges highs and lows and lets position
+        # alone decide the label, which mislabels ~46% of "supports" (see walls_kind). Fall
+        # back to it only for a board built before the kind list existed.
+        kl, kh = r.get(f"sr_wallk{ltf}"), r.get(f"sr_wallk{htf}")
+        _has_kind = isinstance(kl, list) and isinstance(kh, list) and kl and kh
+        if _has_kind:
+            lo_side = [(float(x), int(t), int(nl), int(nh)) for x, t, nl, nh in kl]
+            hi_side = [(float(x), int(t), int(nl), int(nh)) for x, t, nl, nh in kh]
+        else:
+            lo_side = [(float(x), int(t), 0, 0) for x, t in wl]
+            hi_side = [(float(x), int(t), 0, 0) for x, t in wh]
+        best = None
+        for look_dn in sides:
+            role = "SUP" if look_dn else "RES"
+            for x, t, nl, nh in lo_side:
+                gap = (px - x) if look_dn else (x - px)
+                if gap < 0 or gap > near:            # wrong side of price, or too far to be "at it"
+                    continue
+                # THE CONFIRMING LEVEL MUST BE ON THE SAME SIDE OF PRICE. Matching on price
+                # distance alone let a 4h CEILING confirm a 1h FLOOR whenever the two happened to
+                # sit within tolerance across the tape -- two lines that are not the same object,
+                # and whose disagreement is the opposite of confirmation. The candidate is already
+                # known to be on the right side (the gap test above), so requiring the same of the
+                # match is the whole fix. Grows with tolerance if left unguarded: 9% of matches at
+                # 0.50%, 22% at 2.00%.
+                same_side = [z for z in hi_side if ((z[0] <= px) if look_dn else (z[0] >= px))]
+                if not same_side:
+                    continue
+                m = min(same_side, key=lambda z: abs(z[0] - x))
+                if abs(m[0] - x) > tol:              # the higher frame does not have this level
+                    continue
+                # BOTH FRAMES MUST AGREE ON WHAT THE LEVEL IS, NOT ONLY ON ITS PRICE. A 1h swing
+                # low and a 4h swing high at the same rupee are not confirmation of each other --
+                # one is a floor price bounced off, the other a ceiling it was rejected from.
+                k_ltf = indicators.level_kind(nl, nh, role) if _has_kind else "MIXED"
+                k_htf = indicators.level_kind(m[2], m[3], role) if _has_kind else "MIXED"
+                kind = k_ltf if k_ltf == k_htf else "MIXED"
+                if conf_kind and conf_kind != "ANY" and kind != conf_kind:
+                    continue
+                if best is None or gap < best[0]:    # the nearest agreeing level wins
+                    # THE PIVOT SPLIT IS THE TRIGGER FRAME'S OWN, NOT THE SUM. Summing it
+                    # across frames is the same 'one swing seen twice' inflation that touches
+                    # are MAXed to avoid -- and it would print 5 turns on a level with 3,
+                    # contradicting the x3 sitting beside it.
+                    best = (gap, x, max(t, m[1]), kind, nl, nh, role)
+        if best is None:
+            conf.append(""); conf_gap.append(np.inf)
+            conf_px.append(np.nan); conf_side.append(""); conf_kd.append("")
+        else:
+            gap, x, t, kind, n_lo, n_hi, role = best
+            _ICON = {"SHELF": "\U0001f6e1\ufe0f", "FLIP": "\U0001f504", "MIXED": "\u2796"}
+            # Show the pivot split (3\u2193/1\u2191 = three turns up, one turn down) so the row can
+            # be checked against the chart rather than trusted.
+            _split = f" {n_lo}\u2193/{n_hi}\u2191" if _has_kind else ""
+            conf.append(f"\U0001f9f2 {_ICON.get(kind, '')} {sd_label(kind, role)} {x:.2f} "
+                        f"\u00d7{t}{_split} \u00b7 {ltf}+{htf}")
+            conf_gap.append(round(gap / a, 2))
+            conf_px.append(x)                    # so the 5s tick re-derives the gap
+            conf_side.append(role)
+            conf_kd.append(kind)
+    b["sr_conf"], b["conf_gap"] = conf, conf_gap
+    b["_conf_px"], b["_conf_side"] = conf_px, conf_side
+    b["conf_kind"] = conf_kd
     return b
 
 
 def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
-               idx_ret: float = 0.0) -> pd.DataFrame:
+               idx_ret: float = 0.0, conf_entry: bool = False) -> pd.DataFrame:
     """Add levels / RSI / structure / verdict to the FILTERED survivors of universe_mtf_scan.
     The LOWER timeframe (ltf) drives the risk geometry and the read — HTF is the context gate,
     LTF is where you actually time and size the entry. Bounded to the handful the MTF filter
@@ -2468,12 +2733,25 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             _close_t = min(_o + pd.Timedelta(minutes=_tfmin),
                            _o.normalize() + pd.Timedelta("15h30min"))
             forming = dt.datetime.now() < _close_t.to_pydatetime()
+        # THE 🧲 FILTER BRINGS ITS OWN CLOCK. With it on, `entered` answers "when did price
+        # arrive at the level both frames agree on" instead of "when did the footprint fire".
+        # Zero extra network -- deep_state already returned this frame's candles.
+        conf_bars = None
+        if conf_entry:
+            _lab, _apx, _nb = _level_arrival(cndl, r.get("_conf_px"), r.get("_sr_atr"),
+                                             ltf, ltp=ltp)
+            if _lab is not None:
+                entered, at_px, conf_bars = _lab, (round(_apx, 2) if _apx else None), _nb
+                since_pct = (round(100 * (ltp / _apx - 1), 2)
+                             if (_apx and _apx > 0) else None)
+            else:
+                entered, at_px, since_pct = None, None, None
         s_stop = round(ltp + atr_tf, 2) if atr_tf > 0 else None
         s_t1 = round(ltp - atr_tf, 2) if atr_tf > 0 else None
         s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
         return {
             "symbol": sym, "entered": entered, "at": at_px, "since%": since_pct,
-            "time": bar_time,
+            "at_bars": conf_bars, "time": bar_time,
             "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
             "s15m": r["s15m"], "s1h": r["s1h"], "s2h": r["s2h"],
             "s4h": r["s4h"], "s1D": r["s1D"], "s1W": r["s1W"],
@@ -2487,6 +2765,13 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             # its LONG/SHORT tabs then have nothing to split on but the footprint `action`.
             "side": r.get("side"), "big_wall": r.get("big_wall"), "big_gap": r.get("big_gap"),
             "_big_wall_px": r.get("_big_wall_px"),   # so refresh_prices ticks big_gap live
+            # S/R CONFLUENCE travels too, for the same reason: the enriched view is what the
+            # LONG/SHORT tabs render, and a column the filter selects on must survive the
+            # filter. _conf_px/_conf_side let refresh_prices re-derive the gap on every tick
+            # AND drop the flag the moment price trades through the level.
+            "sr_conf": r.get("sr_conf"), "conf_gap": r.get("conf_gap"),
+            "_conf_px": r.get("_conf_px"), "_conf_side": r.get("_conf_side"),
+            "conf_kind": r.get("conf_kind"),
             "setup_rank": r.get("setup_rank"), "setup_read": r.get("setup_read"),
             "sup": r.get("sup"), "sup_t": r.get("sup_t"), "res": r.get("res"),
             "res_t": r.get("res_t"), "headroom": r.get("headroom"),
@@ -2610,6 +2895,28 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
         _batr = pd.to_numeric(b["_sr_atr"], errors="coerce")
         _ok = _bpx.notna() & (_batr > 0)
         b.loc[_ok, "big_gap"] = ((_bpx[_ok] - _bltp[_ok]).abs() / _batr[_ok]).round(2)
+    # S/R CONFLUENCE FOLLOWS THE TICK, and it needs MORE than big_gap's abs() re-derive: the
+    # flag's whole claim is "price is sitting ON this level", so it has two live failure modes
+    # rather than one. Price can walk AWAY from the shared level (the gap grows past the
+    # proximity threshold), and price can trade THROUGH it -- at which point a support is no
+    # longer underfoot and the row would be advertising a floor that is now a ceiling. Both
+    # clear the flag. The level itself is past structure and stays pinned until a bar closes;
+    # only the relationship to price is re-derived.
+    if "_conf_px" in b.columns:
+        _cpx = pd.to_numeric(b["_conf_px"], errors="coerce")
+        _cltp = pd.to_numeric(b["ltp"], errors="coerce")
+        _catr = pd.to_numeric(b["_sr_atr"], errors="coerce")
+        _sup = b["_conf_side"].astype(str) == "SUP"
+        _gap = (_cltp - _cpx).where(_sup, _cpx - _cltp) / _catr     # signed, in trigger ATR
+        _live = _cpx.notna() & (_catr > 0) & (_gap >= 0) & (_gap <= config.SR_CONF_NEAR_ATR)
+        b["conf_gap"] = np.where(_live, _gap.round(2), np.inf)
+        b.loc[~_live, "sr_conf"] = ""
+        # THE KIND MUST DIE WITH THE FLAG IT DESCRIBES. Leaving it set on a cleared row keeps
+        # a SHELF/FLIP verdict alive for a level price has already walked away from -- a stale
+        # claim that nothing displays today, which is exactly how it would have rotted unseen
+        # until something did.
+        if "conf_kind" in b.columns:
+            b.loc[~_live, "conf_kind"] = ""
     return _live_levels(b)
 
 

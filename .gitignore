@@ -12,3 +12,7 @@ data/replay/*.parquet
 # generated runtime state (self-calibration + live first-seen tracking)
 data/validation/*.json
 data/live_state/
+
+# scratch outputs from ad-hoc studies (kept out of the repo root)
+*.parquet
+streamlit.err

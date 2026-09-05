@@ -103,8 +103,13 @@ def _fmt(df):
     for c in ("at", "since%", "cvwap%", "rsCum%", "est_close", "vol×", "turn₹L", "wt%"):
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce").astype("Float64")
-    if "dn_age" in d.columns:
-        d["dn_age"] = pd.to_numeric(d["dn_age"], errors="coerce").astype("Int64")
+    for c in ("dn_age", "at_bars"):
+        # Int64 (nullable), not float: a bar COUNT is an integer, and pd.NA crosses Arrow as a
+        # real null. Left as a plain object column, the None on every row where the arrival
+        # clock is off renders as the literal string "None" — the same defect the em-dash and
+        # Float64 casts above exist to prevent, one column further right.
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype("Int64")
     for c in _STRUCT_COLS:                                 # terse enum -> glyph+word (display only)
         if c not in d.columns:
             continue
@@ -149,6 +154,13 @@ def _fmt(df):
     if "big_gap" in d.columns:                             # same inf treatment as headroom
         _bg = pd.to_numeric(d["big_gap"], errors="coerce")
         d["big_gap"] = ["∞" if np.isinf(v) else ("—" if pd.isna(v) else f"{v:.2f}") for v in _bg]
+    if "conf_gap" in d.columns:
+        # inf here means "no level BOTH frames agree on, on the side this trade needs" — an
+        # answer, not a missing value, same distinction headroom and big_gap carry. Rendered
+        # as an em-dash rather than ∞ because the honest reading is "nothing aligned", not
+        # "clear road": an absent confluence says nothing about what is overhead.
+        _cg = pd.to_numeric(d["conf_gap"], errors="coerce")
+        d["conf_gap"] = ["—" if (pd.isna(v) or np.isinf(v)) else f"{v:.2f}" for v in _cg]
     return d
 
 # ── hover tooltips: what each column is + WHY it matters ───────────────────────
@@ -781,6 +793,69 @@ SR_COLS = {
              "a pullback inside a downtrend is a short entry, not a dip to buy.\n\n"
              "**—** = the setup takes no side (squeeze, trap, or sideways). Most of the "
              "universe sits here most of the time."),
+    "sr_conf": st.column_config.TextColumn(
+        "S/R aligned", width="small",
+        help="**The price level BOTH your charts agree on \u2014 with the stock sitting on it "
+             "right now.**\n\n"
+             "`\U0001f9f2 \U0001f6e1\ufe0f SUP 5176.62 \u00d74 4\u2193/0\u2191 \u00b7 1D+1W` reads as:\n"
+             "\u2022 **\U0001f6e1\ufe0f SUP** \u2014 a real floor (see the icon guide below)\n"
+             "\u2022 **5176.62** \u2014 where it is, priced on your FAST chart (that is where "
+             "your stop goes)\n"
+             "\u2022 **\u00d74** \u2014 price has turned there 4 times\n"
+             "\u2022 **4\u2193/0\u2191** \u2014 and of those turns, **4 were bounces UP** and 0 were "
+             "rejections down. This is the number that tells you what kind of level it is\n"
+             "\u2022 **1D+1W** \u2014 the two charts that agree on it\n\n"
+             "**Blank** = your two charts do not agree on any level price is standing at.\n\n"
+             "**The three icons:**\n\n"
+             "\u2022 \U0001f6e1\ufe0f **SUP / RES** \u2014 the real thing. A floor price has "
+             "actually **bounced UP off** (or a ceiling it has been **pushed DOWN from**), on "
+             "both charts. This is what you want.\n"
+             "\u2022 \U0001f504 **SUP-flip / RES-flip** \u2014 an old **ceiling** that price "
+             "broke above and is now resting on (or an old floor now capping it). A real "
+             "pattern \u2014 the classic breakout throwback \u2014 but this line has never once "
+             "held price up. Do not read it as a proven floor.\n"
+             "\u2022 \u2796 **SUP? / RES?** \u2014 the two charts agree on the PRICE but not on "
+             "what the level is (one sees a floor there, the other a ceiling), or the level "
+             "has been both. Unresolved, and labelled that way rather than guessed.\n\n"
+             "**Why this distinction exists.** The board finds levels from swing points, and a "
+             "swing is either a LOW (price fell there and turned up) or a HIGH (price rose "
+             "there and turned down). Both end up under price sooner or later. Measured over "
+             "8,566 days on this universe, the nearest 'support' under price was **21% pure "
+             "swing-low, 25% pure swing-high, 53% mixed \u2014 46% leaning HIGH**. So before "
+             "this column split them, roughly every other 'support' on the board was an old "
+             "ceiling, not a floor the stock had ever bounced off.\n\n"
+             "*(\u00d7count is the HIGHER of the two charts' counts \u2014 never the two added "
+             "up, since your slow chart is built from your fast chart's candles and would "
+             "count one swing twice. The \u2193/\u2191 split is your FAST chart's own, so it "
+             "matches the price quoted beside it.)*\n\n"
+             "The price shown is the **fast chart's** \u2014 that is where your stop goes. The "
+             "\u00d7count is the **higher** of the two charts, never the two added together: "
+             "your slow chart is built out of your fast chart's candles, so it is the same "
+             "swing counted twice, and adding them would invent strength that was never there. "
+             "Same reason the two levels must match to within a quarter of one percent instead "
+             "of just being 'close': a loose match said YES on **196 names out of 197**.\n\n"
+             "\u26a0\ufe0f **The kind tells you WHAT the level is, not whether it pays.** Head "
+             "to head, real shelves and flipped ceilings are indistinguishable going forward "
+             "(20-day difference \u22120.002pp, t=\u22120.00). Use \U0001f6e1\ufe0f because it means "
+             "what it says, not because it wins.\n\n"
+             "\u26d4 **It is a map, not a buy signal.** Tested on 8 years: a support both "
+             "charts agree on goes **\u22120.21% the next day** and **\u22120.89% over a "
+             "month**, and it was negative in **8 years out of 8** \u2014 while a randomly "
+             "placed fake level did nothing at all. A shelf everybody can see is a shelf that "
+             "**BREAKS**. Use it to place the stop, not to buy the dip."),
+    "conf_gap": st.column_config.TextColumn(
+        "conf gap",
+        help="**How far price is from that agreed level**, counted in typical bars of your "
+             "fast chart (the same unit as `headroom` and `big gap`).\n\n"
+             "\u2022 **0.00** \u2014 standing right on it\n"
+             "\u2022 **0.50** \u2014 the furthest the filter allows; past that, price is not "
+             "really *at* the level any more\n"
+             "\u2022 **\u2014** \u2014 no agreed level on the side your trade needs\n\n"
+             "Why there is a cut-off at all: *'both charts have a level somewhere'* is true of "
+             "nearly every stock in the market and tells you nothing. It only means something "
+             "while price is actually touching it.\n\n"
+             "This updates live. If price cuts **through** the level, the flag disappears "
+             "instead of carrying on calling it a floor when it has just become a ceiling."),
     "big_wall": st.column_config.TextColumn(
         "big wall", width="small",
         help="**THE ONE HIGHER-FRAME WALL YOUR PAIR CANNOT SEE.** The setup, sup/res and "
@@ -790,8 +865,8 @@ SR_COLS = {
              "DEFENDED (≥2-touch) wall from the ONE next confirmation frame up, in your trade's "
              "direction: a ceiling above a long, a floor below a short.\n\n"
              "Which frame, by horizon: **Intraday** (15m/1h) → **4h** · **BTST** (1h/4h) → "
-             "**1D** · **Swing** (4h/1D) → **1W** · **Positional** → none (already the top "
-             "frame). Just the next chart up, as a chartist checks.\n\n"
+             "**1D** · **Swing** (4h/1D) → **1W** · **Positional** (1D/1W) → **1M** "
+             "(the month). Just the next chart up, as a chartist checks.\n\n"
              "`1D 3745.40 ×4` = a 4-touch DAILY resistance overhead. The `big gap` column is "
              "how far, in your trigger-frame ATR (same unit as headroom). **< 0.5 = you are "
              "buying straight into a major level** — expect a fight; a break THROUGH it is the "
@@ -800,8 +875,9 @@ SR_COLS = {
              "Context, not a veto — but you must SEE the level before you trade into it."),
     "big_gap": st.column_config.TextColumn(
         "big gap",
-        help="Distance to the `big wall` (the nearest 1D/1W defended level in your trade's "
-             "direction), in your TRIGGER-frame ATR. ∞ = clear of any bigger-frame wall. "
+        help="Distance to the `big wall` (the nearest defended level ONE FRAME ABOVE your pair "
+             "— 4h / 1D / 1W / 1M by horizon — in your trade's direction), measured in "
+             "your TRIGGER-frame ATR. ∞ = clear of any bigger-frame wall. "
              "< 0.5 = trading straight into a daily/weekly level — the pair's own headroom can "
              "say 'clear' while THIS says you are capped."),
     "at_wall": st.column_config.TextColumn(
@@ -865,6 +941,60 @@ SR_COLS = {
              "real swing high is respected **69.2%** vs **70.5%** for a random line — the level "
              "does NOT cap price more than chance, and the touch count does not change that. Use "
              "it to SEE where the visible level is, never as a reason the trade will work."),
+}
+
+# ── 🧲 MODE: `entered` / `at` / `since%` MEAN SOMETHING ELSE ─────────────────────────
+# A column that silently changes meaning is a trap, so it is RENAMED as well as refilled --
+# the header itself tells you which clock you are reading.
+CONF_ENTRY_COLS = {
+    "entered": st.column_config.TextColumn(
+        "at level since",
+        help="**WHEN PRICE ARRIVED AT THE ALIGNED LEVEL** — the start of the CURRENT unbroken "
+             "stay inside the level's zone, read off your trigger-frame candles.\n\n"
+             "⚠️ **This is NOT the `entered` column you get with 🧲 off.** With the filter off, "
+             "`entered` is the validated BTST accumulation footprint (up ≥1%, strong close, "
+             "above VWAP, persistent RS, volume on pace ≥2×). That is a MOMENTUM event. This "
+             "filter selects names PARKED on a level — close to the opposite condition — so "
+             "the footprint clock would read '—' on almost every row here. Different screen, "
+             "different question, different clock.\n\n"
+             "**How to read it:**\n"
+             "• `09:45` — arrived at 09:45 today\n"
+             "• `03 14:15` — arrived on the 3rd (the stay has crossed a session)\n"
+             "• `04-Sep` — a 1D/1W trigger frame stamps the date, not a clock time\n"
+             "• `just now` — price is in the zone but the last CLOSED bar is not; it walked in "
+             "mid-bar\n\n"
+             "**Why arrival is the trigger:** the claim this filter makes is *price is standing "
+             "on a level both frames mark*. That became true the moment price entered the zone. "
+             "Read it with `bars` beside it: **freshly arrived = a decision point** (it either "
+             "holds or breaks), while **many bars on the same shelf = a level being worn down** "
+             "— which, on this board's own 8-year measurement, is the more common ending.\n\n"
+             "The zone is the same ±0.5 ATR band the filter uses, so this clock and the flag "
+             "can never disagree about whether price is 'at' the level. A bar counts once its "
+             "RANGE touches the zone — a wick into the shelf is a test of it."),
+    "at": st.column_config.NumberColumn(
+        "at (arrival)", format="%.2f",
+        help="The price when it ARRIVED at the aligned level (that bar's close) — not the "
+             "footprint trigger price. With 🧲 off this column means the footprint price "
+             "instead."),
+    "since%": st.column_config.NumberColumn(
+        "since arrival%", format="%.2f",
+        help="Move since price arrived at the level = (ltp / arrival price − 1).\n\n"
+             "For a **support**, a positive number means it has lifted off the shelf so far; "
+             "negative means it is pressing into it. For a **ceiling**, read it the other way "
+             "round.\n\n"
+             "⚠️ NOT profit, and NOT a forecast — you did not necessarily enter here. It is a "
+             "*is the level holding so far* read. And remember the measured base rate: an "
+             "aligned support has gone on to BREAK more often than hold (−0.21% next day, "
+             "negative in 8 of 8 years), so a level that is quietly bleeding is the normal "
+             "case, not an anomaly."),
+    "at_bars": st.column_config.NumberColumn(
+        "bars", format="%d",
+        help="How many trigger-frame bars price has been inside the level's zone on this "
+             "approach. **1–2 = just arrived**, the decision point. **Many = it has been "
+             "grinding there**, which historically favours a break over a hold. Counts the "
+             "CURRENT unbroken stay only: price that left the zone and came back starts a new "
+             "count, because that is a second test of the level, not a continuation of the "
+             "first."),
 }
 
 # Delivery-conviction columns — ported from the DCM sector-rotation view (same formulas).
@@ -1247,6 +1377,28 @@ if tf == "Intraday":
                 f"**Fix:** run the Daily_Cash_Market nightly sync to ingest the missing "
                 f"session(s), then ↻ re-scan. The Intraday frames (15m–4h) come straight from "
                 f"Fyers and are unaffected.")
+        # THE ARCHIVE'S TWO HALVES CAN ALSO DISAGREE WITH EACH OTHER. index_data and
+        # daily_data are synced separately, so the index side can lag the stock side even
+        # when the archive as a whole is current — and everything measured RELATIVE to the
+        # index loses its newest session when it does. Caught live 2026-09-04 (stocks 09-04,
+        # Nifty 09-03): rs_cum9 came back NaN for all 249 names, which made the live
+        # accumulation footprint silently drop its relative-strength leg and run on four of
+        # its five validated legs. The only symptom on screen was a blank `entered` column.
+        _istale = live.index_staleness()
+        if _istale.get("ok") and _istale.get("lag_days", 0) >= 1:
+            _n = _istale["lag_days"]
+            st.warning(
+                f"⚠ **The index series is {_n} session(s) behind the stock series** in the "
+                f"same archive — stocks through **{_istale['stock_date']:%d-%b}**, Nifty only "
+                f"through **{_istale['index_date']:%d-%b}**. Everything measured *relative to "
+                f"the index* is missing its newest session: `RS%`, the relative-strength leg "
+                f"of the accumulation footprint, and the `entered` trigger that depends on it. "
+                f"The cumulative RS now sums the sessions that DO exist (a slightly shorter "
+                f"window) instead of going blank, so the leg still applies — but it is one "
+                f"session short. **Fix:** re-run the Daily_Cash_Market index sync. "
+                + ("At **2+ sessions** the leg drops out entirely." if _n < 2 else
+                   "**At this lag the leg has dropped out entirely — the live footprint is "
+                   "looser than the validated one.**"))
         # AGE IS ALWAYS SHOWN. With no TTL the board holds its scan until you re-scan, so the
         # only thing that can mislead is not knowing how old it is. Off-hours this used to be
         # hidden entirely, which is when the board sits stalest.
@@ -1416,6 +1568,35 @@ if tf == "Intraday":
                        "dropdown is the hold.")
         _setup_f = "All"
         _room_f = "All"
+        # THE 🧲 TOGGLE IS DRAWN LATER, BESIDE THE TABLE -- BUT IT IS READ HERE.
+        # Streamlit executes top-to-bottom, so a widget sitting above the table cannot also
+        # be read by a filter that runs before it. Take the value from session_state, which
+        # holds what the PREVIOUS run's widget was set to, and draw the widget itself at the
+        # table (see _conf_toggle). Flipping it triggers a full rerun, so this line sees the
+        # new value on the very next pass and the board filters on the same click.
+        def _sync_conf_tol():
+            """The slider reads in % (what a trader thinks in); the engine takes bps. Keep the
+            two in one place rather than converting at three call sites."""
+            st.session_state["mtf_conftol"] = float(
+                st.session_state.get("mtf_conftol_pct", config.SR_CONF_TOL_BPS / 100.0)) * 100.0
+
+        _conf_f = bool(st.session_state.get("mtf_conff", False))
+        # HOW CLOSE THE TWO FRAMES MUST AGREE — read here, drawn beside the toggle below.
+        # It is a control and not a constant because it decides how many names survive, and
+        # the measured cost of loosening it is steep and non-obvious (see SR_CONF_MEASURED).
+        _conf_tol = float(st.session_state.get("mtf_conftol", config.SR_CONF_TOL_BPS))
+        # WHAT KIND of shared level counts. "SHELF" = built from the swings that turned price
+        # the way this level is now expected to turn it (lows under price, highs over it) --
+        # the thing a chartist means by support. Default, because the column says SUP and it
+        # should mean SUP: measured, 46% of levels sitting under price are built mostly from
+        # swing HIGHS, i.e. old ceilings, not floors price ever bounced off.
+        # DEFAULT "Either". Narrowing to real shelves by default hid two thirds of the
+        # matches behind a radio the user had to discover first — and the honest fix for
+        # "SUP should mean SUP" is the LABEL (🛡️ / 🔄 / ➖ now says which it is), not a
+        # silent pre-filter. The measurement agrees: shelf and flip are indistinguishable
+        # forward, so defaulting to one of them asserts a difference that is not there.
+        _conf_kind = str(st.session_state.get("mtf_confkind", "ANY"))
+        _conf_help = ""
         if _P:
             _setup_f = pc2.selectbox(
                 "Setup quality", ["All", "🎯 Textbook only", "🟢 Long-side setups",
@@ -1474,6 +1655,77 @@ if tf == "Intraday":
                       "footprint), not these levels.\n\n"
                       "Composes with Setup quality: 🟢 Long-side + ✅ Has room = longs with a "
                       "clear higher frame."))
+            # ── S/R CONFLUENCE — help text only; the widget itself is drawn at the table ──
+            # Selects on the PAIR'S OWN two frames agreeing on a level that price is sitting
+            # on right now — a different question from `Upper-TF S/R`, which looks ONE FRAME
+            # ABOVE the pair. Both can be on at once (aligned level here, clear road above).
+            # It does NOT live in this row: it is the only control here that is a plain
+            # on/off, and the three selectboxes beside it are all "pick a value" — mixing the
+            # two shapes in one row read as a fourth dropdown that had lost its label.
+            _conf_help = ("**Show me only stocks that are SITTING ON a price level BOTH of my "
+                      "charts agree on.**\n\n"
+                      f"**Which two charts?** The two your **Trade horizon** already uses: "
+                      f"the fast one you time the entry on (**{_P['ltf']}**) and the slow one "
+                      f"that confirms it (**{_P['htf']}**). Those two, and only those two — "
+                      f"change the horizon and this pair changes with it.\n\n"
+                      "It does **not** look at the chart ABOVE them. That is the separate "
+                      "`Upper-TF S/R` box, which asks a different question: *is a bigger level "
+                      "in the way?* This one asks: *do my own two charts mark the same line?*"
+                      "\n\n"
+                      f"So: do the {_P['ltf']} and the {_P['htf']} both draw a line at the "
+                      "*same price*, and is the stock touching that line now.\n\n"
+                      f"Example: the stock is resting at ₹481. The {_P['ltf']} chart shows "
+                      f"a floor at ₹481. The {_P['htf']} chart shows a floor at ₹481 "
+                      "too. That is a real shelf — the kind you can see without squinting."
+                      "\n\n"
+                      "**All three must be true:**\n\n"
+                      f"1. the **{_P['ltf']}** chart (fast) has a level within **half a typical "
+                      f"{_P['ltf']} bar** of price — a FLOOR if you are long, a CEILING if you "
+                      "are short;\n"
+                      f"2. the **{_P['htf']}** chart (slow) has a level at the **same price** — "
+                      f"within **{_conf_tol:g} paise per ₹100**, which is what the slider under "
+                      "this toggle sets;\n"
+                      "3. price is actually TOUCHING it — not just somewhere nearby.\n\n"
+                      "Two columns tell you the rest: **`S/R aligned`** names the level, "
+                      "**`conf gap`** is how far price is from it (0.00 = standing on it).\n\n"
+                      "---\n\n"
+                      "⛔ **READ THIS BEFORE YOU USE IT TO BUY.**\n\n"
+                      "Everyone is taught that a support both charts agree on is a strong floor "
+                      "that will bounce. We tested that on **8 years** of this exact universe "
+                      "(43,101 cases) and it is **not true — it is the opposite.**\n\n"
+                      "The test was fair: these names were compared against *other names that "
+                      "also had a level under them*, so the only thing being tested is whether "
+                      "the two charts AGREE. A fake level (a real one shifted a few percent at "
+                      "random) went through the same test as a control.\n\n"
+                      "| if you buy it | agreed level | fake level |\n"
+                      "|---|---|---|\n"
+                      "| next day | **−0.21%** | +0.05% |\n"
+                      "| after a week | **−0.29%** | +0.12% |\n"
+                      "| after a month | **−0.89%** | −0.16% |\n"
+                      "| overnight only | **0.00%** | −0.03% |\n\n"
+                      "Read the two columns together. **The fake level does nothing** — "
+                      "which is how you know the real one is not a fluke. And the real one "
+                      "**loses at every holding period**, and lost in **8 years out of 8**.\n\n"
+                      "In plain words: a shelf both charts can see is a shelf *everybody* can "
+                      "see — and it tends to **BREAK**, not hold. (Same answer this board "
+                      "got everywhere else: a level holds 69% of the time, and a random line "
+                      "drawn anywhere holds 70%.)\n\n"
+                      "✅ **So what is it actually good for?** Knowing exactly where the "
+                      "shelf is, so you can:\n"
+                      "• put your stop just under it (or just above, if short)\n"
+                      "• trade smaller, because a break is the likely outcome\n"
+                      "• or leave it alone\n\n"
+                      "✅ **The one safe pairing:** the overnight row is **0.00%** — "
+                      "flat. So this does not damage the one trade on this board that IS proven "
+                      "(the overnight delivery carry). It just does not add to it either.\n\n"
+                      "ℹ️ **Pairs well with `Upper-TF S/R`** — that box reads the chart ABOVE "
+                      "your pair, this one reads the pair itself. Together: standing on a line "
+                      "both my charts agree on, with clear road on the bigger chart.\n\n"
+                      "⚠️ **Expect very few names** — usually a handful. And they "
+                      "are usually going SIDEWAYS (a stock parked on a shelf is not trending), "
+                      "so look for them on the **No side** tab.\n\n"
+                      "*(For shorts the ceiling version is weaker still, and the fake level "
+                      "nearly matches it — so read that side as description only.)*")
             st.caption(f"📐 **{_P['label']}** · hold: *{_P['hold']}* — {_P['note']}")
             # HOW PROVISIONAL IS THIS TAG? A forming trigger bar can relabel until it closes,
             # and the board never said so. Measured per preset (see mtf.REPAINT) rather than
@@ -1643,10 +1895,13 @@ if tf == "Intraday":
         # WHOLE universe so the default view is already sorted best-context-first.
         _setup_on = False
         _room_on = False
+        _conf_on = False
         _n_setup = None
+        _n_room = None
         _census = None
         if _P:
-            light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"])
+            light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"], conf_tol_bps=_conf_tol,
+                                   conf_kind=_conf_kind)
             # CENSUS OF THE WHOLE TAPE — from the FULL SCAN, not from `light`. Taken after the
             # setup filter it once reported "1 setup type across 7 names", which describes your
             # filter and not the market; that was fixed. But `light` has ALREADY been cut by the
@@ -1656,7 +1911,8 @@ if tf == "Intraday":
             # position-SIZING choice; it must never decide what the tape is doing. The census is
             # therefore built from sc["board"] directly. Cost is nil — add_setup is arithmetic
             # over boxes the scan already carried.
-            _census = live.add_setup(sc["board"], ltf=_P["ltf"], htf=_P["htf"])[
+            _census = live.add_setup(sc["board"], ltf=_P["ltf"], htf=_P["htf"],
+                                     conf_tol_bps=_conf_tol, conf_kind=_conf_kind)[
                 ["setup", "setup_read", "turn₹L", "symbol", "dir"]].copy()
             if _setup_f == "🎯 Textbook only":
                 light, _setup_on = light[light["setup"] == "WITH-TREND CONTINUATION"], True
@@ -1686,11 +1942,141 @@ if tf == "Intraday":
                     light, _room_on = light[(_bg >= 0.5) & (_bg < 1.0)], True
                 elif _room_f == "🧱 Capped":
                     light, _room_on = light[_bg < 0.5], True
+            # S/R CONFLUENCE — the pair's OWN two frames agreeing on a level price is at.
+            # Its own flag and its own funnel stage: it is a different question from the
+            # room filter (which reads ONE FRAME ABOVE the pair), so attributing a cut to
+            # the wrong stage would make an empty board undiagnosable.
+            _n_room = len(light)                        # count AFTER room, BEFORE confluence
+            if _conf_f and "conf_gap" in light.columns:
+                _cg = pd.to_numeric(light["conf_gap"], errors="coerce")
+                light, _conf_on = light[_cg <= config.SR_CONF_NEAR_ATR], True
             light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
+
+        # ── THE 🧲 TOGGLE ITSELF — drawn at the top right of whichever table this run
+        # renders. Called from THREE places because there are three reachable table paths
+        # (unfiltered tabs / filtered panel / the empty board) and exactly one of them runs
+        # per pass, so there is never a duplicate-key collision.
+        #
+        # THE EMPTY-BOARD CALL IS THE LOAD-BEARING ONE. This filter can legitimately cut the
+        # board to zero — it is meant to be selective. If st.stop() fired before the widget
+        # was drawn, the control that emptied the board would itself vanish, and the only way
+        # back would be a page reload. A filter must always be reachable from the state it
+        # produces.
+        #
+        # AND IT MUST STAY OUTSIDE THE 5s FRAGMENTS. A widget inside a fragment reruns only
+        # that fragment; the filter chain above lives outside it, so the toggle would flip,
+        # the table would redraw, and nothing would actually be filtered until some unrelated
+        # event forced a full rerun.
+        def _conf_toggle():
+            if not _P:
+                return                       # custom TF pair: no horizon, so no second frame
+            _c = st.columns([5, 2])[1]
+            _c.toggle("🧲 Support / Resistance", key="mtf_conff",
+                      help=_conf_help)
+            if not _conf_f:
+                return                       # the knob only exists while the filter is on
+            _c.slider(
+                "how closely must the two frames agree?",
+                min_value=config.SR_CONF_TOL_MIN_BPS / 100.0,
+                max_value=config.SR_CONF_TOL_MAX_BPS / 100.0,
+                step=config.SR_CONF_TOL_STEP_BPS / 100.0,
+                # WITHOUT AN EXPLICIT value= A SLIDER ANCHORS TO ITS MINIMUM, which here is the
+                # strictest setting — so the board would have opened tighter than the default
+                # the filter was measured and documented at, and the caption would have
+                # disagreed with the config.
+                value=config.SR_CONF_TOL_BPS / 100.0,
+                format="%.2f%%", key="mtf_conftol_pct",
+                on_change=_sync_conf_tol,
+                help=("**Two levels this close count as the SAME level.**\n\n"
+                      "0.25% on a \u20b91,000 stock means the two charts must both mark the "
+                      "level within \u20b92.50 of each other. Slide right and more names "
+                      "qualify \u2014 but they qualify for a weaker reason.\n\n"
+                      "**Loosening is not free, and the caption under the slider says what it "
+                      "costs.** We measured how often the two charts agree at each setting, "
+                      "and how often two UNRELATED charts would agree just as well (another "
+                      "random stock's weekly levels, rescaled to this price \u2014 so the "
+                      "comparison controls for simply having a lot of levels lying around):\n\n"
+                      "| setting | names that qualify | the same, by pure chance |\n"
+                      "|---|---|---|\n"
+                      "| 0.25% | 8 in 100 | 5 in 100 |\n"
+                      "| 0.50% | 15 in 100 | 10 in 100 |\n"
+                      "| 1.00% | 26 in 100 | 21 in 100 |\n"
+                      "| 2.00% | 46 in 100 | 42 in 100 |\n\n"
+                      "At **2.00%** almost half the board qualifies and **nine tenths of that "
+                      "is chance** \u2014 the filter has stopped saying anything. That is not "
+                      "a softer version of this screen, it is the exact failure it was built "
+                      "to avoid: 2% is a typical **0.66 ATR** on this universe, which is "
+                      "essentially the same-level rule that once flagged **196 names out of "
+                      "197**.\n\n"
+                      "**0.50% is the default** \u2014 about double the names of the strictest "
+                      "setting, while still agreeing meaningfully more often than chance.\n\n"
+                      "One thing the slider does NOT change: **the drift stays negative at "
+                      "every width** (negative in 8 years out of 8 at 0.25%, 0.50% *and* "
+                      "2.00%). Widening does not turn this into a buy signal \u2014 it only "
+                      "waters down the *reason* a name is on the list, until you are really "
+                      "just listing stocks sitting on a level."))
+            _c.radio(
+                "what kind of level?", ["SHELF", "FLIP", "ANY"], key="mtf_confkind",
+                horizontal=True, index=2,          # Either — see the default note above
+                format_func=lambda k: {"SHELF": "\U0001f6e1\ufe0f Real shelf",
+                                       "FLIP": "\U0001f504 Flipped",
+                                       "ANY": "\u2796 Either"}[k],
+                help=("**A level under price is not automatically a floor.** This board's "
+                      "levels are built from swing points, and a swing can be a LOW (price "
+                      "fell there and turned UP) or a HIGH (price rose there and turned "
+                      "DOWN). Both end up sitting under price eventually \u2014 but they are "
+                      "different things.\n\n"
+                      "\U0001f6e1\ufe0f **Real shelf** \u2014 built from the swings that turned "
+                      "price the way you need it turned: **lows** under a long, **highs** over "
+                      "a short. Your ABC example: price came down to \u20b9480 and went back "
+                      "UP, on the 1h *and* on the 4h. This is the default.\n\n"
+                      "\U0001f504 **Flipped** \u2014 an old **ceiling** price has broken above, "
+                      "now acting as a floor (or an old floor now capping a short). Textbook "
+                      "polarity reversal, and a genuine setup \u2014 but it is a breakout "
+                      "throwback, not a level that has ever held price up.\n\n"
+                      "\u2796 **Either** \u2014 no filter on what built it. This is what the "
+                      "board did before this control existed.\n\n"
+                      "**Why it matters:** measured over 8,566 daily observations, the nearest "
+                      "'support' under price on this universe was **21% pure swing-low**, "
+                      "**25% pure swing-high** and 53% mixed \u2014 **46% of them lean HIGH**. "
+                      "So without this filter, roughly every other 'support' is an old ceiling "
+                      "the stock broke through, not a floor it has bounced off.\n\n"
+                      "\u26a0\ufe0f **This is about the label being TRUE, not about profit.** "
+                      "Head to head the two kinds are indistinguishable forward (20-day "
+                      "difference \u22120.002pp, t=\u22120.00; nothing at any horizon reaches "
+                      "t=1.2). Shelf does not beat flip. It simply *is* what the word support "
+                      "means \u2014 and the drift stays negative for both."))
+            _pct = _conf_tol / 100.0
+            # SNAP TO THE NEAREST MEASURED SETTING. The slider steps finer than the study
+            # did, so name the setting the numbers actually come from rather than quietly
+            # presenting an interpolation as a measurement.
+            _m = min(config.SR_CONF_MEASURED, key=lambda k: abs(k - _conf_tol))
+            _approx = "" if abs(_m - _conf_tol) < 1e-6 else f" (measured at {_m/100:.2f}%)"
+            _hit, _chance = config.SR_CONF_MEASURED[_m]
+            _edge = _hit / _chance if _chance else float("inf")
+            # SAY WHAT THIS SETTING BUYS, AT THE MOMENT IT IS CHOSEN. A slider that silently
+            # degrades what it filters on is how a screen turns into decoration -- the whole
+            # reason this flag did not ship for a year. The ratio is the honest summary: 1.0
+            # means the agreement is entirely explained by there being levels everywhere.
+            if _edge >= 1.40:
+                _c.caption(f"\u2705 **{_pct:.2f}%** \u00b7 {_hit:.0f} names in 100 qualify, "
+                           f"{_chance:.0f} would by chance \u2014 **{_edge:.2f}\u00d7** chance. "
+                           f"Strict and meaningful.{_approx}")
+            elif _edge >= 1.20:
+                _c.caption(f"\u2696\ufe0f **{_pct:.2f}%** \u00b7 {_hit:.0f} names in 100 "
+                           f"qualify, {_chance:.0f} would by chance \u2014 "
+                           f"**{_edge:.2f}\u00d7** chance. A fair trade for a longer list.{_approx}")
+            else:
+                _c.caption(f"\u26a0\ufe0f **{_pct:.2f}%** \u00b7 {_hit:.0f} names in 100 "
+                           f"qualify and {_chance:.0f} would by **pure chance** "
+                           f"(**{_edge:.2f}\u00d7**). At this width the two charts are barely "
+                           f"agreeing about anything \u2014 you are just listing stocks that "
+                           f"have a level somewhere nearby.{_approx}")
 
         after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
         filtered = _mtf_filter(after_deliv)
-        active = _htf_on or _ltf_on or _setup_on or _room_on or (min_wtd > 0) or (min_vs > 0)
+        active = (_htf_on or _ltf_on or _setup_on or _room_on or _conf_on
+                  or (min_wtd > 0) or (min_vs > 0))
         # `deliv 5wk` sits immediately after `side`: once you know WHICH WAY a setup points, the
         # next question is whether anyone is actually accumulating into it, and that read is
         # useless twenty columns to the right. The per-side evidence note (`long/short evidence`)
@@ -1712,7 +2098,7 @@ if tf == "Intraday":
         # split, and the no-preset table has no tabs) but demoted.
         light_cols = (["symbol", "sector", "sector tilt", "ltp", "day%"]
                       + (["setup", "deliv trend"] + fno.COLS + ["carry"] +
-                         ["loc", "at_wall", "sup", "sup_t", "res",
+                         ["loc", "at_wall", "sr_conf", "conf_gap", "sup", "sup_t", "res",
                           "res_t", "headroom", "big_wall", "big_gap"]
                          if _P else ["deliv trend"] + fno.COLS + ["carry"])
                       + ["wtd_deliv7", "deliv_vs_100d",
@@ -1874,6 +2260,7 @@ if tf == "Intraday":
                 _tally(len(df_), len(light), "names",
                        f"of {sc['n_scanned']} scanned" if len(light) != sc["n_scanned"] else "")
 
+            _conf_toggle()
             # ── LONG / SHORT split by the setup's OWN direction, not by its tag ──────────
             # Only shown when a horizon preset is active, because without one there is no
             # HTF x LTF read to take a side from — and inventing a side from a single
@@ -1892,7 +2279,9 @@ if tf == "Intraday":
                     light_live = base
                     if live.market_open():
                         _re = live.refresh_light_prices(base)
-                        light_live = live.add_setup(_re, ltf=_P["ltf"], htf=_P["htf"])
+                        light_live = live.add_setup(_re, ltf=_P["ltf"], htf=_P["htf"],
+                                                    conf_tol_bps=_conf_tol,
+                                                    conf_kind=_conf_kind)
                         st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure & "
                                    f"walls pinned at {_sa:%H:%M}" if _sa else "💹 prices live")
                     light = light_live
@@ -2007,7 +2396,11 @@ if tf == "Intraday":
         if _setup_on:
             _funnel.append(f"setup ({_setup_f}) → **{_n_setup if _n_setup is not None else len(light)}**")
         if _room_on:
-            _funnel.append(f"upper-TF ({_room_f}) → **{len(light)}**")
+            _funnel.append(f"upper-TF ({_room_f}) → **{_n_room if _n_room is not None else len(light)}**")
+        if _conf_on:
+            _kindw = {"SHELF": "real-shelf", "FLIP": "flipped", "ANY": "any-kind"}
+            _funnel.append(f"S/R aligned ({_kindw.get(_conf_kind, '')}) on "
+                           f"{_P['ltf']}+{_P['htf']} → **{len(light)}**")
         if (st.session_state.get("price_max") or 0) or (st.session_state.get("price_min") or 0):
             _funnel.append(f"price band → **{len(light)}**")
         if min_wtd > 0 or min_vs > 0:
@@ -2019,9 +2412,23 @@ if tf == "Intraday":
             _funnel.append(f"structure ({_legs}) → **{len(filtered)}**")
         st.caption("🔎 funnel:  " + "  →  ".join(_funnel))
         if filtered.empty:
+            _conf_toggle()
             st.info("No name survives this combination right now. That is an answer, not an error "
                     "— read the funnel above to see WHICH stage emptied it, then loosen that leg "
                     "(a slider to 0, or a structure box to 'Any').")
+            if _conf_on and _setup_on:
+                # These two filters PULL AGAINST EACH OTHER, and that is structural, not a bug.
+                # A name parked on a level both frames agree on is, almost by definition, a name
+                # that is NOT trending — measured on the last archive close, all 7 aligned names
+                # on the 1D/1W pair carried a no-side tag (RANGE-BOUND, DRIFT-IN-RANGE, one
+                # FALSE-BREAK TRAP). Stacking a directional setup filter on top will usually
+                # empty the board, so say so rather than let it read as "nothing is happening".
+                st.caption("💡 **🧲 S/R aligned and a directional Setup quality fight each "
+                           "other.** A name standing on a level both frames agree on is usually "
+                           "a name going SIDEWAYS — that is what being parked on a shelf means. "
+                           "On the last close, every aligned name on the 1D/1W pair carried a "
+                           "no-side tag. Drop **Setup quality** back to *All* and read the "
+                           "aligned list on the **No side** tab; that is where it lives.")
             st.stop()
 
         # CAP the per-name enrich (cost bound). Sort by TURNOVER, not day% — day%-desc kept the
@@ -2034,14 +2441,25 @@ if tf == "Intraday":
             st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by turnover "
                        "(most fillable) for levels/verdict. Tighten a leg to see the rest.")
         with st.spinner(f"Reading {len(capped)} matches on {levels_tf} bars for levels & verdict…"):
+            # WITH 🧲 ON, `entered` MEASURES A DIFFERENT EVENT. The footprint clock answers
+            # "did smart money step in today"; the confluence answers "how long has price been
+            # standing on this shelf". Those are different screens, and the footprint almost
+            # never fires on a confluence name anyway (it wants a +1% strong-close volume
+            # surge; this filter selects names going sideways on a level), so leaving the
+            # footprint clock in place would have left the column permanently blank here.
             enr = live.enrich_mtf(capped, ltf=levels_tf, risk_on=sc["risk_on"],
-                                  idx_ret=sc.get("idx_ret", 0.0))
+                                  idx_ret=sc.get("idx_ret", 0.0), conf_entry=_conf_f)
         enr = price_filter(enr, "ltp")
         # The F&O labels are EOD and do not move on a 5s price tick, so they are attached ONCE
         # here rather than inside the refresh fragment -- everything downstream (including
         # live.refresh_prices) inherits them.
         enr = arb.annotate(fno.annotate(enr, _ASOF_LIVE), _ASOF_LIVE)
         if enr.empty:
+            # FOURTH EXIT, SAME REASON AS THE EMPTY-BOARD ONE. Streamlit drops a widget's
+            # state on any run that does not draw it, so a pass that stops here would reset
+            # the toggle to OFF behind the user's back — the board would appear to "forget"
+            # the filter whenever the Lower-TF read came back thin.
+            _conf_toggle()
             st.info("Matches found, but none could be read on the Lower TF (thin candles). "
                     "Try a coarser Lower TF.")
             st.stop()
@@ -2055,7 +2473,7 @@ if tf == "Intraday":
         # applied (reported on "Has room"). Any column added to one list must be added to
         # both, or the board silently shows a different shape once you narrow it.
         _sc = (["setup", "deliv trend"] + fno.COLS + ["carry"] +
-               ["loc", "at_wall", "sup", "sup_t", "res",
+               ["loc", "at_wall", "sr_conf", "conf_gap", "sup", "sup_t", "res",
                 "res_t", "headroom", "big_wall", "big_gap"]) if _P else []
 
         def _day_by_setup(cols):
@@ -2085,12 +2503,12 @@ if tf == "Intraday":
                 cols = cols[:i] + move + cols[i:]
             return cols
 
-        long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
+        long_cols = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "at_bars", "time", "bar", "sector", "sector tilt", "ltp",
                      "day%", "wtd_deliv7", "deliv_vs_100d",
                      "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                      "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
                      "entry", "stop", "t1", "t2", "atr%", "action", "turn₹L", "side"])
-        sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "time", "bar", "sector", "sector tilt", "ltp",
+        sell_cols_tf = _day_by_setup(["symbol", *_sc, "entered", "at", "since%", "at_bars", "time", "bar", "sector", "sector tilt", "ltp",
                         "day%", "wtd_deliv7", "deliv_vs_100d",
                         "s15m", "s1h", "s2h", "s4h", "s1D", "s1W",
                         "bar_clr", "character", "vs_vwap%", "rsi7", "rsi14", "tone", "RS%",
@@ -2111,14 +2529,30 @@ if tf == "Intraday":
             _has_side = "side" in bb.columns
             tb, tsh = st.tabs([f"🟢 LONG ({levels_tf} bars)", f"🔴 SHORT ({levels_tf} bars)"])
             with tb:
+                # ORDER BY THE FILTER'S OWN SUBJECT. With 🧲 on, the question every row is
+                # answering is "how close is price to the level, and how long has it been
+                # there" — so the name standing ON the shelf (the decision point) must lead,
+                # not whichever name happened to sort first by the footprint verdict. Ties go
+                # to the FRESHER arrival: a level tested once is a decision, a level ground
+                # against for twenty bars is a level being worn down.
+                def _conf_order(_d):
+                    if not _conf_f or "conf_gap" not in _d.columns or _d.empty:
+                        return _d
+                    _k = _d.assign(_cg=pd.to_numeric(_d["conf_gap"], errors="coerce"),
+                                   _cb=pd.to_numeric(_d.get("at_bars"), errors="coerce"))
+                    return _k.sort_values(["_cg", "_cb", "turn₹L"],
+                                          ascending=[True, True, False]).drop(
+                                              columns=["_cg", "_cb"])
+
                 lo = bb[bb["side"] == "LONG"] if _has_side else bb[bb["action"] == "LONG"]
+                lo = _conf_order(lo)
                 if lo.empty:
                     st.caption("No LONG-side setup among the matches. That is a reading of the "
                                "tape, not an error — loosen a filter to see more.")
                 else:
                     lo = _wt(_dw(lo, _ASOF_LIVE, _hz), _ASOF_LIVE, "LONG")
                     st.dataframe(_fmt(lo)[_cols(lo, long_cols)], use_container_width=True,
-                                 hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS, **ARB_COLS})
+                                 hide_index=True, column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **FNO_COLS, **ARB_COLS, **(CONF_ENTRY_COLS if _conf_f else {})})
                     _tally(len(lo), sc["n_scanned"], "names",
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
             with tsh:
@@ -2127,6 +2561,7 @@ if tf == "Intraday":
                            "edge either. Weakness screen, not alpha — trade small, manage by s_stop.")
                 sh = (bb[bb["side"] == "SHORT"] if _has_side
                       else bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell"))
+                sh = _conf_order(sh)
                 if sh.empty:
                     st.caption("No SHORT-side setup among the matches. A reading of the tape, "
                                "not an error.")
@@ -2134,10 +2569,11 @@ if tf == "Intraday":
                     sh = _wt(_dw(sh, _ASOF_LIVE, _hz), _ASOF_LIVE, "SHORT")
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,
                                  hide_index=True,
-                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS, **FNO_COLS, **ARB_COLS})
+                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS, **FNO_COLS, **ARB_COLS, **(CONF_ENTRY_COLS if _conf_f else {})})
                     _tally(len(sh), sc["n_scanned"], "names",
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
 
+        _conf_toggle()
         _struct_panel()
         st.caption("Entry/Stop/T1/T2 = ATR risk geometry on your Lower TF, NOT a forecast. "
                    "Structure-first is a research lens; the validated trade is BTST-CARRY.")

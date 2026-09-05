@@ -458,6 +458,68 @@ def walls_ext(h, l, tol: float, w: int = 2) -> list[tuple[float, int, float, flo
     return [(round(x, 2), int(t), round(lo, 2), round(hi, 2)) for x, t, lo, hi in lv]
 
 
+def walls_kind(h, l, tol: float, w: int = 2) -> list[tuple[float, int, int, int]]:
+    """`walls()` plus WHAT BUILT each cluster — (level, touches, n_lows, n_highs).
+
+    WHY THIS EXISTS. walls()/walls_ext() merge `sorted(his + los)`, so a level carries no
+    memory of whether price turned UP there (swing LOWS = a demand shelf) or DOWN there
+    (swing HIGHS = a supply ceiling). Everything downstream then classifies a level purely by
+    POSITION -- below price is called "support", above is called "resistance". Those are not
+    the same statement, and the gap is not small. Measured over 8,566 causal daily
+    observations, the nearest "support" underfoot on this universe was built from:
+
+        pure swing-LOW  (a real demand shelf)       21.4%
+        pure swing-HIGH (an old ceiling, flipped)   25.3%
+        mixed                                       53.3%
+        -> LOW-dominant 43.7%   HIGH-dominant 46.1%   tied 10.2%
+
+    So NEARLY HALF the levels the board calls "support" are built more from swing highs than
+    swing lows: old ceilings price has broken above, not floors it has bounced off. Both are
+    legitimate chart objects -- a broken ceiling acting as a floor is textbook polarity
+    reversal -- but they are DIFFERENT objects, and a screen that says "support" while serving
+    a coin flip between them is not describing what the user asked to see.
+
+    NO EDGE CLAIM. Head to head over the same window the two are indistinguishable forward
+    (20-day difference -0.002pp, t=-0.00; nothing at any horizon clears |t|=1.2). This is a
+    DISPLAY-FIDELITY function, exactly like the SR_DAILY_LOOKBACK widening -- it makes the
+    label mean what it says, it does not make the level predictive. Ranking or sorting on the
+    kind would be inventing an edge the measurement denies.
+
+    Clustering is byte-identical to walls_ext (same tolerance, same running touch-weighted
+    mean, same merge order); only the bookkeeping is added.
+    """
+    his, los = pivots(h, l, w=w)
+    pts = [(x, 0) for x in los] + [(x, 1) for x in his]      # 0 = swing low, 1 = swing high
+    lv: list[list] = []
+    for x, k in sorted(pts, key=lambda z: z[0]):
+        for c in lv:
+            if abs(x - c[0]) <= tol:
+                c[0] = (c[0] * c[1] + x) / (c[1] + 1)
+                c[1] += 1
+                c[2 + k] += 1
+                break
+        else:
+            lv.append([x, 1, 1 - k, k])
+    return [(round(x, 2), int(t), int(nl), int(nh)) for x, t, nl, nh in lv]
+
+
+def level_kind(n_lo: int, n_hi: int, role: str) -> str:
+    """Is this level doing the job the pivots that BUILT it were doing?
+
+    role = "SUP" (the level is under price, expected to hold it up) or "RES" (over price).
+      SHELF  the dominant pivots match the role -- lows under price, highs over it. The
+             textbook object: price came to this line and turned the way it is now expected
+             to turn again.
+      FLIP   the dominant pivots are the OPPOSITE kind -- an old ceiling now acting as a
+             floor (or an old floor now capping). Real, classic, and a different trade.
+      MIXED  neither kind dominates; the cluster has been both.
+    """
+    if n_lo == n_hi:
+        return "MIXED"
+    dominant_low = n_lo > n_hi
+    return "SHELF" if dominant_low == (role == "SUP") else "FLIP"
+
+
 def zone_visits(candles: pd.DataFrame, level: float, atr_val: float,
                 tol_atr: float | None = None) -> dict:
     """How much ACTIVITY a level's zone actually saw — the chartist's sense of "strength".
@@ -530,6 +592,10 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
         return {}
     hh, ll = h[-lookback:], l[-lookback:]
     lv_ext = walls_ext(hh, ll, tol_atr * a)
+    # SAME clustering, plus what BUILT each level (swing lows vs swing highs) -- so a
+    # caller can tell a demand shelf from a flipped ceiling instead of guessing from
+    # position alone. See walls_kind for why that distinction is load-bearing.
+    lv_kind = walls_kind(hh, ll, tol_atr * a)
     lv = [(x, t) for x, t, _, _ in lv_ext]
     if not lv:
         return {}
@@ -569,7 +635,7 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
         "res_visits": zr["visits"], "res_time_pct": zr["time_pct"], "res_bars": zr["bars"],
         "head_up": round((min(up2) - px) / a, 2) if up2 else None,
         "head_dn": round((px - max(dn2)) / a, 2) if dn2 else None,
-        "atr": a, "levels": lv, "levels_ext": lv_ext, "blind": blind,
+        "atr": a, "levels": lv, "levels_ext": lv_ext, "levels_kind": lv_kind, "blind": blind,
     }
 
 

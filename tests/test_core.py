@@ -1348,7 +1348,11 @@ def test_enriched_view_carries_and_splits_by_setup_side():
         assert col in esrc, f"enrich_mtf must carry {col} so the enriched view keeps it"
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     i = dash.find("def _struct_panel")
-    body = dash[i:i + 2500]
+    # SCAN THE WHOLE FUNCTION, not a magic byte count. This used to slice a fixed 2,500
+    # characters, so any comment or helper added inside _struct_panel silently pushed the
+    # SHORT assertion out of the window and failed a test about code that had not changed.
+    # A structural assertion must not depend on how much prose sits above the line it checks.
+    body = dash[i:dash.index("        _struct_panel()", i)]
     assert 'bb["side"] == "LONG"' in body, "enriched LONG tab must split on the setup side"
     assert 'bb["side"] == "SHORT"' in body, "enriched SHORT tab must split on the setup side"
     assert "else bb" not in body.split("bb[\"side\"] == \"LONG\"")[0][-200:], \

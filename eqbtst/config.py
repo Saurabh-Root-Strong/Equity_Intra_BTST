@@ -101,6 +101,97 @@ SR_LOOKBACK  = 60     # bars of history S/R levels are drawn from (NOT the 20-ba
 # LABEL and box are unchanged -- they read the last STRUCT_LOOKBACK bars regardless.
 SR_DAILY_LOOKBACK = 180   # ~9 months: long enough to carry a multi-month daily base, short
                           # enough to stay out of an ancient, different price regime
+# ── S/R CONFLUENCE: the same level on BOTH frames of the horizon ─────────────────────
+# "Price is on a support the 1h shows AND the 4h shows at the same price." The obvious way
+# to code that is a tolerance in ATR, and it does not work: the two frames are RESAMPLES OF
+# ONE SERIES, so a 4h swing high usually IS a 1h swing high and the flag becomes tautology.
+# Measured on a live board at an ATR-scale tolerance (25bps of an ATR-sized zone): fired on
+# 196 of 197 names, and a NULL version -- one frame's walls randomly displaced 1-5% -- still
+# fired on 148. That is why this project shipped no confluence flag for a year.
+#
+# The fix is a PRICE-relative tolerance plus a proximity requirement, and it was validated on
+# the archive rather than argued. 43,101 causal observations, 2018-2026, 276 names, the
+# POSITIONAL pair (1D trigger / 1W confirm -- the only pair with 8 years of history, since the
+# broker serves ~60 days of intraday). Conditioned on the HARD control: names that already
+# have a daily support underfoot, so the comparison is "do the two frames AGREE" and not
+# "is there a level at all". Against the same displaced-wall null:
+#
+#   tol      fires (of the control group)      next-day excess        null's next-day
+#   25bps          8.3%   (null 5.2%)          -0.210pp  t=-3.68      +0.048pp  t=+0.64
+#   50bps         14.7%   (null 10.2%)         -0.135pp  t=-3.03      -0.004pp  t=-0.07
+#  100bps         26.4%   (null 20.0%)         -0.102pp  t=-2.79      +0.034pp  t=+0.85
+#
+# So at 25bps the flag IS distinguishable from noise -- it fires 1.6x as often as the null and
+# carries a t=-3.7 effect the null does not carry at all (t=+0.6). AND THE SIGN IS THE
+# OPPOSITE OF THE CHARTIST STORY: a support both frames agree on is a level that BREAKS, not
+# one that bounces. -0.21pp next day, -0.29pp over 5 days, -0.89pp over 20 days, negative in
+# 8 of 8 years. That is consistent with every other level study in this stack (a level is
+# respected 69.2% vs 70.5% for a random line; more touches measured mildly ANTI-predictive).
+# Overnight (close -> next open, the ONE validated horizon here) it is flat: -0.003pp, t=-0.13,
+# i.e. confluence neither helps nor hurts the BTST carry.
+# The RESISTANCE mirror is much weaker and its null tracks it (real f1 -0.100 t=-1.84 vs null
+# -0.027; overnight real -0.041 vs null -0.050), so the short side is DESCRIPTIVE only.
+SR_CONF_TOL_BPS  = 50.0   # two frames' levels within this many bps of price = the SAME level
+SR_CONF_NEAR_ATR = 0.50   # ...and price must be within this x trigger-frame ATR of it
+# ── HOW LOOSE CAN THE AGREEMENT TOLERANCE GO? (re-measured with a PROPER null) ────────
+# The first sweep used a null that displaced the weekly walls by a random 1-5%. That is a
+# fine control at 25bps and a BROKEN one past ~100bps, because the displacement lands inside
+# the tolerance window and the null starts "agreeing" for the same mechanical reason the real
+# one does. Re-run with a PERMUTATION null instead: this name's daily levels matched against
+# ANOTHER random name-day's weekly walls, rescaled to this price. That preserves wall COUNT
+# and SPACING -- so wall density is controlled for -- and destroys only the real
+# correspondence between the frames. It is the honest answer to "does agreement mean anything
+# beyond what having lots of levels around would produce by itself".
+#
+# 43,111 causal observations; control group n=16,929.
+#
+#   tolerance   fires (of the control group)   the same by chance   ratio
+#     10 bps           4.4%                          2.0%            2.18
+#     25 bps           8.3%                          5.1%            1.62
+#     50 bps          14.7%                         10.2%            1.44   <- the default
+#    100 bps          26.4%                         21.1%            1.25
+#    150 bps          36.7%                         31.8%            1.15
+#    200 bps (2%)     46.4%                         41.5%            1.12   <- ~all chance
+#    300 bps          63.4%                         58.3%            1.09
+#    500 bps          81.5%                         77.4%            1.05
+#
+# 2% fires on nearly HALF the control group and ~89% of that is explained by chance alone.
+#
+# WHAT DOES *NOT* CHANGE WITH THE SETTING: the negative drift. Next-day excess runs -0.211pp
+# (t=-3.68) at 25bps, -0.135 (t=-3.03) at 50, -0.085 (t=-2.52) at 200, and the 20-day figure
+# is negative in 8 of 8 years at 25bps, 50bps AND 200bps. Loosening does not flip the sign or
+# rescue the screen -- it dilutes the "both charts agree" claim until what is really being
+# selected is just "price is sitting on a level", which carries the same negative drift on
+# its own. So the slider trades list length against how much of the agreement is real; it
+# never turns this into a dip-buy signal at any width.
+# And it is the same setting by another name: 200bps is a MEDIAN 0.66 daily ATR on this
+# universe (p25 0.51, p75 0.82), i.e. essentially SR_TOL_ATR=0.6 -- the exact ATR-scale
+# tolerance that produced the original "fired on 196 of 197 names" result. So the loose end
+# of this control is not a softer version of the filter, it is the failure mode it was built
+# to avoid, and the UI says so at that setting.
+#
+# WHY bps AND NOT AN ATR FRACTION, given the board clusters levels at 0.6 ATR? Measured both,
+# and compared them AT MATCHED FIRE RATES (the only fair comparison):
+#      ~5% of names:  10bps ratio 2.18   vs   0.05 ATR ratio 1.78
+#      ~9% of names:  25bps ratio 1.62   vs   0.10 ATR ratio 1.38
+#     ~14% of names:  50bps ratio 1.44   vs   0.15 ATR ratio 1.30
+#     ~26% of names: 100bps ratio 1.25   vs   0.30 ATR ratio 1.18
+# Flat bps discriminates better at all FOUR matched fire rates, so the price-relative rule
+# stays. (Daily ATR runs 1.95% of price at p10 and 4.82% at p90, so the two rules genuinely
+# disagree -- this is a measured choice, not a cosmetic one.)
+SR_CONF_TOL_MIN_BPS = 25.0     # slider floor  (0.25% -- the original, most selective setting)
+SR_CONF_TOL_MAX_BPS = 200.0    # slider ceiling (2.00% -- honoured, and labelled as chance)
+SR_CONF_TOL_STEP_BPS = 25.0
+# tol_bps -> (fires % of the control group, the same % by chance). Drives the live caption
+# under the slider so the cost of loosening is on screen at the moment you loosen it.
+# ONLY MEASURED SETTINGS APPEAR HERE. The slider steps every 25bps, so it can land between
+# two rows; the caption then snaps to the nearest MEASURED one and says so. Interpolating a
+# plausible-looking number into this table would be inventing evidence -- the one thing this
+# module is not allowed to do.
+SR_CONF_MEASURED = {
+    10: (4.4, 2.0), 25: (8.3, 5.1), 50: (14.7, 10.2),
+    100: (26.4, 21.1), 150: (36.7, 31.8), 200: (46.4, 41.5),
+}
 # LIQ_MIN_LACS is the REALISM floor. Stress test: the headline +30bps net was partly
 # flattered by thin names where the fill is not real. On genuinely liquid names
 # (>=Rs20cr turnover) the honest deployable edge is ~+16-19bps net, win ~62%. Thin
