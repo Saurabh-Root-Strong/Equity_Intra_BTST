@@ -1322,6 +1322,9 @@ if tf == "Intraday":
                  "being closed / pre-open. The live scan runs Mon–Fri 09:15–15:30 IST."))
             st.stop()
         light = price_filter(sc["board"], "ltp")     # price band applies; no turnover floor
+        # How many names every LATER filter gets to see. The band runs before all of them, so
+        # this is the real denominator for "how much of the universe did that filter examine".
+        _n_band = len(light)
         _sa = sc.get("scanned_at")
         _age = (dt.datetime.now() - _sa).total_seconds() if _sa else 0
 
@@ -2415,6 +2418,16 @@ if tf == "Intraday":
         # ── FILTER FUNNEL — show WHERE names drop, so a 0 is diagnosable (which stage killed
         # it?), not a mystery. Only stages you actually engaged appear.
         _funnel = [f"scanned **{sc['n_scanned']}**"]
+        # THE PRICE BAND GOES FIRST, BECAUSE IT RUNS FIRST. It is applied to the raw scan
+        # before add_setup and before every other filter, so listing it last -- and quoting
+        # the FINAL row count for it -- made it look like it cut nothing. Measured live:
+        # "scanned 254 -> S/R aligned -> 17 -> price band -> 17" on a board where the band had
+        # already removed 137 names. Anyone reading the funnel to learn how many names the S/R
+        # filter examined would have answered 254; the true answer was 117. The funnel exists
+        # to make a 0 diagnosable, so its ORDER has to be the execution order and each stage
+        # has to quote its OWN survivor count.
+        if _n_band is not None and _n_band < sc["n_scanned"]:
+            _funnel.append(f"price band → **{_n_band}**")
         if _setup_on:
             _funnel.append(f"setup ({_setup_f}) → **{_n_setup if _n_setup is not None else len(light)}**")
         if _room_on:
@@ -2423,8 +2436,6 @@ if tf == "Intraday":
             _kindw = {"SHELF": "real-shelf", "FLIP": "flipped", "ANY": "any-kind"}
             _funnel.append(f"S/R aligned ({_kindw.get(_conf_kind, '')}) on "
                            f"{_P['ltf']}+{_P['htf']} → **{len(light)}**")
-        if (st.session_state.get("price_max") or 0) or (st.session_state.get("price_min") or 0):
-            _funnel.append(f"price band → **{len(light)}**")
         if min_wtd > 0 or min_vs > 0:
             _funnel.append(f"delivery (wtd≥{min_wtd} · vs100D≥{min_vs}) → **{len(after_deliv)}**")
         if _htf_on or _ltf_on:
