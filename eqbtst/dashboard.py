@@ -2628,25 +2628,38 @@ if tf == "Intraday":
             # footprint fired (every off-hours session), fell back to dumping ALL matches under
             # LONG — which is why NESTED SQUEEZE / RANGE-BOUND (no-side) rows appeared as longs.
             _has_side = "side" in bb.columns
-            tb, tsh = st.tabs([f"🟢 LONG ({levels_tf} bars)", f"🔴 SHORT ({levels_tf} bars)"])
-            with tb:
-                # ORDER BY THE FILTER'S OWN SUBJECT. With 🧲 on, the question every row is
-                # answering is "how close is price to the level, and how long has it been
-                # there" — so the name standing ON the shelf (the decision point) must lead,
-                # not whichever name happened to sort first by the footprint verdict. Ties go
-                # to the FRESHER arrival: a level tested once is a decision, a level ground
-                # against for twenty bars is a level being worn down.
-                def _conf_order(_d):
-                    if not _conf_f or "conf_gap" not in _d.columns or _d.empty:
-                        return _d
-                    _k = _d.assign(_cg=pd.to_numeric(_d["conf_gap"], errors="coerce"),
-                                   _cb=pd.to_numeric(_d.get("at_bars"), errors="coerce"))
-                    return _k.sort_values(["_cg", "_cb", "turn₹L"],
-                                          ascending=[True, True, False]).drop(
-                                              columns=["_cg", "_cb"])
+            # ORDER BY THE FILTER'S OWN SUBJECT. With 🧲 on, the question every row is
+            # answering is "how close is price to the level, and how long has it been there"
+            # — so the name standing ON the shelf (the decision point) must lead, not
+            # whichever name happened to sort first by the footprint verdict. Ties go to the
+            # FRESHER arrival: a level tested once is a decision, a level ground against for
+            # twenty bars is a level being worn down.
+            def _conf_order(_d):
+                if not _conf_f or "conf_gap" not in _d.columns or _d.empty:
+                    return _d
+                _k = _d.assign(_cg=pd.to_numeric(_d["conf_gap"], errors="coerce"),
+                               _cb=pd.to_numeric(_d.get("at_bars"), errors="coerce"))
+                return _k.sort_values(["_cg", "_cb", "turn₹L"],
+                                      ascending=[True, True, False]).drop(
+                                          columns=["_cg", "_cb"])
 
-                lo = bb[bb["side"] == "LONG"] if _has_side else bb[bb["action"] == "LONG"]
-                lo = _conf_order(lo)
+            # THREE TABS, MATCHING THE PRE-FILTER PANEL. This panel used to split only two
+            # ways, so every row whose setup takes NO direction was computed, enriched,
+            # counted in the funnel and then dropped at render. Fatal for the S/R filter in
+            # particular: a name standing on a level both frames agree on is almost by
+            # definition a name going sideways, so its main output had nowhere to appear.
+            # Counts in the labels for the same reason the pre-filter panel has them --
+            # "LONG (1) SHORT (0)" beside "133 matched" is a question you ask on sight.
+            _lo_n = _conf_order(bb[bb["side"] == "LONG"] if _has_side
+                                else bb[bb["action"] == "LONG"])
+            _sh_n = _conf_order(bb[bb["side"] == "SHORT"] if _has_side
+                                else bb[bb["sell"].isin(["SHORT", "WEAK"])])
+            _no_n = _conf_order(bb[~bb.index.isin(_lo_n.index.union(_sh_n.index))])
+            tb, tsh, tno = st.tabs([f"🟢 LONG ({len(_lo_n)}) · {levels_tf} bars",
+                                    f"🔴 SHORT ({len(_sh_n)}) · {levels_tf} bars",
+                                    f"⚪ No side ({len(_no_n)})"])
+            with tb:
+                lo = _lo_n
                 if lo.empty:
                     st.caption("No LONG-side setup among the matches. That is a reading of the "
                                "tape, not an error — loosen a filter to see more.")
@@ -2660,9 +2673,7 @@ if tf == "Intraday":
                 st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Overnight "
                            "short is proven -EV (win 20%); intraday direction has no validated "
                            "edge either. Weakness screen, not alpha — trade small, manage by s_stop.")
-                sh = (bb[bb["side"] == "SHORT"] if _has_side
-                      else bb[bb["sell"].isin(["SHORT", "WEAK"])].sort_values("sell"))
-                sh = _conf_order(sh)
+                sh = _sh_n
                 if sh.empty:
                     st.caption("No SHORT-side setup among the matches. A reading of the tape, "
                                "not an error.")
@@ -2672,6 +2683,28 @@ if tf == "Intraday":
                                  hide_index=True,
                                  column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS, **SETUP_COLS, **SR_COLS, **SELL_COLS, **FNO_COLS, **ARB_COLS, **(CONF_ENTRY_COLS if _conf_f else {})})
                     _tally(len(sh), sc["n_scanned"], "names",
+                           f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
+
+            with tno:
+                st.caption("Setups that take **no direction** — squeezes, traps and sideways "
+                           "names. Most of the universe sits here most of the time, and that is "
+                           "the honest default: no trade.")
+                if _conf_f:
+                    st.info("🧲 **This is where the S/R filter usually lands.** A name "
+                            "standing on a level both frames agree on is, almost by definition, "
+                            "a name going SIDEWAYS — so expect most matches here rather than "
+                            "on the directional tabs. Read the level, place the stop under it, "
+                            "and wait for the break or the hold.")
+                if _no_n.empty:
+                    st.caption("Every match took a side. Unusual for this filter.")
+                else:
+                    _no = _wt(_dw(_no_n, _ASOF_LIVE, _hz), _ASOF_LIVE)
+                    st.dataframe(_fmt(_no)[_cols(_no, long_cols)], use_container_width=True,
+                                 hide_index=True,
+                                 column_config={**LIVE_COLS, **TF_COLS, **DELIV_COLS,
+                                                **SETUP_COLS, **SR_COLS, **FNO_COLS, **ARB_COLS,
+                                                **(CONF_ENTRY_COLS if _conf_f else {})})
+                    _tally(len(_no), sc["n_scanned"], "names",
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
 
         _conf_toggle()

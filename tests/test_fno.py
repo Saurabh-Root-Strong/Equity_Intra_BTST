@@ -164,9 +164,14 @@ def test_every_table_that_shows_the_fno_block_can_actually_render_it():
     lists = len(re.findall(r"fno\.COLS", src))
     annot = len(re.findall(r"fno\.annotate\(", src))
     cfgs = len(re.findall(r"\*\*FNO_COLS", src))
-    assert (lists, annot, cfgs) == (9, 6, 10), (
+    # 10 -> 11 configs: the filtered panel gained a NO-SIDE table (2026-09-06). It reuses
+    # long_cols (which already carries fno.COLS through _sc) and renders from `bb`, which is
+    # annotated upstream on `enr` — so only the column_config count moves. Before that table
+    # existed, every no-side row was computed, enriched, counted in the funnel and then
+    # dropped at render, which hid most of the S/R filter's output.
+    assert (lists, annot, cfgs) == (9, 6, 11), (
         f"F&O column wiring moved: {lists} fno.COLS references / {annot} annotate calls / "
-        f"{cfgs} configs (expected 9 / 6 / 10). If you ADDED a table, wire all three and "
+        f"{cfgs} configs (expected 9 / 6 / 11). If you ADDED a table, wire all three and "
         f"update this count. If a number DROPPED, a table just lost the block silently."
     )
 

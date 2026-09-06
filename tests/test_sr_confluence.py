@@ -424,3 +424,36 @@ def test_scope_defaults_to_the_current_list():
     """Opening the board must not silently widen what every other filter was set against."""
     dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
     assert 'st.session_state.get("mtf_confscope", "NONE")' in dash
+
+
+def test_filtered_panel_has_a_NO_SIDE_tab_like_the_prefilter_panel():
+    """The pre-filter panel splits LONG / SHORT / No side; the FILTERED panel split only two
+    ways, so every row whose setup takes no direction was computed, enriched, counted in the
+    funnel and then dropped at render. That is fatal for the S/R filter specifically: a name
+    standing on a level both frames agree on is almost by definition going sideways, so its
+    main output had nowhere to appear. Reported as 'whole universe shows the same as current
+    list' — it did not, both just collapsed to the same one or two directional rows."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = dash.index("def _struct_panel")
+    body = dash[i:dash.index("        _struct_panel()", i)]
+    assert "tb, tsh, tno = st.tabs(" in body, "the filtered panel must split three ways"
+    assert "No side (" in body
+    assert "with tno:" in body
+    # the no-side frame must be the COMPLEMENT of the two directional ones, so nothing can
+    # fall between the cracks the way it did before.
+    assert "_no_n = _conf_order(bb[~bb.index.isin(_lo_n.index.union(_sh_n.index))])" in body
+    # counts in the labels — this defect was invisible precisely because they were absent
+    assert "LONG ({len(_lo_n)})" in body and "SHORT ({len(_sh_n)})" in body
+
+
+def test_every_enriched_row_lands_in_exactly_one_tab():
+    """LONG, SHORT and No side must partition the enriched frame — no row shown twice, none
+    dropped. Pinned as set algebra on the index rather than on labels."""
+    import pandas as _pd
+    bb = _pd.DataFrame({"side": ["LONG", "SHORT", "—", "LONG", "—"]})
+    lo = bb[bb["side"] == "LONG"]
+    sh = bb[bb["side"] == "SHORT"]
+    no = bb[~bb.index.isin(lo.index.union(sh.index))]
+    assert len(lo) + len(sh) + len(no) == len(bb)
+    assert set(lo.index) | set(sh.index) | set(no.index) == set(bb.index)
+    assert not (set(lo.index) & set(sh.index)) and not (set(no.index) & set(lo.index))
