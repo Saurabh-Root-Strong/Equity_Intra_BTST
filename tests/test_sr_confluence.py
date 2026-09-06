@@ -400,9 +400,24 @@ def test_whole_universe_scope_bypasses_the_price_band_everywhere():
     assert "if not _sr_universe:" in dash[i - 400:i],         "the post-enrich price_filter must be skipped in whole-universe mode"
     # the scope is read BEFORE the pool is built, or the branch above cannot see it
     assert dash.index('mtf_confscope') < dash.index('light = sc["board"].copy()') or         dash.index('_conf_scope = str(') < dash.index('light = sc["board"].copy()')
-    # and it bypasses ONLY the band -- the analytical filters still run
-    for keep in ('_setup_on', '_room_on', '_deliv_filter', '_mtf_filter'):
-        assert keep in dash, f"{keep} must still apply in whole-universe mode"
+    # ...and in whole-universe mode the S/R read is the ONLY thing deciding the list:
+    # every other filter is overridden, not merely re-ordered.
+    assert '_setup_f, _room_f = "All", "All"' in dash,         "setup-quality and upper-TF must be overridden in whole-universe mode"
+    assert "after_deliv = light if _sr_universe else _deliv_filter(light)" in dash,         "the delivery sliders must be skipped in whole-universe mode"
+    assert "filtered = after_deliv if _sr_universe else _mtf_filter(after_deliv)" in dash,         "the structure boxes must be skipped in whole-universe mode"
+    # the horizon is NOT a filter -- it defines which two frames the question is about
+    assert 'ltf=_P["ltf"], htf=_P["htf"]' in dash
+
+
+def test_whole_universe_names_every_control_it_overrode():
+    """A control that silently stops biting is worse than one that is absent, so the funnel
+    lists each overridden filter by name -- which means the REQUESTED values have to be
+    captured before they are forced to 'All'."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert "_setup_f_req, _room_f_req = _setup_f, _room_f" in dash
+    assert dash.index("_setup_f_req, _room_f_req") < dash.index('_setup_f, _room_f = "All", "All"')
+    for named in ("price band", "setup quality", "upper-TF", "delivery", "structure"):
+        assert f'"{named}"' in dash, f"funnel must be able to name {named}"
 
 
 def test_scope_defaults_to_the_current_list():

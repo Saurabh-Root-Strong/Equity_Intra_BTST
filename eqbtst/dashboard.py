@@ -1949,6 +1949,15 @@ if tf == "Intraday":
             _census = live.add_setup(sc["board"], ltf=_P["ltf"], htf=_P["htf"],
                                      conf_tol_bps=_conf_tol, conf_kind=_conf_kind)[
                 ["setup", "setup_read", "turn₹L", "symbol", "dir"]].copy()
+            # WHOLE-UNIVERSE MODE: the S/R read is the ONLY thing allowed to decide the list.
+            # The question is "which names ANYWHERE are standing on a level both frames of my
+            # horizon agree on", and any other filter still running makes the answer a silent
+            # subset of that -- the same defect the price band already caused once. The horizon
+            # itself is not a filter here; it defines WHICH two frames the question is about.
+            # What the user asked for is remembered so the funnel can name what it ignored.
+            _setup_f_req, _room_f_req = _setup_f, _room_f
+            if _sr_universe:
+                _setup_f, _room_f = "All", "All"
             if _setup_f == "🎯 Textbook only":
                 light, _setup_on = light[light["setup"] == "WITH-TREND CONTINUATION"], True
             elif _setup_f == "🟢 Long-side setups":
@@ -2086,25 +2095,33 @@ if tf == "Intraday":
                 horizontal=True,
                 format_func=lambda k: {"NONE": "\u25ab\ufe0f Current list",
                                        "UNIVERSE": "\U0001f310 Whole universe"}[k],
-                help=("**Which names does this filter get to look at?**\n\n"
+                help=("**How much does this filter decide?**\n\n"
                       "\u25ab\ufe0f **Current list** (default) \u2014 it narrows what is already "
-                      "on the board. Your **price band** has usually cut the universe down "
-                      "long before this filter runs, so names outside the band are never even "
-                      "considered. Read the funnel line above the table: it now shows the band "
-                      "first, with its own count.\n\n"
-                      "\U0001f310 **Whole universe** \u2014 ignore the **price band** and ask "
-                      "the question of every scanned name. Nothing else changes: Setup "
-                      "quality, Upper-TF S/R, the delivery sliders and the structure boxes all "
-                      "still apply, because those are analytical choices you made. The price "
-                      "band is not \u2014 it is a position-SIZING cap, and where price is "
-                      "standing relative to its levels is a fact about the tape, not about "
-                      "what you can afford.\n\n"
+                      "on the board. Everything else you have set still applies: the price "
+                      "band, Setup quality, Upper-TF S/R, the delivery sliders, the structure "
+                      "boxes. S/R is the LAST cut in a chain.\n\n"
+                      "\U0001f310 **Whole universe** \u2014 the S/R read becomes the **only** "
+                      "thing that decides the list. Every scanned name is asked one question: "
+                      "*is price standing on a level that both frames of my horizon mark at "
+                      "the same price?* Nothing else is applied \u2014 not the price band, not "
+                      "Setup quality, not Upper-TF S/R, not the delivery sliders, not the "
+                      "structure boxes.\n\n"
+                      "Your **Trade horizon** still applies, because it is not a filter \u2014 "
+                      "it defines WHICH two charts the question is asked about. So do the "
+                      "tolerance slider and the level-kind radio beside this one: those are "
+                      "the S/R condition itself.\n\n"
+                      "**The funnel above the table names every control this mode overrode**, "
+                      "so a setting that has stopped biting is never silent.\n\n"
                       "\u26a1 **It does not re-fetch anything.** The scan already holds every "
-                      "name in the F&O universe with its levels attached \u2014 the band was "
-                      "only hiding them \u2014 so this is instant. It is NOT the "
-                      "\u21bb re-scan universe button higher up the page, which really does "
-                      "re-pull ~270 histories.\n\n"
-                      "With no price band set, the two options give the same list."))
+                      "name in the F&O universe with its levels attached, so this is instant. "
+                      "It is NOT the \u21bb re-scan universe button higher up the page, which "
+                      "really does re-pull ~270 histories.\n\n"
+                      "\u26a0\ufe0f Expect a LONGER list, and remember only the top 60 by "
+                      "turnover get the per-name levels/RSI read."))
+            if _sr_universe:
+                _c.caption("\U0001f310 **Whole universe** \u2014 this list is decided by the "
+                           "S/R read ALONE. Price band, Setup quality, Upper-TF S/R, delivery "
+                           "and structure are all ignored while this is selected.")
             _pct = _conf_tol / 100.0
             # SNAP TO THE NEAREST MEASURED SETTING. The slider steps finer than the study
             # did, so name the setting the numbers actually come from rather than quietly
@@ -2132,8 +2149,10 @@ if tf == "Intraday":
                            f"agreeing about anything \u2014 you are just listing stocks that "
                            f"have a level somewhere nearby.{_approx}")
 
-        after_deliv = _deliv_filter(light)          # stage the chain so each cut is VISIBLE
-        filtered = _mtf_filter(after_deliv)
+        # The delivery sliders and the HTF/LTF structure boxes are skipped for the same reason
+        # as the two above: in whole-universe mode the S/R condition is the whole answer.
+        after_deliv = light if _sr_universe else _deliv_filter(light)
+        filtered = after_deliv if _sr_universe else _mtf_filter(after_deliv)
         active = (_htf_on or _ltf_on or _setup_on or _room_on or _conf_on
                   or (min_wtd > 0) or (min_vs > 0))
         # `deliv 5wk` sits immediately after `side`: once you know WHICH WAY a setup points, the
@@ -2461,7 +2480,16 @@ if tf == "Intraday":
         # to make a 0 diagnosable, so its ORDER has to be the execution order and each stage
         # has to quote its OWN survivor count.
         if _sr_universe:
-            _funnel.append("price band **bypassed** (whole universe)")
+            # NAME WHAT WAS IGNORED. A control that silently stops working is worse than one
+            # that is absent, so every filter this mode overrode is listed by name.
+            _ign = [n for n, on in (
+                ("price band", _n_band < sc["n_scanned"]),
+                ("setup quality", _setup_f_req != "All"),
+                ("upper-TF", _room_f_req != "All"),
+                ("delivery", (min_wtd or 0) > 0 or (min_vs or 0) > 0),
+                ("structure", bool(_htf_on or _ltf_on))) if on]
+            _funnel.append("**whole universe** — S/R only"
+                           + (f" (ignoring {', '.join(_ign)})" if _ign else ""))
         elif _n_band is not None and _n_band < sc["n_scanned"]:
             _funnel.append(f"price band → **{_n_band}**")
         if _setup_on:
