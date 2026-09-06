@@ -157,9 +157,22 @@ SR_CONF_NEAR_ATR = 0.50   # ...and price must be within this x trigger-frame ATR
 #
 # 2% fires on nearly HALF the control group and ~89% of that is explained by chance alone.
 #
-# WHAT DOES *NOT* CHANGE WITH THE SETTING: the negative drift. Next-day excess runs -0.211pp
-# (t=-3.68) at 25bps, -0.135 (t=-3.03) at 50, -0.085 (t=-2.52) at 200, and the 20-day figure
-# is negative in 8 of 8 years at 25bps, 50bps AND 200bps. Loosening does not flip the sign or
+# WHAT DOES *NOT* CHANGE WITH THE SETTING: the negative drift. The 20-day figure is negative
+# in 8 of 8 years at 25bps, 50bps AND 200bps.
+#
+# BUT THE HORIZON MATTERS, AND THE FIRST VERSION OF THIS NOTE OVERSTATED IT. Those t-stats
+# treated every (symbol, date) row as an independent draw. They are not -- hundreds of names
+# share each date and therefore share the market, and the multi-day windows overlap. Recomputed
+# as a per-DATE difference with the t taken across DATES:
+#     horizon     naive t   clustered t   sign test across dates
+#     overnight    -0.16       -0.87      --
+#     next day     -2.08       -1.29      53.3% neg, p=0.53   <- does NOT survive
+#     5-day        -2.82       -1.91      55.7% neg, p=0.24   <- marginal
+#     20-day       -3.48       -1.95      61.5% neg, p=0.014  <- survives
+#     year as the unit         -2.50      negative in 8 of 8 years
+# The effect is real but SLOWER than first stated: it shows up over WEEKS, not on the next day.
+# Same trap this stack has hit before (a 5-day result that was an overlap artifact, disjoint
+# t=+0.12). Quote the horizon that survives; stop quoting the ones that do not. Loosening does not flip the sign or
 # rescue the screen -- it dilutes the "both charts agree" claim until what is really being
 # selected is just "price is sitting on a level", which carries the same negative drift on
 # its own. So the slider trades list length against how much of the agreement is real; it
