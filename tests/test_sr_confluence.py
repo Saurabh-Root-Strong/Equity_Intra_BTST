@@ -6,6 +6,8 @@ resampled from one price series, so a loose match fires on everything and means 
 These tests pin the three conditions that make it separable — same price on both frames,
 inside the tolerance, and price actually AT the level on the side the trade needs.
 """
+import io
+
 import numpy as np
 import pandas as pd
 
@@ -381,3 +383,29 @@ def test_the_clock_never_mutates_the_callers_candles():
     before = d["high"].tolist(), d["low"].tolist()
     live._level_arrival(d, 100.0, 2.0, "1h", ltp=100.2)
     assert (d["high"].tolist(), d["low"].tolist()) == before
+
+
+# ── SCOPE: "whole universe" must actually bypass the band, at BOTH sites ────────────
+def test_whole_universe_scope_bypasses_the_price_band_everywhere():
+    """Filters COMMUTE, so a scope control that merely re-ordered the stages would return a
+    byte-identical list and be decoration. It has to drop the band -- and the band is applied
+    TWICE (once building the pool, once after the per-name enrich). Missing the second one
+    would silently undo the bypass on exactly the rows it was meant to reveal, while the
+    funnel still claimed the universe had been searched."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    # the pool is built unbanded in universe mode
+    assert 'light = sc["board"].copy() if _sr_universe else price_filter(sc["board"], "ltp")' in dash
+    # ...and the post-enrich re-application is guarded by the same flag
+    i = dash.index('enr = price_filter(enr, "ltp")')
+    assert "if not _sr_universe:" in dash[i - 400:i],         "the post-enrich price_filter must be skipped in whole-universe mode"
+    # the scope is read BEFORE the pool is built, or the branch above cannot see it
+    assert dash.index('mtf_confscope') < dash.index('light = sc["board"].copy()') or         dash.index('_conf_scope = str(') < dash.index('light = sc["board"].copy()')
+    # and it bypasses ONLY the band -- the analytical filters still run
+    for keep in ('_setup_on', '_room_on', '_deliv_filter', '_mtf_filter'):
+        assert keep in dash, f"{keep} must still apply in whole-universe mode"
+
+
+def test_scope_defaults_to_the_current_list():
+    """Opening the board must not silently widen what every other filter was set against."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    assert 'st.session_state.get("mtf_confscope", "NONE")' in dash

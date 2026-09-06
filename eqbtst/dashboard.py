@@ -1321,7 +1321,17 @@ if tf == "Intraday":
                 (f"Universe scan unavailable — {_e}. The token is valid, so this is the market "
                  "being closed / pre-open. The live scan runs Mon–Fri 09:15–15:30 IST."))
             st.stop()
-        light = price_filter(sc["board"], "ltp")     # price band applies; no turnover floor
+        # SCOPE OF THE S/R FILTER, read here because the pool is built here. The widget is
+        # drawn down beside the table (same session_state pattern as the toggle it belongs to).
+        _conf_on_pre = bool(st.session_state.get("mtf_conff", False))
+        _conf_scope = str(st.session_state.get("mtf_confscope", "NONE"))
+        _sr_universe = _conf_on_pre and _conf_scope == "UNIVERSE"
+        # WHOLE-TAPE MODE BYPASSES THE PRICE BAND, and only the price band. Re-ordering the
+        # filters would change nothing (they commute -- band AND S/R is the same set either
+        # way), so the scope control has to actually drop one to mean anything. The band is
+        # the right one to drop: it is a position-SIZING cap, and the census below already
+        # refuses to let it decide what the tape is doing.
+        light = sc["board"].copy() if _sr_universe else price_filter(sc["board"], "ltp")
         # How many names every LATER filter gets to see. The band runs before all of them, so
         # this is the real denominator for "how much of the universe did that filter examine".
         _n_band = len(light)
@@ -2071,6 +2081,30 @@ if tf == "Intraday":
                       "difference \u22120.002pp, t=\u22120.00; nothing at any horizon reaches "
                       "t=1.2). Shelf does not beat flip. It simply *is* what the word support "
                       "means \u2014 and the drift stays negative for both."))
+            _c.radio(
+                "search where?", ["NONE", "UNIVERSE"], key="mtf_confscope",
+                horizontal=True,
+                format_func=lambda k: {"NONE": "\u25ab\ufe0f Current list",
+                                       "UNIVERSE": "\U0001f310 Whole universe"}[k],
+                help=("**Which names does this filter get to look at?**\n\n"
+                      "\u25ab\ufe0f **Current list** (default) \u2014 it narrows what is already "
+                      "on the board. Your **price band** has usually cut the universe down "
+                      "long before this filter runs, so names outside the band are never even "
+                      "considered. Read the funnel line above the table: it now shows the band "
+                      "first, with its own count.\n\n"
+                      "\U0001f310 **Whole universe** \u2014 ignore the **price band** and ask "
+                      "the question of every scanned name. Nothing else changes: Setup "
+                      "quality, Upper-TF S/R, the delivery sliders and the structure boxes all "
+                      "still apply, because those are analytical choices you made. The price "
+                      "band is not \u2014 it is a position-SIZING cap, and where price is "
+                      "standing relative to its levels is a fact about the tape, not about "
+                      "what you can afford.\n\n"
+                      "\u26a1 **It does not re-fetch anything.** The scan already holds every "
+                      "name in the F&O universe with its levels attached \u2014 the band was "
+                      "only hiding them \u2014 so this is instant. It is NOT the "
+                      "\u21bb re-scan universe button higher up the page, which really does "
+                      "re-pull ~270 histories.\n\n"
+                      "With no price band set, the two options give the same list."))
             _pct = _conf_tol / 100.0
             # SNAP TO THE NEAREST MEASURED SETTING. The slider steps finer than the study
             # did, so name the setting the numbers actually come from rather than quietly
@@ -2426,7 +2460,9 @@ if tf == "Intraday":
         # filter examined would have answered 254; the true answer was 117. The funnel exists
         # to make a 0 diagnosable, so its ORDER has to be the execution order and each stage
         # has to quote its OWN survivor count.
-        if _n_band is not None and _n_band < sc["n_scanned"]:
+        if _sr_universe:
+            _funnel.append("price band **bypassed** (whole universe)")
+        elif _n_band is not None and _n_band < sc["n_scanned"]:
             _funnel.append(f"price band → **{_n_band}**")
         if _setup_on:
             _funnel.append(f"setup ({_setup_f}) → **{_n_setup if _n_setup is not None else len(light)}**")
@@ -2482,7 +2518,11 @@ if tf == "Intraday":
             # footprint clock in place would have left the column permanently blank here.
             enr = live.enrich_mtf(capped, ltf=levels_tf, risk_on=sc["risk_on"],
                                   idx_ret=sc.get("idx_ret", 0.0), conf_entry=_conf_f)
-        enr = price_filter(enr, "ltp")
+        # The band is applied a SECOND time here, after the per-name enrich. In whole-tape
+        # mode that would quietly undo the bypass on exactly the rows it was meant to reveal,
+        # and the funnel would still claim the universe had been searched.
+        if not _sr_universe:
+            enr = price_filter(enr, "ltp")
         # The F&O labels are EOD and do not move on a 5s price tick, so they are attached ONCE
         # here rather than inside the refresh fragment -- everything downstream (including
         # live.refresh_prices) inherits them.
