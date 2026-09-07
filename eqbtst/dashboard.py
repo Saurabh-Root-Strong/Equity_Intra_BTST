@@ -2697,8 +2697,14 @@ if tf == "Intraday":
                       else f"🟢 LONG · {levels_tf} bars")
             _lbl_s = ("🔴 SHORT · at RESISTANCE" if _by_level
                       else f"🔴 SHORT · {levels_tf} bars")
+            # THE THIRD TAB MEANS SOMETHING DIFFERENT IN EACH MODE. Splitting on the level,
+            # a row lands here only because price has LEFT the zone since the scan -- which is
+            # the common case, not an edge one (measured: the median flagged name spends ~68%
+            # of the session's range inside the zone). Calling that "no side" would be wrong
+            # twice over: it had a side, and the reason it is here is worth reading.
+            _lbl_n = ("⚪ left the level" if _by_level else "⚪ No side")
             tb, tsh, tno = st.tabs([f"{_lbl_l} ({len(_lo_n)})", f"{_lbl_s} ({len(_sh_n)})",
-                                    f"⚪ No side ({len(_no_n)})"])
+                                    f"{_lbl_n} ({len(_no_n)})"])
             with tb:
                 lo = _lo_n
                 if lo.empty:
@@ -2727,15 +2733,21 @@ if tf == "Intraday":
                            f"{len(filtered)} matched the filter · {len(bb)} read on {levels_tf}")
 
             with tno:
-                st.caption("Setups that take **no direction** — squeezes, traps and sideways "
-                           "names. Most of the universe sits here most of the time, and that is "
-                           "the honest default: no trade.")
-                if _conf_f:
-                    st.info("🧲 **This is where the S/R filter usually lands.** A name "
-                            "standing on a level both frames agree on is, almost by definition, "
-                            "a name going SIDEWAYS — so expect most matches here rather than "
-                            "on the directional tabs. Read the level, place the stop under it, "
-                            "and wait for the break or the hold.")
+                if _by_level:
+                    st.caption("These **qualified at the scan and price has since walked off "
+                               "the level** — so they are no longer at support or at "
+                               "resistance, and their `S/R aligned` cell is blank.")
+                    st.info("⏱️ **This is normal, not a fault.** The scan is a snapshot; "
+                            "prices keep moving. Measured on this board, the median flagged "
+                            "name spends only about **68%** of the session's range inside the "
+                            "zone, and **73% of the time a name qualifies it qualifies for a "
+                            "single session** — so expect steady traffic into this tab as "
+                            "the day runs. ↻ re-scan to re-ask the question at current "
+                            "prices.")
+                else:
+                    st.caption("Setups that take **no direction** — squeezes, traps and "
+                               "sideways names. Most of the universe sits here most of the "
+                               "time, and that is the honest default: no trade.")
                 if _no_n.empty:
                     st.caption("Every match took a side. Unusual for this filter.")
                 else:

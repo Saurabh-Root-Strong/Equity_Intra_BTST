@@ -2927,6 +2927,12 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
         # until something did.
         if "conf_kind" in b.columns:
             b.loc[~_live, "conf_kind"] = ""
+        # AND THE SIDE, for the same reason and with sharper consequences: the tabs split on
+        # `_conf_side` when the filter is on, so a stale value keeps a row filed under
+        # "at SUPPORT" after price has walked off the level, with an empty level cell beside
+        # it. Every field describing the flag has to die with the flag.
+        if "_conf_side" in b.columns:
+            b.loc[~_live, "_conf_side"] = ""
     return _live_levels(b)
 
 

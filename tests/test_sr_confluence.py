@@ -437,7 +437,9 @@ def test_filtered_panel_has_a_NO_SIDE_tab_like_the_prefilter_panel():
     i = dash.index("def _struct_panel")
     body = dash[i:dash.index("        _struct_panel()", i)]
     assert "tb, tsh, tno = st.tabs(" in body, "the filtered panel must split three ways"
-    assert "No side (" in body
+    # the label is built from a variable now (it changes with the split rule), so assert the
+    # BUCKET exists and both namings are reachable rather than one fixed string
+    assert "No side" in body and "left the level" in body
     assert "with tno:" in body
     # the no-side frame must be the COMPLEMENT of the two directional ones, so nothing can
     # fall between the cracks the way it did before.
@@ -550,3 +552,34 @@ def test_tabs_split_on_the_LEVEL_side_when_the_filter_is_on():
     assert "at SUPPORT" in body and "at RESISTANCE" in body
     # the structure split must still exist for when the filter is OFF
     assert 'bb["side"] == "LONG"' in body and 'bb["side"] == "SHORT"' in body
+
+
+def test_every_field_describing_the_flag_dies_with_the_flag():
+    """refresh_prices clears the confluence when price walks out of the zone. It cleared
+    sr_conf and conf_kind but not _conf_side — harmless while the tabs split on the structure
+    tag, fatal the moment _conf_side became the classifier: stale rows stayed filed under
+    'LONG - at SUPPORT' with an empty level cell. Reported from a screenshot where 14 of 16
+    rows in that tab carried no level at all."""
+    import inspect
+    src = inspect.getsource(live.refresh_prices)
+    for col in ('"sr_conf"', '"conf_kind"', '"_conf_side"'):
+        assert f'b.loc[~_live, {col}] = ""' in src, f"refresh_prices must clear {col}"
+
+
+def test_a_row_that_left_the_zone_is_not_reported_as_being_at_the_level():
+    """Same arithmetic refresh_prices runs: inside the band the flag lives, outside it dies."""
+    import pandas as _pd
+    for ltp, still_there in ((99.6, True), (95.0, False), (105.0, False)):
+        gap = (ltp - 99.5) / 2.0                      # SUP: price above the level
+        assert bool(0 <= gap <= config.SR_CONF_NEAR_ATR) is still_there, ltp
+
+
+def test_third_tab_is_named_for_what_it_holds_in_each_mode():
+    """Splitting on the level, a row lands in the third tab only because price LEFT the zone —
+    calling that 'No side' would be wrong twice: it had a side, and the reason it is there is
+    the thing worth reading."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = dash.index("def _struct_panel")
+    body = dash[i:dash.index("        _struct_panel()", i)]
+    assert '_lbl_n = ("⚪ left the level" if _by_level else "⚪ No side")' in body         or "left the level" in body
+    assert "walked off" in body or "walked off the level" in body
