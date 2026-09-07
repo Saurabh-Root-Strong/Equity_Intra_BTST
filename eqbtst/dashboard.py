@@ -2087,31 +2087,58 @@ if tf == "Intraday":
                 format_func=lambda k: {"SHELF": "\U0001f6e1\ufe0f Real shelf",
                                        "FLIP": "\U0001f504 Flipped",
                                        "ANY": "\u2796 Either"}[k],
-                help=("**A level under price is not automatically a floor.** This board's "
-                      "levels are built from swing points, and a swing can be a LOW (price "
-                      "fell there and turned UP) or a HIGH (price rose there and turned "
-                      "DOWN). Both end up sitting under price eventually \u2014 but they are "
-                      "different things.\n\n"
-                      "\U0001f6e1\ufe0f **Real shelf** \u2014 built from the swings that turned "
-                      "price the way you need it turned: **lows** under a long, **highs** over "
-                      "a short. Your ABC example: price came down to \u20b9480 and went back "
-                      "UP, on the 1h *and* on the 4h. This is the default.\n\n"
-                      "\U0001f504 **Flipped** \u2014 an old **ceiling** price has broken above, "
-                      "now acting as a floor (or an old floor now capping a short). Textbook "
-                      "polarity reversal, and a genuine setup \u2014 but it is a breakout "
-                      "throwback, not a level that has ever held price up.\n\n"
-                      "\u2796 **Either** \u2014 no filter on what built it. This is what the "
-                      "board did before this control existed.\n\n"
-                      "**Why it matters:** measured over 8,566 daily observations, the nearest "
-                      "'support' under price on this universe was **21% pure swing-low**, "
-                      "**25% pure swing-high** and 53% mixed \u2014 **46% of them lean HIGH**. "
-                      "So without this filter, roughly every other 'support' is an old ceiling "
-                      "the stock broke through, not a floor it has bounced off.\n\n"
-                      "\u26a0\ufe0f **This is about the label being TRUE, not about profit.** "
-                      "Head to head the two kinds are indistinguishable forward (20-day "
-                      "difference \u22120.002pp, t=\u22120.00; nothing at any horizon reaches "
-                      "t=1.2). Shelf does not beat flip. It simply *is* what the word support "
-                      "means \u2014 and the drift stays negative for both."))
+                # REWRITTEN IN PLAIN ENGLISH, and one stale sentence removed with it: this
+                # text still told the reader "Real shelf ... This is the default" long after
+                # the default moved to Either (index=2 above). A tooltip that misstates the
+                # control's own default is worse than no tooltip -- it teaches the wrong
+                # mental model of a screen the reader cannot otherwise see inside. The example
+                # now runs ONE price through all three options instead of naming a different
+                # abstraction per bullet, because the whole difficulty here is that the two
+                # kinds look IDENTICAL on the board and only differ in how they were built.
+                help=("**Two completely different things can both look like "
+                      "'a level under price'.**\n\n"
+                      "The board finds levels by looking for turning points, and a turning "
+                      "point is one of two things:\n\n"
+                      "\u2022 a **low** \u2014 price dropped to there and turned back **UP** "
+                      "(buyers showed up)\n"
+                      "\u2022 a **high** \u2014 price rose to there and turned back **DOWN** "
+                      "(sellers showed up)\n\n"
+                      "Give it enough time and *both* end up sitting below price. On the "
+                      "board they look exactly the same. This control lets you say which one "
+                      "you actually want.\n\n"
+                      "---\n\n"
+                      "**An example.** Say \u20b9480 shows up on both of your charts, and the "
+                      "stock is trading at \u20b9485 now. Two ways it could have got there:\n\n"
+                      "\U0001f6e1\ufe0f **Real shelf** \u2014 \u20b9480 was built from **lows**. "
+                      "Price fell to \u20b9480 three times and bounced back up every time. "
+                      "Buyers have actually defended it. That is a floor in the ordinary "
+                      "meaning of the word \u2014 and it is the level your stop belongs "
+                      "under.\n\n"
+                      "\U0001f504 **Flipped** \u2014 \u20b9480 was built from **highs**. For "
+                      "weeks, every rally died at \u20b9480. Then price finally broke through "
+                      "and is now resting just above it. This is the well-known 'old ceiling "
+                      "becomes the new floor', and it is a real setup \u2014 but be honest "
+                      "about what it is: **this line has never once held price up.** It is a "
+                      "breakout coming back to touch its old ceiling, not a shelf with a "
+                      "track record.\n\n"
+                      "\u2796 **Either** \u2014 do not care what built it; show both kinds. "
+                      "**This is the default**, and it is what the board did before this "
+                      "control existed.\n\n"
+                      "*(A short is the same story upside down: for a **Real shelf** ceiling "
+                      "the level was built from **highs** price got pushed down from.)*\n\n"
+                      "---\n\n"
+                      "**Why the control is here at all.** Over 8,566 days on this universe, "
+                      "the nearest 'support' sitting under price was **21% pure low**, "
+                      "**25% pure high**, 53% a mix \u2014 **46% of them leaning HIGH**. So "
+                      "without this filter, roughly every second 'support' on your board is "
+                      "an old ceiling the stock broke through, not a floor it has ever "
+                      "bounced off.\n\n"
+                      "\u26a0\ufe0f **Choosing \U0001f6e1\ufe0f makes the label TRUE. It does "
+                      "not make you money.** Head to head, shelves and flips are "
+                      "indistinguishable going forward (20-day difference \u22120.002pp, "
+                      "t=\u22120.00; nothing at any horizon reaches t=1.2). Pick "
+                      "\U0001f6e1\ufe0f when you want the word *support* to mean what it "
+                      "says \u2014 not because it wins."))
             _c.radio(
                 "search where?", ["NONE", "UNIVERSE"], key="mtf_confscope",
                 horizontal=True,
