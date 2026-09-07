@@ -50,9 +50,18 @@ div[role="tooltip"] p{margin-bottom:.4rem;}
 
 
 def _cols(df, cols):
-    """Only the columns that actually exist — tolerates a stale cache / older board
-    that predates a new column (e.g. 'entered'), so a missing column never crashes."""
-    return [c for c in cols if c in df.columns]
+    """Only the columns that actually exist, each ONCE — tolerates a stale cache / older board
+    that predates a new column (e.g. 'entered'), so a missing column never crashes.
+
+    DE-DUPLICATED, order-preserving (first mention wins). The column lists are assembled by
+    concatenating conditional fragments, so the moment one fragment hoists a column to the
+    front while another still declares it later, the name appears twice — and `df[[... twice
+    ...]]` hands Streamlit a frame with two identical columns rather than raising. Caught when
+    the S/R columns were promoted to lead the row while still sitting inside the shared
+    structure block. Cheap to make impossible here instead of policing every list."""
+    seen = set()
+    return [c for c in cols
+            if c in df.columns and not (c in seen or seen.add(c))]
 
 
 # ── structure labels: the engine returns terse ENUMS (BREAKOUT_UP…); humans read glyph+word.
@@ -2174,7 +2183,10 @@ if tf == "Intraday":
         # tells you what the tab heading already said, while occupying a prime slot and
         # pushing the delivery and F&O reads toward the right edge. Kept (it confirms the
         # split, and the no-preset table has no tabs) but demoted.
-        light_cols = (["symbol", "sector", "sector tilt", "ltp", "day%"]
+        # The pre-filter table gets the same treatment, so switching the toggle on does not
+        # move the evidence column from one place to another between the two panels.
+        light_cols = (["symbol"] + (["sr_conf", "conf_gap"] if _conf_f else [])
+                      + ["sector", "sector tilt", "ltp", "day%"]
                       + (["setup", "deliv trend"] + fno.COLS + ["carry"] +
                          ["loc", "at_wall", "sr_conf", "conf_gap", "sup", "sup_t", "res",
                           "res_t", "headroom", "big_wall", "big_gap"]
@@ -2596,6 +2608,18 @@ if tf == "Intraday":
             # that triggered at 10:55 is a different read from one that triggered at 09:30,
             # and that question comes BEFORE the price. Rows that never fired show "—", so it
             # costs one narrow column.
+            # THE FILTER'S OWN EVIDENCE LEADS THE ROW. When 🧲 decides which names are on the
+            # board, `S/R aligned` and `conf gap` are the answer to "why is this here" -- and
+            # they were sitting ~15 columns right, behind the F&O block, off the edge of the
+            # screen. A list built on a condition must show that condition first; otherwise
+            # the eye lands on `setup` and reads a structure tag as the reason. Placed BEFORE
+            # `setup` because on this board the level is the thesis and the shape is context.
+            if _conf_f:
+                _sr = [c for c in ("sr_conf", "conf_gap") if c in cols]
+                if _sr:
+                    cols = [c for c in cols if c not in _sr]
+                    _at = cols.index("symbol") + 1 if "symbol" in cols else 0
+                    cols = cols[:_at] + _sr + cols[_at:]
             if "setup" in cols:
                 move = [c for c in ("entered", "ltp", "day%", "sector", "sector tilt")
                         if c in cols]

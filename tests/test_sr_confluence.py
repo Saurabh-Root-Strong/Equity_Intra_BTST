@@ -457,3 +457,53 @@ def test_every_enriched_row_lands_in_exactly_one_tab():
     assert len(lo) + len(sh) + len(no) == len(bb)
     assert set(lo.index) | set(sh.index) | set(no.index) == set(bb.index)
     assert not (set(lo.index) & set(sh.index)) and not (set(no.index) & set(lo.index))
+
+
+def test_sr_columns_lead_the_row_when_the_filter_decides_the_list():
+    """If 🧲 chose which names are on the board, `S/R aligned` is the answer to "why is this
+    here" — and it was sitting ~15 columns right, behind the F&O block, off the edge of the
+    screen. Reported as "it should come based on support/resistance": the filter was right,
+    the table was not saying so. Same defect the `sector tilt` relocation already fixed."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = dash.index("def _day_by_setup")
+    # SCAN THE WHOLE FUNCTION, never a fixed byte count — a comment added inside it would
+    # otherwise push the assertion out of the window and fail a test about unchanged code.
+    body = dash[i:dash.index("long_cols = _day_by_setup(", i)]
+    assert "if _conf_f:" in body and '"sr_conf", "conf_gap"' in body
+    # hoisted to just after `symbol`, i.e. BEFORE the setup relocation runs
+    assert body.index('_sr = [c for c in ("sr_conf", "conf_gap")') < body.index('if "setup" in cols:')
+
+
+def test_column_lists_cannot_render_a_duplicate_column():
+    """The column lists are built by concatenating conditional fragments, so the moment one
+    fragment hoists a column to the front while another still declares it later, the name
+    appears twice — and df[[...twice...]] hands Streamlit two identical columns rather than
+    raising. Caught for real when the S/R columns were promoted to lead the row while still
+    sitting inside the shared structure block. _cols must de-duplicate, first mention wins."""
+    import pandas as _pd
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("def _cols(df, cols):")
+    j = src.index("def _struct_label", i)          # next top-level def after it
+    ns = {}
+    exec(src[i:j], ns)
+    df = _pd.DataFrame({"a": [1], "b": [2], "c": [3]})
+    out = ns["_cols"](df, ["a", "b", "c", "a", "b", "zzz"])
+    assert out == ["a", "b", "c"], out
+    assert len(df[out].columns) == len(set(df[out].columns))
+
+
+def test_the_real_light_cols_list_survives_dedup():
+    """light_cols legitimately mentions sr_conf/conf_gap twice once the filter hoists them —
+    the hoist is conditional, the structure block is not. Proves the render path is safe."""
+    import pandas as _pd
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("def _cols(df, cols):")
+    j = src.index("def _struct_label", i)
+    ns = {}
+    exec(src[i:j], ns)
+    cols = ["symbol", "sr_conf", "conf_gap", "sector", "setup",
+            "loc", "at_wall", "sr_conf", "conf_gap", "sup"]
+    df = _pd.DataFrame({c: [0] for c in set(cols)})
+    out = ns["_cols"](df, cols)
+    assert out.count("sr_conf") == 1 and out.count("conf_gap") == 1
+    assert out.index("sr_conf") == 1, "the hoisted position must win, not the later one"
