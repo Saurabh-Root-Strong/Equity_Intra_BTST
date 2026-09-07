@@ -1945,7 +1945,7 @@ if tf == "Intraday":
         _census = None
         if _P:
             light = live.add_setup(light, ltf=_P["ltf"], htf=_P["htf"], conf_tol_bps=_conf_tol,
-                                   conf_kind=_conf_kind)
+                                   conf_kind=_conf_kind, conf_any_side=_conf_f)
             # CENSUS OF THE WHOLE TAPE — from the FULL SCAN, not from `light`. Taken after the
             # setup filter it once reported "1 setup type across 7 names", which describes your
             # filter and not the market; that was fixed. But `light` has ALREADY been cut by the
@@ -1956,7 +1956,8 @@ if tf == "Intraday":
             # therefore built from sc["board"] directly. Cost is nil — add_setup is arithmetic
             # over boxes the scan already carried.
             _census = live.add_setup(sc["board"], ltf=_P["ltf"], htf=_P["htf"],
-                                     conf_tol_bps=_conf_tol, conf_kind=_conf_kind)[
+                                     conf_tol_bps=_conf_tol, conf_kind=_conf_kind,
+                                     conf_any_side=_conf_f)[
                 ["setup", "setup_read", "turn₹L", "symbol", "dir"]].copy()
             # WHOLE-UNIVERSE MODE: the S/R read is the ONLY thing allowed to decide the list.
             # The question is "which names ANYWHERE are standing on a level both frames of my
@@ -2371,7 +2372,8 @@ if tf == "Intraday":
                         _re = live.refresh_light_prices(base)
                         light_live = live.add_setup(_re, ltf=_P["ltf"], htf=_P["htf"],
                                                     conf_tol_bps=_conf_tol,
-                                                    conf_kind=_conf_kind)
+                                                    conf_kind=_conf_kind,
+                                                    conf_any_side=_conf_f)
                         st.caption(f"💹 prices live ({dt.datetime.now():%H:%M:%S}) · structure & "
                                    f"walls pinned at {_sa:%H:%M}" if _sa else "💹 prices live")
                     light = light_live
@@ -2674,13 +2676,28 @@ if tf == "Intraday":
             # definition a name going sideways, so its main output had nowhere to appear.
             # Counts in the labels for the same reason the pre-filter panel has them --
             # "LONG (1) SHORT (0)" beside "133 matched" is a question you ask on sight.
-            _lo_n = _conf_order(bb[bb["side"] == "LONG"] if _has_side
-                                else bb[bb["action"] == "LONG"])
-            _sh_n = _conf_order(bb[bb["side"] == "SHORT"] if _has_side
-                                else bb[bb["sell"].isin(["SHORT", "WEAK"])])
+            # WITH 🧲 ON, THE LEVEL DECIDES THE SIDE. `side` is the STRUCTURE read, and a
+            # name standing on a shelf is almost always range-bound by that measure -- which
+            # dumped the entire S/R list into "no side" (measured: 143 matched, LONG 0,
+            # SHORT 4, No side 56). The claim this filter makes is far simpler and is already
+            # in `_conf_side`: price on a floor is a long candidate, price under a ceiling is
+            # a short candidate. Split on that instead, and the structure tag stays visible in
+            # the `setup` column as context rather than as the classifier.
+            _by_level = _conf_f and "_conf_side" in bb.columns
+            if _by_level:
+                _lo_n = _conf_order(bb[bb["_conf_side"] == "SUP"])
+                _sh_n = _conf_order(bb[bb["_conf_side"] == "RES"])
+            else:
+                _lo_n = _conf_order(bb[bb["side"] == "LONG"] if _has_side
+                                    else bb[bb["action"] == "LONG"])
+                _sh_n = _conf_order(bb[bb["side"] == "SHORT"] if _has_side
+                                    else bb[bb["sell"].isin(["SHORT", "WEAK"])])
             _no_n = _conf_order(bb[~bb.index.isin(_lo_n.index.union(_sh_n.index))])
-            tb, tsh, tno = st.tabs([f"🟢 LONG ({len(_lo_n)}) · {levels_tf} bars",
-                                    f"🔴 SHORT ({len(_sh_n)}) · {levels_tf} bars",
+            _lbl_l = ("🟢 LONG · at SUPPORT" if _by_level
+                      else f"🟢 LONG · {levels_tf} bars")
+            _lbl_s = ("🔴 SHORT · at RESISTANCE" if _by_level
+                      else f"🔴 SHORT · {levels_tf} bars")
+            tb, tsh, tno = st.tabs([f"{_lbl_l} ({len(_lo_n)})", f"{_lbl_s} ({len(_sh_n)})",
                                     f"⚪ No side ({len(_no_n)})"])
             with tb:
                 lo = _lo_n

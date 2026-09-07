@@ -2413,7 +2413,8 @@ def sd_label(kind: str, role: str) -> str:
 
 def add_setup(board: pd.DataFrame, ltf: str, htf: str,
               conf_tol_bps: float | None = None,
-              conf_kind: str | None = None) -> pd.DataFrame:
+              conf_kind: str | None = None,
+              conf_any_side: bool = False) -> pd.DataFrame:
     """Attach the HTFxLTF chartist synthesis to every row: setup tag, quality rank, the
     plain-English read, and `loc` (where the LTP sits inside the higher-TF range box).
 
@@ -2621,13 +2622,22 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str,
         # this board carries a no-side tag, and 10 of 30 such names on the live board had a
         # RESISTANCE confluence that could never be displayed. A no-side row therefore takes
         # whichever side price is actually standing on, and the label says which.
+        # WHOSE QUESTION IS THIS? By default the structure tag decides which side of price is
+        # worth looking at -- a long wants a floor, a short a ceiling. But when the S/R read is
+        # what SELECTS the board, that gating is backwards: a name whose structure reads LONG
+        # could never surface a resistance confluence, however plainly price sat under a
+        # ceiling, because the ceiling side was never searched. Measured symptom: 143 names
+        # matched on the whole universe and the directional tabs held 0 and 4, with 56 piled
+        # into "no side". With conf_any_side the level is found first and the side follows
+        # from WHICH side it was found on -- price on a floor is a long candidate, price under
+        # a ceiling is a short candidate, which is the whole chartist claim.
         _side = str(r.get("side") or "")
-        if _side == "SHORT":
+        if conf_any_side or _side not in ("LONG", "SHORT"):
+            sides = [True, False]                # search both; the nearer level wins
+        elif _side == "SHORT":
             sides = [False]                      # ceiling only
-        elif _side == "LONG":
-            sides = [True]                       # floor only
         else:
-            sides = [True, False]                # no side: report whichever is nearer
+            sides = [True]                       # floor only
         near, tol = _CONF_NEAR * a, _CONF_TOL * px
         # PREFER THE KIND-ANNOTATED WALL LIST. sr_wallk carries (level, touches, n_lows,
         # n_highs) so the read can tell a level price BOUNCED UP FROM (swing lows = a demand

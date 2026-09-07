@@ -442,8 +442,10 @@ def test_filtered_panel_has_a_NO_SIDE_tab_like_the_prefilter_panel():
     # the no-side frame must be the COMPLEMENT of the two directional ones, so nothing can
     # fall between the cracks the way it did before.
     assert "_no_n = _conf_order(bb[~bb.index.isin(_lo_n.index.union(_sh_n.index))])" in body
-    # counts in the labels — this defect was invisible precisely because they were absent
-    assert "LONG ({len(_lo_n)})" in body and "SHORT ({len(_sh_n)})" in body
+    # counts in the labels — this defect was invisible precisely because they were absent.
+    # Asserted on the COUNT EXPRESSIONS, not on a fixed label string: the labels themselves
+    # change with the split rule (structure tag vs level side), the counts must not.
+    assert "{len(_lo_n)}" in body and "{len(_sh_n)}" in body and "{len(_no_n)}" in body
 
 
 def test_every_enriched_row_lands_in_exactly_one_tab():
@@ -507,3 +509,44 @@ def test_the_real_light_cols_list_survives_dedup():
     out = ns["_cols"](df, cols)
     assert out.count("sr_conf") == 1 and out.count("conf_gap") == 1
     assert out.index("sr_conf") == 1, "the hoisted position must win, not the later one"
+
+
+# ── THE LEVEL DECIDES THE SIDE (not the structure tag) ──────────────────────────────
+def test_setup_tag_must_not_gate_which_side_is_searched():
+    """The structure tag used to decide which side of price the confluence was allowed to look
+    at, so a name reading LONG could never surface a resistance confluence however plainly
+    price sat under a ceiling. Measured on the live board: 143 matched with LONG 0 / SHORT 4 /
+    No side 56, and 7 names were invisible outright."""
+    # tag says LONG (HTF uptrend), but the only aligned level is a CEILING overhead
+    b = _board([(100.5, 3)], [(100.5, 2)], side="LONG", built="H")
+    assert _conf(b.copy(), conf_kind="ANY")[0] == ""            # gated: never searched
+    out = live.add_setup(b.copy(), ltf="1h", htf="4h", conf_kind="ANY", conf_any_side=True)
+    assert "RES 100.50" in out["sr_conf"].iloc[0]               # found once ungated
+    assert out["_conf_side"].iloc[0] == "RES"
+
+
+def test_conf_any_side_can_only_add_matches_never_remove_one():
+    """Ungating is a superset: every level the tag-gated search could find is still found."""
+    for side, walls, built in (("LONG", [(99.5, 3)], "L"), ("SHORT", [(100.5, 3)], "H")):
+        b = _board(walls, walls, side=side, built=built)
+        gated = live.add_setup(b.copy(), ltf="1h", htf="4h", conf_kind="ANY")
+        free = live.add_setup(b.copy(), ltf="1h", htf="4h", conf_kind="ANY",
+                              conf_any_side=True)
+        if gated["sr_conf"].iloc[0]:
+            assert free["sr_conf"].iloc[0] == gated["sr_conf"].iloc[0]
+
+
+def test_tabs_split_on_the_LEVEL_side_when_the_filter_is_on():
+    """price on a floor = long candidate, price under a ceiling = short candidate. Splitting
+    on the structure tag instead put ~93% of matches under 'No side', because a name parked on
+    a shelf is range-bound BY THAT MEASURE — which is the whole point of the filter."""
+    dash = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = dash.index("def _struct_panel")
+    body = dash[i:dash.index("        _struct_panel()", i)]
+    assert '_by_level = _conf_f and "_conf_side" in bb.columns' in body
+    assert '_lo_n = _conf_order(bb[bb["_conf_side"] == "SUP"])' in body
+    assert '_sh_n = _conf_order(bb[bb["_conf_side"] == "RES"])' in body
+    # ...and the tab says which rule produced it, so the meaning is never ambiguous
+    assert "at SUPPORT" in body and "at RESISTANCE" in body
+    # the structure split must still exist for when the filter is OFF
+    assert 'bb["side"] == "LONG"' in body and 'bb["side"] == "SHORT"' in body
