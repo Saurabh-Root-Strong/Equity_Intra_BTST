@@ -583,3 +583,114 @@ def test_third_tab_is_named_for_what_it_holds_in_each_mode():
     body = dash[i:dash.index("        _struct_panel()", i)]
     assert '_lbl_n = ("⚪ left the level" if _by_level else "⚪ No side")' in body         or "left the level" in body
     assert "walked off" in body or "walked off the level" in body
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# SCOPE: "current list" vs "whole universe"
+# Reported live as "both options show the same table". They did, and correctly: measured on
+# a 254-name board with no other filter active, both modes returned the SAME 74 names --
+# narrowing a list that is already the whole universe IS scanning the whole universe. What
+# was missing was the board SAYING so, and a cap that could make the superset return fewer.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+def _load_quality_filter():
+    """Lift _quality_filter out of the dashboard so the branches can be exercised directly."""
+    import textwrap
+    import pandas as _pd
+    import numpy as _np
+    from eqbtst import mtf as _mtf
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("            def _quality_filter(")
+    j = src.index("            light, _setup_on, _room_on, _n_setup", i)
+    ns = {"pd": _pd, "np": _np, "mtf": _mtf}
+    exec(textwrap.dedent(src[i:j]), ns)
+    return ns["_quality_filter"]
+
+
+def _qf_frame():
+    import pandas as _pd
+    import numpy as _np
+    return _pd.DataFrame({
+        "symbol": ["A", "B", "C", "D"],
+        "setup":  ["WITH-TREND CONTINUATION", "RANGE-BOUND", "FALSE-BREAK TRAP", "RANGE-BOUND"],
+        "side":   ["LONG", "SHORT", "LONG", "-"],
+        "big_gap": [_np.inf, 0.7, 0.2, 1.4],
+    })
+
+
+def test_quality_filter_all_is_a_true_noop():
+    """`All`/`All` must not drop a row or claim a cut. Whole-universe mode forces exactly this
+    pair, so any accidental cut here would silently narrow the mode that promises not to."""
+    qf = _load_quality_filter()
+    df = _qf_frame()
+    out, s_on, r_on, n_s = qf(df, "All", "All")
+    assert len(out) == len(df) and not s_on and not r_on and n_s == len(df)
+
+
+def test_quality_filter_reproduces_every_branch():
+    qf = _load_quality_filter()
+    df = _qf_frame()
+    from eqbtst import mtf
+    assert set(qf(df, "\U0001f3af Textbook only", "All")[0]["symbol"]) == {"A"}
+    assert set(qf(df, "\U0001f7e2 Long-side setups", "All")[0]["symbol"]) == {"A", "C"}
+    assert set(qf(df, "\U0001f534 Short-side setups", "All")[0]["symbol"]) == {"B"}
+    _traps = set(df[df["setup"].isin(mtf.AVOID_TAGS)]["symbol"])
+    assert _traps, "fixture must contain a trap or the branch is untested"
+    assert set(qf(df, "\U0001faa4 Exclude traps", "All")[0]["symbol"]) == set(df["symbol"]) - _traps
+    # room legs partition the big_gap line: >=1 has room, 0.5-1 tight, <0.5 capped
+    assert set(qf(df, "All", "\u2705 Has room")[0]["symbol"]) == {"A", "D"}
+    assert set(qf(df, "All", "\u26a0 Tight")[0]["symbol"]) == {"B"}
+    assert set(qf(df, "All", "\U0001f9f1 Capped")[0]["symbol"]) == {"C"}
+
+
+def test_quality_filter_flags_which_stage_cut():
+    """The funnel attributes each cut to a named stage; a room cut must never read as a setup
+    cut, or an empty board becomes undiagnosable."""
+    qf = _load_quality_filter()
+    _, s_on, r_on, _ = qf(_qf_frame(), "All", "\u2705 Has room")
+    assert r_on and not s_on
+
+
+def test_shadow_chain_uses_the_REQUESTED_filters_not_the_overridden_ones():
+    """Whole-universe mode sets _setup_f/_room_f to "All" so the live chain stops cutting. The
+    shadow that reports "N were hidden by your other filters" must therefore read the SAVED
+    _setup_f_req/_room_f_req -- feeding it the overridden values would make the shadow equal
+    the universe and report 0 hidden names forever, i.e. exactly the bug it exists to explain."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("        if _P and _sr_universe:")
+    blk = src[i:src.index("_sr_new = int(", i)]
+    assert "_setup_f_req, _room_f_req" in blk, blk
+    assert "_quality_filter(_shadow, _setup_f, _room_f)" not in blk
+
+
+def test_shadow_puts_back_every_filter_the_mode_overrode():
+    """Each override announced in the funnel has to be re-applied by the shadow, or the delta
+    over-reports: price band, setup, room, delivery, structure."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("        if _P and _sr_universe:")
+    blk = src[i:src.index("_sr_new = int(", i)]
+    for leg in ("price_filter(", "_quality_filter(", "_deliv_filter(", "_mtf_filter("):
+        assert leg in blk, f"shadow does not re-apply {leg}"
+
+
+def test_cap_ranks_by_confluence_when_the_sr_read_decides_the_list():
+    """The 60-name enrich cap used to drop the overflow by TURNOVER. With the S/R filter on
+    that let a name which qualified on the current list fall out of the whole universe -- a
+    superset returning fewer names. Tightest confluence first instead."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("        _MAXE = 60")
+    blk = src[i:src.index("capped = filtered.sort_values", i) + 120]
+    assert '_cap_key, _cap_asc = "conf_gap", True' in blk
+    assert "ascending=_cap_asc" in blk
+    assert '_conf_f and "conf_gap" in filtered.columns' in blk
+
+
+def test_identical_scopes_are_called_out_rather_than_left_silent():
+    """A zero delta is the normal state when no other filter is set, and it is the state that
+    reads as "the control is broken". It must be stated, not left to be inferred from two
+    identical tables."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("if _sr_new == 0:")
+    blk = src[i:i + 900]
+    assert "_c.warning(" in blk, "a zero delta must be surfaced, not captioned quietly"
+    assert "Current list" in blk

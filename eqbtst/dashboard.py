@@ -1968,34 +1968,45 @@ if tf == "Intraday":
             _setup_f_req, _room_f_req = _setup_f, _room_f
             if _sr_universe:
                 _setup_f, _room_f = "All", "All"
-            if _setup_f == "🎯 Textbook only":
-                light, _setup_on = light[light["setup"] == "WITH-TREND CONTINUATION"], True
-            elif _setup_f == "🟢 Long-side setups":
-                # DIRECTION, not tag: a continuation/pullback tag reads identically in a
-                # downtrend, so filtering on the tag alone served short setups as longs.
-                light, _setup_on = light[light["side"] == "LONG"], True
-            elif _setup_f == "🔴 Short-side setups":
-                light, _setup_on = light[light["side"] == "SHORT"], True
-            elif _setup_f == "🪤 Exclude traps":
-                light, _setup_on = light[~light["setup"].isin(mtf.AVOID_TAGS)], True
-            # UPPER-TF S/R FILTER — on the big-wall (one frame up), the level the pair is blind
-            # to. big_gap is still NUMERIC here (float, inf for clear); _fmt stringifies it only
-            # at render. "Room" = the higher frame is not capping the trade (clear or >=1 ATR);
-            # "Capped" = a defended higher-frame wall sits <0.5 ATR in the trade's direction.
-            # A SEPARATE flag from setup quality so the funnel can attribute each cut honestly:
-            # picking "Has room" with Setup quality = All must NOT read as a "setup" cut.
-            _n_setup = len(light)                       # count AFTER setup quality, BEFORE room
-            if _room_f != "All" and "big_gap" in light.columns:
-                _bg = pd.to_numeric(light["big_gap"], errors="coerce")
-                if _room_f == "✅ Has room":
-                    light, _room_on = light[np.isinf(_bg) | (_bg >= 1.0)], True
-                elif _room_f == "⚠ Tight":
-                    # 0.5-1.0 ATR. These names belonged to NEITHER of the old two options, so
-                    # flipping between them never showed them (measured 3.4-8.5% of the universe,
-                    # worst on Swing). Not a third opinion -- the missing third of the range.
-                    light, _room_on = light[(_bg >= 0.5) & (_bg < 1.0)], True
-                elif _room_f == "🧱 Capped":
-                    light, _room_on = light[_bg < 0.5], True
+            # ONE PREDICATE, TWO CALLERS. These cuts now run twice: once on the live chain,
+            # and once as a SHADOW so whole-universe mode can say how many of its names the
+            # current list was actually hiding. Duplicating the branch would let the two
+            # answers drift apart silently -- the very class of bug this control exists to
+            # expose. The body below is the block that used to sit here, unchanged but for
+            # the rename to parameters.
+            def _quality_filter(d_, setup_f, room_f):
+                _s_on = _r_on = False
+                if setup_f == "🎯 Textbook only":
+                    d_, _s_on = d_[d_["setup"] == "WITH-TREND CONTINUATION"], True
+                elif setup_f == "🟢 Long-side setups":
+                    # DIRECTION, not tag: a continuation/pullback tag reads identically in a
+                    # downtrend, so filtering on the tag alone served short setups as longs.
+                    d_, _s_on = d_[d_["side"] == "LONG"], True
+                elif setup_f == "🔴 Short-side setups":
+                    d_, _s_on = d_[d_["side"] == "SHORT"], True
+                elif setup_f == "🪤 Exclude traps":
+                    d_, _s_on = d_[~d_["setup"].isin(mtf.AVOID_TAGS)], True
+                # UPPER-TF S/R FILTER — on the big-wall (one frame up), the level the pair is blind
+                # to. big_gap is still NUMERIC here (float, inf for clear); _fmt stringifies it only
+                # at render. "Room" = the higher frame is not capping the trade (clear or >=1 ATR);
+                # "Capped" = a defended higher-frame wall sits <0.5 ATR in the trade's direction.
+                # A SEPARATE flag from setup quality so the funnel can attribute each cut honestly:
+                # picking "Has room" with Setup quality = All must NOT read as a "setup" cut.
+                _n_s = len(d_)                       # count AFTER setup quality, BEFORE room
+                if room_f != "All" and "big_gap" in d_.columns:
+                    _bg = pd.to_numeric(d_["big_gap"], errors="coerce")
+                    if room_f == "✅ Has room":
+                        d_, _r_on = d_[np.isinf(_bg) | (_bg >= 1.0)], True
+                    elif room_f == "⚠ Tight":
+                        # 0.5-1.0 ATR. These names belonged to NEITHER of the old two options, so
+                        # flipping between them never showed them (measured 3.4-8.5% of the universe,
+                        # worst on Swing). Not a third opinion -- the missing third of the range.
+                        d_, _r_on = d_[(_bg >= 0.5) & (_bg < 1.0)], True
+                    elif room_f == "🧱 Capped":
+                        d_, _r_on = d_[_bg < 0.5], True
+                return d_, _s_on, _r_on, _n_s
+
+            light, _setup_on, _room_on, _n_setup = _quality_filter(light, _setup_f, _room_f)
             # S/R CONFLUENCE — the pair's OWN two frames agreeing on a level price is at.
             # Its own flag and its own funnel stage: it is a different question from the
             # room filter (which reads ONE FRAME ABOVE the pair), so attributing a cut to
@@ -2006,6 +2017,7 @@ if tf == "Intraday":
                 light, _conf_on = light[_cg <= config.SR_CONF_NEAR_ATR], True
             light = light.sort_values(["setup_rank", "turn₹L"], ascending=[True, False])
 
+        _sr_new = None
         # ── THE 🧲 TOGGLE ITSELF — drawn at the top right of whichever table this run
         # renders. Called from THREE places because there are three reachable table paths
         # (unfiltered tabs / filtered panel / the empty board) and exactly one of them runs
@@ -2126,12 +2138,31 @@ if tf == "Intraday":
                       "name in the F&O universe with its levels attached, so this is instant. "
                       "It is NOT the \u21bb re-scan universe button higher up the page, which "
                       "really does re-pull ~270 histories.\n\n"
-                      "\u26a0\ufe0f Expect a LONGER list, and remember only the top 60 by "
-                      "turnover get the per-name levels/RSI read."))
+                      "\u26a0\ufe0f Expect a LONGER list, and remember only the top 60 get "
+                      "the per-name levels/RSI read \u2014 ranked by TIGHTEST confluence "
+                      "while this filter is on, so the cap drops the loosest matches rather "
+                      "than the smallest names."))
             if _sr_universe:
                 _c.caption("\U0001f310 **Whole universe** \u2014 this list is decided by the "
                            "S/R read ALONE. Price band, Setup quality, Upper-TF S/R, delivery "
                            "and structure are all ignored while this is selected.")
+                # THE DELTA, NOT JUST THE PROMISE. Reported live 2026-09-07 as "current list
+                # and whole universe show the same data". They did, and correctly so: with
+                # nothing else narrowing the board the two questions are the same question.
+                # Saying that outright is the fix -- silence made a no-op look like a defect.
+                if _sr_new == 0:
+                    _c.warning(
+                        "\u2194\ufe0f **Same list as \u25ab\ufe0f Current list right now "
+                        "\u2014 and that is arithmetic, not a fault.** Nothing else is "
+                        "narrowing the board, so your current list already **is** the whole "
+                        "universe. These two options can only differ once a price band, "
+                        "Setup quality, Upper-TF S/R, a delivery slider or a structure box "
+                        "is actually cutting names.")
+                elif _sr_new:
+                    _c.caption(
+                        f"\U0001f195 **{_sr_new}** of these were hidden by your other "
+                        f"filters \u2014 \u25ab\ufe0f Current list would show "
+                        f"**{len(filtered) - _sr_new}** of the same **{len(filtered)}**.")
             _pct = _conf_tol / 100.0
             # SNAP TO THE NEAREST MEASURED SETTING. The slider steps finer than the study
             # did, so name the setting the numbers actually come from rather than quietly
@@ -2163,6 +2194,20 @@ if tf == "Intraday":
         # as the two above: in whole-universe mode the S/R condition is the whole answer.
         after_deliv = light if _sr_universe else _deliv_filter(light)
         filtered = after_deliv if _sr_universe else _mtf_filter(after_deliv)
+        # WHAT DID WHOLE-UNIVERSE ACTUALLY ADD? Every filter this mode overrode is a pure row
+        # predicate on columns `filtered` still carries, so the current-list answer is exactly
+        # `filtered` put back through them -- no second scan, no second add_setup, and the
+        # order does not matter because they all commute. Measured on a live 254-name board
+        # with no other filter set, the two modes returned the SAME 74 names. That is not a
+        # bug: narrowing a list that is already the whole universe IS scanning the whole
+        # universe. But two identical tables with no explanation is how a working control gets
+        # read as broken, so the delta is stated on screen rather than left to be diffed by
+        # eye against a table whose top rows overlap by construction.
+        if _P and _sr_universe:
+            _shadow = price_filter(filtered, "ltp")
+            _shadow, _, _, _ = _quality_filter(_shadow, _setup_f_req, _room_f_req)
+            _shadow = _mtf_filter(_deliv_filter(_shadow))
+            _sr_new = int(len(filtered) - len(_shadow))
         active = (_htf_on or _ltf_on or _setup_on or _room_on or _conf_on
                   or (min_wtd > 0) or (min_vs > 0))
         # `deliv 5wk` sits immediately after `side`: once you know WHICH WAY a setup points, the
@@ -2547,10 +2592,19 @@ if tf == "Intraday":
         # (they have LOW day%). Liquidity-first keeps the most FILLABLE matches, any direction.
         _MAXE = 60
         _cap_key = "turn₹L" if "turn₹L" in filtered.columns else "day%"
-        capped = filtered.sort_values(_cap_key, ascending=False).head(_MAXE)
+        _cap_asc = False
+        if _conf_f and "conf_gap" in filtered.columns:
+            # WHEN THE S/R READ DECIDES THE LIST, IT DECIDES THE CAP TOO. Ranking the overflow
+            # by turnover let a name that qualified on the current list fall OUT of the whole
+            # universe -- a superset returning fewer names, which is precisely the confusion
+            # the scope control was added to remove. Tightest confluence first: the cap then
+            # drops the loosest matches, the same ordering the table itself is sorted by.
+            _cap_key, _cap_asc = "conf_gap", True
+        capped = filtered.sort_values(_cap_key, ascending=_cap_asc).head(_MAXE)
         if len(filtered) > _MAXE:
-            st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by turnover "
-                       "(most fillable) for levels/verdict. Tighten a leg to see the rest.")
+            st.caption(f"⚠ {len(filtered)} matches — reading the top **{_MAXE}** by "
+                       + ("**tightest confluence**" if _cap_asc else "turnover (most fillable)")
+                       + " for levels/verdict. Tighten a leg to see the rest.")
         with st.spinner(f"Reading {len(capped)} matches on {levels_tf} bars for levels & verdict…"):
             # WITH 🧲 ON, `entered` MEASURES A DIFFERENT EVENT. The footprint clock answers
             # "did smart money step in today"; the confluence answers "how long has price been
