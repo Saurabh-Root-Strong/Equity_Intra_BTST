@@ -2252,7 +2252,17 @@ if tf == "Intraday":
             _arrow = {"UP": " ↑", "DOWN": " ↓"}
             _key = _census["setup"] + _census["dir"].map(lambda d: _arrow.get(d, ""))
             _vc = _key.value_counts()
-            _band_cut = len(_census) - len(light) if not _setup_on else None
+            # WHAT THE BAND HIDES IS THE BAND'S CUT, NOT EVERY CUT. This read
+            # `len(_census) - len(light)`, but by here `light` has also been through Setup
+            # quality, the Upper-TF room filter AND the S/R confluence filter — and the
+            # `not _setup_on` guard only excused the first of those three. With the S/R toggle
+            # on it announced "incl. 218 your price band hides" on a board whose own funnel,
+            # four lines above it, read `scanned 247 → price band → 112` — a 135-name cut. Two
+            # numbers for the same quantity on one screen, the louder one blaming a control
+            # that did not make the cut. `_n_band` is counted immediately after the band and
+            # after nothing else, so it cannot absorb a later stage's work.
+            _band_cut = (len(_census) - _n_band) if _n_band is not None else None
+            _band_cut = _band_cut if (_band_cut or 0) > 0 else None
             with st.expander(f"🔭 What the {_P['ltf']} × {_P['htf']} tape says right now — "
                              f"{len(_vc)} setup types across all {len(_census)} scanned names"
                              + (f"  (incl. {_band_cut} your price band hides)"

@@ -694,3 +694,15 @@ def test_identical_scopes_are_called_out_rather_than_left_silent():
     blk = src[i:i + 900]
     assert "_c.warning(" in blk, "a zero delta must be surfaced, not captioned quietly"
     assert "Current list" in blk
+
+
+def test_census_band_cut_counts_only_the_band():
+    """The census header claims "incl. N your price band hides". N was `len(_census) - len(light)`
+    with `light` already past setup quality, the Upper-TF room filter and the S/R confluence
+    filter — so with the S/R toggle on it read 218 on a board whose funnel said the band cut
+    247 -> 112. It must be measured against `_n_band`, the count taken right after the band."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("_band_cut = ")
+    blk = src[i:src.index("your price band hides", i)]
+    assert "len(_census) - _n_band" in blk, blk
+    assert "len(light)" not in blk, "band cut must not be measured against the filtered frame"
