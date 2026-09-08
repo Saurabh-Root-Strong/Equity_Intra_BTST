@@ -2799,8 +2799,18 @@ if tf == "Intraday":
             with tb:
                 lo = _lo_n
                 if lo.empty:
-                    st.caption("No LONG-side setup among the matches. That is a reading of the "
-                               "tape, not an error — loosen a filter to see more.")
+                    # THE EMPTY STATE HAS TO NAME THE SAME TEST THE TAB DOES. Splitting on the
+                    # level, "no LONG-side setup" describes a filter that is no longer running:
+                    # nothing here consults the structure side. Same mistake as the third tab's
+                    # old "No side" label, and it misleads in the direction that costs — it
+                    # reads as "the setups dried up" when the true statement is "nothing is
+                    # standing on a floor right now".
+                    st.caption(
+                        "No name is standing at a **support both frames agree on** right now. "
+                        "A reading of the tape, not an error — widen the tolerance or "
+                        "↻ re-scan." if _by_level else
+                        "No LONG-side setup among the matches. That is a reading of the "
+                        "tape, not an error — loosen a filter to see more.")
                 else:
                     lo = _wt(_dw(lo, _ASOF_LIVE, _hz), _ASOF_LIVE, "LONG")
                     st.dataframe(_fmt(lo)[_cols(lo, long_cols)], use_container_width=True,
@@ -2811,10 +2821,44 @@ if tf == "Intraday":
                 st.warning("⚠ **Intraday short only — SQUARE OFF BEFORE THE CLOSE.** Overnight "
                            "short is proven -EV (win 20%); intraday direction has no validated "
                            "edge either. Weakness screen, not alpha — trade small, manage by s_stop.")
+                if _by_level:
+                    # WHAT SELECTED THESE NAMES, SAID OUT LOUD. This tab used to require
+                    # `side == "SHORT"` — the MTF structure read, which is direction- and
+                    # regime-aware. Splitting on the level replaced that with a single
+                    # question: is price under a ceiling both frames mark? That is exactly
+                    # what was asked for, and it is also strictly LESS gated than what it
+                    # replaced, on the side this board's own evidence is harshest about. The
+                    # structure read still travels in `setup` / `sell`, so the fix is to say
+                    # where it went rather than to quietly re-impose it.
+                    st.caption(
+                        "🧲 **The LEVEL alone put these here.** A name is on this tab because "
+                        "price is standing under a ceiling both of your frames mark at the "
+                        "same price — *not* because its trend, regime or setup reads short. "
+                        "The structure side that used to gate this tab now travels in the "
+                        "`setup` and `sell` columns, so read them: a name that is **UP on the "
+                        "day**, in an **overweight sector**, at a level marked 🔄 (an old "
+                        "floor price broke below — never a proven ceiling) is a weak short "
+                        "however tight the confluence.")
+                    if levels_tf in ("1D", "1W"):
+                        # THE FRAME AND THE HOLD PERIOD HAVE TO AGREE. A ceiling read off
+                        # DAILY or WEEKLY bars is a multi-week thesis; the rule directly above
+                        # says square off before the close. Both are individually right and
+                        # they do not compose, so a short taken here is a weeks-long idea
+                        # expressed as a one-day trade — which is neither.
+                        st.caption(
+                            f"⏳ **Frame check:** these levels are read off **{levels_tf}** "
+                            "bars, so the thesis is weeks long — but the rule above says "
+                            "square off before the close, and that rule is the measured one. "
+                            "The two do not compose. Either drop the Lower TF to an intraday "
+                            "frame, or read this list as a *map of where the ceiling is*, "
+                            "not as a trade list.")
                 sh = _sh_n
                 if sh.empty:
-                    st.caption("No SHORT-side setup among the matches. A reading of the tape, "
-                               "not an error.")
+                    st.caption(
+                        "No name is standing at a **resistance both frames agree on** right "
+                        "now. A reading of the tape, not an error." if _by_level else
+                        "No SHORT-side setup among the matches. A reading of the tape, "
+                        "not an error.")
                 else:
                     sh = _wt(_dw(sh, _ASOF_LIVE, _hz), _ASOF_LIVE, "SHORT")
                     st.dataframe(_fmt(sh)[_cols(sh, sell_cols_tf)], use_container_width=True,

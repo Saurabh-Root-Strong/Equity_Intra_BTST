@@ -706,3 +706,37 @@ def test_census_band_cut_counts_only_the_band():
     blk = src[i:src.index("your price band hides", i)]
     assert "len(_census) - _n_band" in blk, blk
     assert "len(light)" not in blk, "band cut must not be measured against the filtered frame"
+
+
+def test_empty_state_names_the_test_the_tab_actually_runs():
+    """Splitting on the level, "No SHORT-side setup among the matches" describes a filter that
+    is no longer running — nothing on that tab consults the structure side. It misleads in the
+    expensive direction: it reads as "the setups dried up" when the true statement is "nothing
+    is standing at a level right now"."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    for word in ("support both frames agree on", "resistance both frames agree on"):
+        assert word in src, word
+    # and the old wording must survive for the non-level split, which still is a side read
+    assert "No SHORT-side setup among the matches" in src
+    assert "No LONG-side setup among the matches" in src
+
+
+def test_short_tab_discloses_that_the_level_alone_selected_it():
+    """The tab used to require side == "SHORT" (direction- and regime-aware). The level split
+    replaced that with "is price under a ceiling" — strictly less gated, on the side this
+    board's own evidence is harshest about. That has to be stated, not left to be inferred."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("**Intraday short only")
+    blk = src[i:i + 2600]
+    assert "The LEVEL alone put these here" in blk
+    assert "_by_level" in blk
+
+
+def test_daily_and_weekly_frames_flag_the_hold_period_clash():
+    """A ceiling read off 1D/1W bars is a multi-week thesis; the banner above it says square off
+    before the close. Both are right, and they do not compose."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("**Intraday short only")
+    blk = src[i:i + 2600]
+    assert 'levels_tf in ("1D", "1W")' in blk
+    assert "Frame check" in blk
