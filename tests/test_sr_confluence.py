@@ -560,10 +560,17 @@ def test_every_field_describing_the_flag_dies_with_the_flag():
     tag, fatal the moment _conf_side became the classifier: stale rows stayed filed under
     'LONG - at SUPPORT' with an empty level cell. Reported from a screenshot where 14 of 16
     rows in that tab carried no level at all."""
-    import inspect
-    src = inspect.getsource(live.refresh_prices)
-    for col in ('"sr_conf"', '"conf_kind"', '"_conf_side"'):
-        assert f'b.loc[~_live, {col}] = ""' in src, f"refresh_prices must clear {col}"
+    # ASSERTS THE BEHAVIOUR, NOT THE SOURCE LINE. This originally grepped for the literal
+    # `b.loc[~_live, "x"] = ""` and so went red when clear-only was replaced by
+    # derive-from-pinned-original -- a rewrite that keeps the clearing and ADDS the restore.
+    # A test that fails on a strictly better implementation is testing the spelling.
+    import numpy as _np
+    run = _conf_block()
+    b = _conf_row(481.0)
+    b["ltp"] = 489.0                                  # walked out of the zone
+    r = run(b).iloc[0]
+    assert r["sr_conf"] == "" and r["conf_kind"] == "" and r["_conf_side"] == ""
+    assert not _np.isfinite(r["conf_gap"])
 
 
 def test_a_row_that_left_the_zone_is_not_reported_as_being_at_the_level():
@@ -740,3 +747,111 @@ def test_daily_and_weekly_frames_flag_the_hold_period_clash():
     blk = src[i:i + 2600]
     assert 'levels_tf in ("1D", "1W")' in blk
     assert "Frame check" in blk
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# THE LIVE FLAG IS DERIVED, NOT DESTROYED
+# refresh_prices used to CLEAR sr_conf / conf_kind / _conf_side and never restore them, while
+# `_conf_side` was simultaneously the tab classifier AND an input to the gap arithmetic. Three
+# compounding failures came out of that one design fault; these pin all three.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+def _conf_block():
+    """The confluence half of refresh_prices, executed straight from source (no network)."""
+    import textwrap
+    import numpy as _np
+    import pandas as _pd
+    from eqbtst import config as _cfg
+    src = io.open("eqbtst/live.py", encoding="utf-8").read()
+    i = src.index('    if "_conf_px" in b.columns:')
+    j = src.index("    return _live_levels(b)", i)
+    code = textwrap.dedent(src[i:j])
+
+    def _run(b):
+        ns = {"pd": _pd, "np": _np, "config": _cfg, "b": b}
+        exec(code, ns)
+        return ns["b"]
+    return _run
+
+
+def _conf_row(ltp, clock=True, side="SUP", lv=480.0, atr=10.0):
+    import pandas as _pd
+    return _pd.DataFrame([{
+        "symbol": "T", "ltp": ltp, "_sr_atr": atr,
+        "_conf_px": lv, "_conf_side": side, "conf_kind": "SHELF",
+        "sr_conf": "SUP 480.00", "conf_gap": 0.10,
+        "_conf_str0": "SUP 480.00", "_conf_side0": side, "_conf_kind0": "SHELF",
+        "_conf_clock": clock, "entered": "09:15", "at": 481.0, "since%": 0.1, "at_bars": 3,
+    }])
+
+
+def test_the_flag_comes_back_when_price_does():
+    """The old code only ever cleared, so the FIRST time a name left the zone it was stranded
+    under "left the level" for the rest of the session however many times price returned —
+    draining the directional tabs monotonically through the day on a board whose median
+    flagged name spends only ~68% of the session's range inside the zone."""
+    import numpy as _np
+    run = _conf_block()
+    b = _conf_row(481.0)
+    for px in (481.0, 489.0, 481.5):        # on it, off it, back on it
+        b["ltp"] = px
+        b = run(b)
+    r = b.iloc[0]
+    assert _np.isfinite(r["conf_gap"]), "gap must be live again"
+    assert r["_conf_side"] == "SUP", "the tab classifier must be restored"
+    assert r["sr_conf"], "the level cell must be restored, not left blank beside a live gap"
+    assert r["conf_kind"] == "SHELF"
+
+
+def test_a_broken_support_never_re_reads_as_a_resistance():
+    """`_conf_side` was blanked to mark "left the level" and then read back as an INPUT to the
+    gap arithmetic, so the next tick evaluated a cleared SUPPORT with the RESISTANCE formula.
+    Probed: price 0.40 ATR BELOW a broken shelf reported conf_gap 0.40 — a live-looking number
+    on a floor that had just failed."""
+    import numpy as _np
+    run = _conf_block()
+    b = _conf_row(481.0)
+    for px in (489.0, 476.0):               # leaves upward, then breaks DOWN through it
+        b["ltp"] = px
+        b = run(b)
+    assert not _np.isfinite(b.iloc[0]["conf_gap"]), "a broken support is not 'at' anything"
+    assert b.iloc[0]["_conf_side"] == ""
+
+
+def test_the_arrival_clock_dies_with_the_flag():
+    """With the filter on, `entered`/`at`/`since%`/`at_bars` time the stay AT THE LEVEL, so a
+    row that has left it was still reading "at level since 09:15" beside a blank level."""
+    import pandas as _pd
+    run = _conf_block()
+    b = _conf_row(481.0)
+    b["ltp"] = 489.0
+    r = run(b).iloc[0]
+    for c in ("entered", "at", "since%", "at_bars"):
+        assert r[c] is None or _pd.isna(r[c]), f"{c} outlived the flag"
+
+
+def test_the_footprint_clock_survives_when_the_filter_is_off():
+    """With the filter OFF those same columns carry the validated BTST footprint trigger — a
+    different event on a different clock. Clearing it would delete the board's one validated
+    signal because an unrelated level moved."""
+    run = _conf_block()
+    b = _conf_row(489.0, clock=False)
+    assert run(b).iloc[0]["entered"] == "09:15"
+
+
+def test_add_setup_pins_the_originals_it_restores_from():
+    """The restore is only possible because add_setup writes an immutable copy. If these ever
+    stop being emitted the live path silently degrades back to clear-only."""
+    src = io.open("eqbtst/live.py", encoding="utf-8").read()
+    i = src.index('    b["sr_conf"], b["conf_gap"] = conf, conf_gap')
+    blk = src[i:i + 1400]
+    for c in ("_conf_str0", "_conf_side0", "_conf_kind0"):
+        assert f'b["{c}"]' in blk, c
+
+
+def test_gap_arithmetic_reads_the_pinned_side_not_the_displayed_one():
+    src = io.open("eqbtst/live.py", encoding="utf-8").read()
+    i = src.index('    if "_conf_px" in b.columns:')
+    blk = src[i:src.index("    return _live_levels(b)", i)]
+    assert "_side0" in blk and '_sup = _side0 == "SUP"' in blk
+    assert '_sup = b["_conf_side"].astype(str) == "SUP"' not in blk, "reads the mutated field"

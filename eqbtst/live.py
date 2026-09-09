@@ -2705,6 +2705,15 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str,
     b["sr_conf"], b["conf_gap"] = conf, conf_gap
     b["_conf_px"], b["_conf_side"] = conf_px, conf_side
     b["conf_kind"] = conf_kd
+    # PINNED ORIGINALS. The four visible fields above are CLEARED by refresh_prices when live
+    # price walks out of the zone -- and were never restored when it walked back in, because
+    # nothing kept a copy of what to restore. Worse, `_conf_side` was simultaneously the tab
+    # classifier and an input to the gap arithmetic, so blanking it made the next tick
+    # re-derive a SUPPORT with the RESISTANCE formula. These columns are written once, here,
+    # and never mutated; refresh_prices derives every live field from them.
+    b["_conf_str0"] = list(conf)
+    b["_conf_side0"] = list(conf_side)
+    b["_conf_kind0"] = list(conf_kd)
     return b
 
 
@@ -2761,6 +2770,12 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
         s_t2 = round(ltp - 2 * atr_tf, 2) if atr_tf > 0 else None
         return {
             "symbol": sym, "entered": entered, "at": at_px, "since%": since_pct,
+            # WHICH CLOCK THESE FOUR COLUMNS ARE CARRYING. With the confluence filter on they
+            # time the stay AT THE LEVEL; with it off they time the footprint trigger, which
+            # is a different event on a different clock. refresh_prices has to clear the first
+            # when price leaves the level and must never touch the second, and it cannot tell
+            # them apart from the values alone.
+            "_conf_clock": bool(conf_entry),
             "at_bars": conf_bars, "time": bar_time,
             "bar": ("⏳ forming" if forming else "✓ closed") if forming is not None else None,
             "s15m": r["s15m"], "s1h": r["s1h"], "s2h": r["s2h"],
@@ -2916,23 +2931,44 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
         _cpx = pd.to_numeric(b["_conf_px"], errors="coerce")
         _cltp = pd.to_numeric(b["ltp"], errors="coerce")
         _catr = pd.to_numeric(b["_sr_atr"], errors="coerce")
-        _sup = b["_conf_side"].astype(str) == "SUP"
+        # THE SIDE USED FOR THE ARITHMETIC IS THE PINNED ONE, NEVER THE DISPLAYED ONE. The
+        # displayed `_conf_side` is blanked below to file a row under "left the level"; using
+        # it here meant a cleared SUPPORT was re-read as a RESISTANCE on the next tick, which
+        # produced a finite conf_gap on a floor that had just BROKEN (probed: price 0.40 ATR
+        # below a broken shelf reported conf_gap 0.40). Falls back to the live column only for
+        # a board built before add_setup pinned these.
+        _side0 = (b["_conf_side0"] if "_conf_side0" in b.columns
+                  else b.get("_conf_side", pd.Series("", index=b.index)))
+        _side0 = _side0.astype(str)
+        _sup = _side0 == "SUP"
         _gap = (_cltp - _cpx).where(_sup, _cpx - _cltp) / _catr     # signed, in trigger ATR
-        _live = _cpx.notna() & (_catr > 0) & (_gap >= 0) & (_gap <= config.SR_CONF_NEAR_ATR)
+        _live = (_cpx.notna() & (_catr > 0) & _side0.isin(["SUP", "RES"])
+                 & (_gap >= 0) & (_gap <= config.SR_CONF_NEAR_ATR))
         b["conf_gap"] = np.where(_live, _gap.round(2), np.inf)
-        b.loc[~_live, "sr_conf"] = ""
-        # THE KIND MUST DIE WITH THE FLAG IT DESCRIBES. Leaving it set on a cleared row keeps
-        # a SHELF/FLIP verdict alive for a level price has already walked away from -- a stale
-        # claim that nothing displays today, which is exactly how it would have rotted unseen
-        # until something did.
-        if "conf_kind" in b.columns:
-            b.loc[~_live, "conf_kind"] = ""
-        # AND THE SIDE, for the same reason and with sharper consequences: the tabs split on
-        # `_conf_side` when the filter is on, so a stale value keeps a row filed under
-        # "at SUPPORT" after price has walked off the level, with an empty level cell beside
-        # it. Every field describing the flag has to die with the flag.
-        if "_conf_side" in b.columns:
-            b.loc[~_live, "_conf_side"] = ""
+        # DERIVE, DO NOT DESTROY. Every field describing the flag is rebuilt from the pinned
+        # original on each tick, so leaving the zone clears it AND returning restores it. The
+        # old code only ever cleared: the first exit stranded a name under "left the level"
+        # for the rest of the session however many times price came back, draining the
+        # directional tabs monotonically through the day on a board whose median flagged name
+        # spends only ~68% of the session's range inside the zone.
+        _blank = pd.Series("", index=b.index)
+        b["sr_conf"] = (b["_conf_str0"] if "_conf_str0" in b.columns
+                        else b.get("sr_conf", _blank)).where(_live, "")
+        if "conf_kind" in b.columns or "_conf_kind0" in b.columns:
+            b["conf_kind"] = (b["_conf_kind0"] if "_conf_kind0" in b.columns
+                              else b.get("conf_kind", _blank)).where(_live, "")
+        b["_conf_side"] = _side0.where(_live, "")
+        # THE ARRIVAL CLOCK DIES WITH THE FLAG TOO. With the filter on, `entered` / `at` /
+        # `since%` / `at_bars` answer "how long has price been standing on this level" -- so a
+        # row that has left the level was still reporting "at level since 09:15" beside a
+        # blank level cell. Only touched when enrich_mtf marked these columns as the LEVEL
+        # clock; with the filter off they carry the footprint trigger, which is a different
+        # event and must survive.
+        if bool(b.get("_conf_clock", pd.Series(False, index=b.index)).any()):
+            _clk = b["_conf_clock"].astype(bool) & ~_live
+            for _c in ("entered", "at", "since%", "at_bars"):
+                if _c in b.columns:
+                    b.loc[_clk, _c] = None
     return _live_levels(b)
 
 
