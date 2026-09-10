@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import (arb, config, data, fno, ledger, live, mtf, scalp, screen,
+from eqbtst import (arb, config, data, fno, ledger, live, mtf, paper, scalp, screen,
                     sector_tilt)
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
@@ -265,7 +265,7 @@ if last is None:
     raise RuntimeError(str(_err))
 tf = st.sidebar.radio("Timeframe",
                       ["BTST (overnight)", "Intraday", "🎬 Replay (practice)",
-                       "🧮 Arbitrage"],
+                       "🧮 Arbitrage", "📝 Paper trade (R)"],
                       index=0)
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
@@ -1126,6 +1126,209 @@ overnight if flagged 🌙 BTST-CARRY — never just because you bought it intrad
 = ATR risk geometry (trade management), **not** a price forecast. `action=EARNINGS` =
 excluded (reports results during the hold).
 """
+
+if tf == "📝 Paper trade (R)":
+    # ITS OWN LANE. This page does not screen anything -- it MEASURES the two lenses the rest
+    # of the board renders, by taking every signal they produce and managing it to a stop or a
+    # target in R. That is a different question from "what do I trade tonight", it needs no
+    # broker token (EOD archive only), and st.stop() keeps the live lanes from also running.
+    st.title("📝 Paper trade — expectancy in R")
+    st.caption("Every signal the lens produces, taken and managed to a stop or a target. "
+               "No screening, no cherry-picking, no discretion — the point is the "
+               "distribution, not a trade idea.")
+
+    with st.expander("💡 Why this page exists — the 40% / 1:3 claim, tested", expanded=True):
+        st.markdown(
+            "Van Tharp's expectancy formula is exact arithmetic:\n\n"
+            "> **E = (win% × avg win R) − (loss% × avg loss R)**\n\n"
+            "and at a 40% win rate with 1:3 it gives **(0.40×3R) − (0.60×1R) = "
+            "+0.60R**, which beats 60% at 1:1 (**+0.20R**). That much is not in dispute.\n\n"
+            "⚠️ **What the formula does not say is that you may CHOOSE both numbers.** "
+            "Win rate and reward multiple are not independent — widening the target is "
+            "exactly what lowers the hit rate. Assuming 40% *and* 1:3 assumes the answer.\n\n"
+            "So this page never assumes a win rate. It runs the **same signal** at 1:1, 1:1.5, "
+            "1:2, 1:3 and 1:5, and reports the win rate **each target actually earned**. "
+            "Expectancy is then computed from the measured pair — the only "
+            "non-circular version of the formula. Read the **R:R sweep** table first; "
+            "everything else on the page is detail.")
+
+    _pc = st.columns([2, 2, 2, 2])
+    _lens = _pc[0].radio("Which lens?", ["STRUCTURE", "SR"], horizontal=True,
+                         format_func=lambda k: {"STRUCTURE": "📐 Structure",
+                                                "SR": "🧲 Support / Resistance"}[k],
+                         key="paper_lens",
+                         help=("The same two reads the Intraday board renders.\n\n"
+                               "📐 **Structure** — trade when the higher-frame box "
+                               "× lower-frame structure read takes a SIDE (the directional "
+                               "tags: continuation, a range-edge break, a pullback, a coil at "
+                               "the extreme).\n\n"
+                               "🧲 **Support / Resistance** — trade when both "
+                               "frames mark a level at the same price and price is standing on "
+                               "it: LONG at a support, SHORT at a resistance."))
+    _rr = _pc[1].slider("Reward multiple (R:R)", 1.0, 5.0, 3.0, 0.5, key="paper_rr",
+                        help="Target distance as a multiple of the initial risk. The sweep "
+                             "table below reports every setting at once, so this only "
+                             "controls the detailed tables.")
+    _stop_atr = _pc[2].slider("Stop (× ATR)", 0.5, 3.0, 1.0, 0.25, key="paper_stopatr",
+                              help=("Initial risk = this × the trigger frame's ATR, which "
+                                    "is what **1R** means everywhere on this page. A wider "
+                                    "stop is not free: it is stopped out less often but each "
+                                    "loss costs the same 1R, and the target moves the same "
+                                    "multiple further away."))
+    _maxbars = _pc[3].slider("Time stop (bars)", 5, 60, 20, 5, key="paper_maxbars",
+                             help="Close at the market if neither the stop nor the target is "
+                                  "touched within this many daily bars. The exit books "
+                                  "whatever fraction of R it is worth.")
+
+    _sc2 = st.columns([2, 2, 2, 2])
+    _yrs = _sc2[0].slider("Years of history", 1, 8, 3, 1, key="paper_years",
+                          help="More years = more regimes and a firmer answer, and a longer "
+                               "run. The archive starts in 2018.")
+    _nmax = _sc2[1].slider("Names (by turnover)", 10, 250, 60, 10, key="paper_names",
+                           help=("How many of the most-traded names to simulate. Ranked by "
+                                 "median turnover, never alphabetically — a truncated "
+                                 "universe has to be a TRADEABLE subset or the study quietly "
+                                 "becomes 'how does this do on names beginning with A'."))
+    _sides = _sc2[2].multiselect("Sides", ["LONG", "SHORT"], default=["LONG", "SHORT"],
+                                 key="paper_sides",
+                                 help=("Shorts are included by default so the number is "
+                                       "honest, but remember what this board measured "
+                                       "elsewhere: overnight short is proven -EV on this "
+                                       "universe (win ~20%). Untick SHORT to see the long "
+                                       "side alone."))
+    _cost = _sc2[3].number_input("Cost (bps round trip)", 0.0, 100.0,
+                                 float(config.COST_BPS), 1.0, key="paper_cost",
+                                 help=("Charged **in R**, not in bps. A flat 22bps is a "
+                                       "different fraction of risk for every stop width — "
+                                       "0.11R on a 2%-of-price stop, 0.44R on a 0.5% one. "
+                                       "Subtracting a flat '0.1R' would flatter tight stops "
+                                       "exactly where they are least survivable."))
+
+    st.info("⏳ **Frames are 1D trigger + 1W confirm** (the Positional horizon). That is "
+            "the only pair the 8-year EOD archive can reproduce leak-free and without a "
+            "broker call. The intraday pairs (15m/1h, 1h/4h, 4h/1D) need broker history, "
+            "which serves ~60 days and is rate-limited — a 'backtest' on them would be a "
+            "few months of one regime dressed up as evidence, so this page does not offer "
+            "one rather than quietly running a worse study.")
+
+    @st.cache_data(show_spinner=False, ttl=3600)
+    def _run_paper(lens, rr, stop_atr, maxbars, yrs, nmax, sides, cost):
+        _start = (pd.Timestamp(last) - pd.DateOffset(years=int(yrs))).strftime("%Y-%m-%d")
+        return paper.simulate(lens=lens, rr=float(rr), stop_atr=float(stop_atr),
+                              max_bars=int(maxbars), start=_start, max_names=int(nmax),
+                              sides=tuple(sides), cost_bps=float(cost))
+
+    if not _sides:
+        st.warning("Pick at least one side.")
+        st.stop()
+    _go = st.button("▶ Run the simulation", type="primary")
+    _key = ("paper_last", _lens, _rr, _stop_atr, _maxbars, _yrs, _nmax, tuple(_sides), _cost)
+    if _go:
+        st.session_state["paper_key"] = _key
+    if st.session_state.get("paper_key") != _key:
+        # A RUN IS EXPENSIVE AND MUST BE ASKED FOR. Every widget above changes the result, so
+        # re-running on each slider nudge would put a ~1-4 minute job behind a drag gesture.
+        st.caption("⬆ Set the knobs, then press **Run the simulation**. "
+                   "A run takes roughly 1–4 minutes depending on the name count and "
+                   "years — it replays every bar through the real structure and level "
+                   "code, not a fast copy of it.")
+        st.stop()
+    with st.spinner("Replaying every bar through the real structure / level code…"):
+        _res = _run_paper(_lens, _rr, _stop_atr, _maxbars, _yrs, _nmax, _sides, _cost)
+    _tr, _sm, _meta = _res["trades"], _res["summary"], _res["meta"]
+    if _tr.empty:
+        st.warning("No trades. Widen the window or the name count.")
+        st.stop()
+
+    st.caption(f"{_meta['n_names']} names · {_meta['start']} → {_meta['end']} "
+               f"· {_meta['ltf']} trigger / {_meta['htf']} confirm · "
+               f"stop {_meta['stop_atr']}×ATR · cost {_meta['cost_bps']:.0f}bps")
+
+    # ── THE HEADLINE: win rate is not independent of the target ─────────────────────────
+    st.subheader("R:R sweep — what each target actually earns")
+    _sweep = _res.get("rr_curve", pd.DataFrame())
+    if not _sweep.empty:
+        st.dataframe(_sweep, use_container_width=True, hide_index=True)
+        _best = _sweep.loc[_sweep["expectancy_R"].idxmax()]
+        _w1 = _sweep.iloc[0]["win%"]
+        _wN = _sweep.iloc[-1]["win%"]
+        st.caption(
+            f"Win rate falls from **{_w1:.1f}%** at {_sweep.iloc[0]['R:R']} to "
+            f"**{_wN:.1f}%** at {_sweep.iloc[-1]['R:R']} — that fall is the whole point. "
+            f"Best expectancy here is **{_best['expectancy_R']:+.3f}R** at "
+            f"**{_best['R:R']}** (n={int(_best['n'])}, t={_best['t']}).")
+        if float(_sweep["expectancy_R"].max()) <= 0:
+            st.error(
+                "⛔ **Every reward multiple is NEGATIVE after cost.** This is the "
+                "answer the formula cannot give you from assumed inputs: no R:R rescues a "
+                "signal that has no directional edge — it only redistributes the same "
+                "negative expectancy between a smaller number of bigger wins and a larger "
+                "number of losses. Consistent with what the rest of this board measured: "
+                "the one validated edge here is the **BTST overnight carry**, not "
+                "intraday/structure direction.")
+
+    # ── expectancy card ────────────────────────────────────────────────────────────────
+    st.subheader(f"Detail at 1:{_rr:g}")
+    _m = st.columns(6)
+    _m[0].metric("trades", _sm["n"])
+    _m[1].metric("win rate", f"{_sm['win%']:.1f}%")
+    _m[2].metric("avg win", f"{_sm['avg_win_R']:+.2f}R")
+    _m[3].metric("avg loss", f"-{_sm['avg_loss_R']:.2f}R")
+    _m[4].metric("expectancy", f"{_sm['expectancy_R']:+.3f}R",
+                 help="Mean R per trade, net of cost. This is the number that decides "
+                      "whether the system makes money, not the win rate.")
+    _m[5].metric("total", f"{_sm['total_R']:+.1f}R")
+    _m2 = st.columns(4)
+    _m2[0].metric("profit factor", _sm["profit_factor"])
+    _m2[1].metric("t-stat", _sm["t"],
+                  help=("Expectancy divided by its standard error. R-multiples are heavy "
+                        "tailed and at a wide target the distribution is two spikes, so this "
+                        "is the only thing separating a real edge from a lucky run. |t| under "
+                        "~2 means the mean is not distinguishable from zero."))
+    _m2[2].metric("max drawdown", f"{_sm['max_dd_R']:.1f}R",
+                  help="Worst peak-to-trough of the cumulative R curve. Position sizing "
+                       "lives or dies here, not on expectancy.")
+    _m2[3].metric("expectancy check", f"{_sm['expectancy_check']:+.3f}R",
+                  help="The win%/avg-win decomposition recomputed. It must equal expectancy; "
+                       "if the two ever disagree the decomposition is wrong, not the mean.")
+
+    # ── equity curve, per year, trades ─────────────────────────────────────────────────
+    _eq = _tr.sort_values("entry_date").copy()
+    _eq["cum_R"] = _eq["R"].cumsum()
+    st.line_chart(_eq.set_index("entry_date")["cum_R"], height=220)
+    st.caption("Cumulative R, trades in entry order. Flat-to-down is the common outcome for "
+               "a directional screen on this universe and is not a bug in the page.")
+
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        st.markdown("**By year** — an edge that only exists in one year is not an edge.")
+        st.dataframe(_res["by_year"], use_container_width=True, hide_index=True)
+    with _c2:
+        st.markdown("**How trades ended**")
+        _why = _tr["why"].value_counts().rename_axis("exit").reset_index(name="n")
+        _why["share%"] = (100 * _why["n"] / len(_tr)).round(1)
+        st.dataframe(_why, use_container_width=True, hide_index=True)
+        st.caption("`stop` −1R · `target` +{:g}R · `time` whatever it was worth "
+                   "at the time stop. When a bar contains BOTH the stop and the target the "
+                   "STOP is assumed to hit first — daily bars carry no intrabar path, and "
+                   "resolving that in the trade's favour is how a backtest invents an edge "
+                   "that dies live.".format(_rr))
+
+    with st.expander(f"All {len(_tr)} trades"):
+        st.dataframe(_tr.sort_values("entry_date", ascending=False),
+                     use_container_width=True, hide_index=True)
+        st.download_button("⬇ CSV", _tr.to_csv(index=False).encode(),
+                           file_name=f"paper_{_lens}_{_rr:g}R.csv", mime="text/csv")
+
+    st.caption("🧪 **Assumptions, in one place.** Signal at bar *t* reads bars ≤ *t*; "
+               "entry fills at *t+1*'s OPEN; the weekly confirm frame uses only weeks CLOSED "
+               "before *t*; **one position per name at a time** (a persistent tag would "
+               "otherwise re-enter daily and count one position many times); cost charged in "
+               "R. Slippage beyond the cost figure, gaps through the stop, borrow and "
+               "position sizing are NOT modelled — each of them makes the real number "
+               "worse, never better.")
+    st.stop()
+
 
 if tf == "🧮 Arbitrage":
     # Its own LANE, not a tab inside another board, because it answers a different question
