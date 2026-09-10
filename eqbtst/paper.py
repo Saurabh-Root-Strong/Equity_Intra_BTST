@@ -390,3 +390,258 @@ def rr_sweep(bundle: dict | None = None, grid=RR_GRID, stop_atr: float = 1.0,
                      "expectancy_R": e["expectancy_R"], "total_R": e["total_R"],
                      "t": e["t"]})
     return pd.DataFrame(rows)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════
+# SCALP LANE — 1m trigger / 5m confirm
+# ═════════════════════════════════════════════════════════════════════════════════════
+SCALP_FRAMES = ("1m", "5m")
+# Hold horizons in MINUTES (= 1-minute bars). Capped at one hour because past that it stops
+# being a scalp and starts being an intraday swing with a scalp's cost structure.
+SCALP_HOLDS = (5, 15, 30, 60)
+
+
+def _sess_end(ts) -> "np.ndarray":
+    """For each bar, the index of the LAST bar of its own session (the square-off point)."""
+    d = pd.to_datetime(pd.Series(ts)).dt.date.to_numpy()
+    out = np.zeros(len(d), dtype=int)
+    idx = np.arange(len(d))
+    for day in pd.unique(d):
+        m = d == day
+        out[m] = idx[m].max()
+    return out
+
+
+def scalp_signals(ltf: pd.DataFrame, htf: pd.DataFrame, lens: str, i0: int,
+                  conf_tol_bps: float | None = None,
+                  near_atr: float | None = None) -> list[tuple]:
+    """1m x 5m signals. The confirm frame is counted CLOSED-ONLY.
+
+    scalp.py records what the alternative costs: its first offline replay printed WITH-TREND
+    CONTINUATION at +16.6bps with t = 33 and 100% of sessions positive, because each 1-minute
+    bar was indexed to the 5-minute bar CONTAINING it instead of the last one to have CLOSED --
+    handing the structure window up to four minutes of the future against a five-minute
+    forward return. searchsorted(htf_starts[1:], t, "right") counts confirm bars whose
+    SUCCESSOR has already begun, so only closed bars can ever be seen.
+    """
+    conf_tol_bps = float(config.SR_CONF_TOL_BPS if conf_tol_bps is None else conf_tol_bps)
+    near_atr = float(config.SR_CONF_NEAR_ATR if near_atr is None else near_atr)
+    lt, ht = ltf["ts"].to_numpy(), htf["ts"].to_numpy()
+    closed = np.searchsorted(ht[1:], lt, side="right")
+    sr_win = max(config.STRUCT_LOOKBACK * 3, 60)
+    out, cache = [], (None, None)
+    for i in range(i0, len(ltf) - 1):
+        nh = int(closed[i])
+        if nh < 8:
+            continue
+        if cache[0] != nh:
+            cache = (nh, indicators.struct_full(htf.iloc[:nh]))
+        hs = cache[1]
+        ls = indicators.struct_full(ltf.iloc[:i + 1])
+        spot = float(ltf["close"].iloc[i])
+        a = float(ls.get("atr") or 0)
+        if a <= 0:
+            continue
+        if lens == "STRUCTURE":
+            sy = mtf.synthesize(hs, ls, spot)
+            sd = mtf.side_of(sy["tag"], sy.get("dir", "NONE"))
+            if sd in ("LONG", "SHORT"):
+                out.append((i, sd, sy["tag"], a))
+            continue
+        segl = ltf.iloc[max(0, i + 1 - sr_win):i + 1]
+        segh = htf.iloc[max(0, nh - sr_win):nh]
+        kl = indicators.walls_kind(segl["high"], segl["low"], config.SR_TOL_ATR * a)
+        kh = indicators.walls_kind(segh["high"], segh["low"], config.SR_TOL_ATR * a)
+        if not kl or not kh:
+            continue
+        tol, near, best = conf_tol_bps / 1e4 * spot, near_atr * a, None
+        for dn in (True, False):
+            for x, _t, _nl, _nh in kl:
+                gap = (spot - x) if dn else (x - spot)
+                if gap < 0 or gap > near:
+                    continue
+                same = [z for z in kh if ((z[0] <= spot) if dn else (z[0] >= spot))]
+                if not same:
+                    continue
+                m = min(same, key=lambda z: abs(z[0] - x))
+                if abs(m[0] - x) > tol:
+                    continue
+                if best is None or gap < best[0]:
+                    best = (gap, x, "LONG" if dn else "SHORT")
+        if best is not None:
+            out.append((i, best[2], "SR", a))
+    return out
+
+
+def _walk_scalp(bars, sess_end, i, side, stop_atr, rr, max_bars, atr, maker=False):
+    """Fill, then walk to the stop / target / time stop / SESSION END, whichever comes first.
+
+    MAKER FILLS ARE NOT A DISCOUNT. A resting limit is filled only when price comes TO it,
+    which is disproportionately when the market is about to continue against you -- adverse
+    selection, and the reason "just use limit orders" mostly fails in practice. So the maker
+    path rests at the signal bar's close and is filled ONLY if the next bar actually trades
+    through that price; an unfilled signal is not a trade at all. The gap between the taker
+    and maker win rates is then a MEASUREMENT of adverse selection rather than an assumption.
+    """
+    j = i + 1
+    if j >= len(bars) or atr <= 0:
+        return None
+    if maker:
+        limit = float(bars["close"].iloc[i])
+        lo_j, hi_j = float(bars["low"].iloc[j]), float(bars["high"].iloc[j])
+        filled = (lo_j <= limit) if side == "LONG" else (hi_j >= limit)
+        if not filled:
+            return {"unfilled": True}
+        entry = limit
+    else:
+        entry = float(bars["open"].iloc[j])
+    risk = stop_atr * atr
+    if entry <= 0 or risk <= 0:
+        return None
+    long = side == "LONG"
+    stop = entry - risk if long else entry + risk
+    targ = entry + rr * risk if long else entry - rr * risk
+    last = min(j + max_bars, int(sess_end[j]), len(bars) - 1)
+    for k in range(j, last + 1):
+        hi, lo = float(bars["high"].iloc[k]), float(bars["low"].iloc[k])
+        # Ambiguous bar -> the STOP. A 1-minute candle carries no intrabar path either, and
+        # resolving it in the trade's favour is how a scalp backtest invents an edge.
+        # EVERY branch returns `entry`. It used to be returned only by the time-stop path,
+        # so a MAKER trade that hit its stop or target fell back to the taker fill price
+        # (the next bar's OPEN) when the caller computed cost_R -- pricing the maker's cost
+        # off a fill it never got. Small in rupees, wrong in kind: the lane exists to compare
+        # those two fills.
+        if (lo <= stop) if long else (hi >= stop):
+            return {"exit_i": k, "exit_px": stop, "R": -1.0, "why": "stop", "entry": entry}
+        if (hi >= targ) if long else (lo <= targ):
+            return {"exit_i": k, "exit_px": targ, "R": rr, "why": "target", "entry": entry}
+    px = float(bars["close"].iloc[last])
+    r = (px - entry) / risk if long else (entry - px) / risk
+    why = "session" if last == int(sess_end[j]) and last < j + max_bars else "time"
+    return {"exit_i": last, "exit_px": px, "R": round(r, 3), "why": why, "entry": entry}
+
+
+def breakeven_win_rate(cost_r: float, rr: float) -> float:
+    """p such that p*(rr - cost) - (1-p)*(1 + cost) = 0, i.e. p = (1+cost_R)/(1+R:R).
+
+    Printed beside the measured win rate because it is the whole argument of this lane: the
+    requirement is a pure function of the cost fraction, and cost_R = cost / stop, so a
+    TIGHTER scalp stop RAISES the bar. Below roughly a 10-tick stop the requirement passes
+    100% and no hit rate whatsoever can pay -- the round trip exceeds the risk it is taken on.
+    """
+    return (1.0 + float(cost_r)) / (1.0 + float(rr))
+
+
+def walk_scalp_bundle(bundle: dict, rr: float = 2.0, stop_atr: float = 1.0,
+                      max_bars: int = 15, maker: bool = False,
+                      sides: tuple[str, ...] = ("LONG", "SHORT")) -> pd.DataFrame:
+    rows = []
+    for sym, (bars, se, cost_bps, sig) in bundle["sig"].items():
+        free, seen, fills = -1, 0, 0
+        for i, side, tag, a in sig:
+            if side not in sides or i <= free:
+                continue
+            seen += 1
+            tr = _walk_scalp(bars, se, i, side, stop_atr, rr, max_bars, a, maker=maker)
+            if tr is None:
+                continue
+            if tr.get("unfilled"):
+                # A resting order that never traded is NOT a loss and NOT a win -- it is not a
+                # trade. Counting it either way would corrupt the win rate; it is reported
+                # separately as the fill rate.
+                continue
+            fills += 1
+            free = tr["exit_i"]
+            entry = tr.get("entry", float(bars["open"].iloc[i + 1]))
+            # A MAKER DOES NOT PAY THE SPREAD LINE. Everything else on the sheet still applies
+            # -- STT, brokerage, exchange, GST, stamp are indifferent to how you got filled.
+            c = cost_bps["all"] - (cost_bps["spread"] if maker else 0.0)
+            cost_r = (c / 1e4 * entry) / (stop_atr * a)
+            rows.append({"symbol": sym, "side": side, "tag": tag, "why": tr["why"],
+                         "R_gross": tr["R"], "R": tr["R"] - cost_r, "cost_R": cost_r,
+                         "risk_bps": 1e4 * (stop_atr * a) / entry,
+                         "mins": int(tr["exit_i"] - i),
+                         "ts": pd.Timestamp(bars["ts"].iloc[i + 1])})
+        if sig:
+            bundle.setdefault("_fill", {})[sym] = (fills, seen)
+    return pd.DataFrame(rows)
+
+
+def build_scalp_bundle(names: list[str] | None = None, n_names: int = 20, days: int = 30,
+                       position: float | None = None, spread_ticks: float | None = None,
+                       lens: str = "STRUCTURE") -> dict:
+    """Fetch 1-minute bars, build the 5-minute confirm frame, and generate every signal once.
+
+    The universe defaults to scalp.scalp_universe, which ranks by ATR% rather than turnover --
+    Spearman +0.902 against realised mean 5-minute move, where turnover ranks -0.10. That is
+    not a detail: 1R on a 1-minute bar is the ONLY term in cost_R that the trader controls, so
+    the study must run on the names where it is largest, otherwise a negative result could be
+    dismissed as having tested the wrong list. These are the best case, not the average.
+    """
+    from . import scalp as _scalp
+    position = float(_scalp.DEFAULT_POSITION if position is None else position)
+    names = list(names) if names else list(_scalp.scalp_universe(n=n_names))
+    sig, meta_names = {}, []
+    for sym in names:
+        f = _scalp.fetch_1m(sym, days=days)
+        if f is None or len(f) < 800:
+            continue
+        f = f.sort_values("ts").reset_index(drop=True)
+        h5 = _scalp._resample(f, 5)
+        if h5 is None or len(h5) < 60:
+            continue
+        px = float(f["close"].iloc[-1])
+        parts = (_scalp.cost_parts(position, px) if spread_ticks is None
+                 else _scalp.cost_parts(position, px, spread_ticks))
+        cost = {**parts, "all": float(sum(parts.values()))}
+        g = scalp_signals(f, h5, lens, config.STRUCT_LOOKBACK + 5)
+        if g:
+            sig[sym] = (f, _sess_end(f["ts"]), cost, g)
+            meta_names.append(sym)
+    return {"sig": sig, "meta": {
+        "lens": lens, "ltf": SCALP_FRAMES[0], "htf": SCALP_FRAMES[1], "days": days,
+        "position": position, "n_names": len(sig), "names": meta_names,
+        "n_signals": int(sum(len(v[3]) for v in sig.values())),
+        "med_cost_bps": (round(float(np.median([v[2]["all"] for v in sig.values()])), 2)
+                         if sig else None)}}
+
+
+def simulate_scalp(bundle: dict | None = None, rr: float = 2.0, stop_atr: float = 1.0,
+                   max_bars: int = 15, maker: bool = False,
+                   sides: tuple[str, ...] = ("LONG", "SHORT"),
+                   rr_grid=None, **kw) -> dict:
+    """Scalp equivalent of simulate(). Adds the breakeven-vs-measured comparison."""
+    if bundle is None:
+        bundle = build_scalp_bundle(**kw)
+    t = walk_scalp_bundle(bundle, rr=rr, stop_atr=stop_atr, max_bars=max_bars,
+                          maker=maker, sides=sides)
+    meta = {**bundle["meta"], "rr": rr, "stop_atr": stop_atr, "max_bars": max_bars,
+            "maker": maker}
+    if t.empty:
+        return {"trades": t, "summary": {}, "rr_curve": pd.DataFrame(), "meta": meta}
+    e = expectancy(t["R"])
+    med_cost_r = float(t["cost_R"].median())
+    rows = []
+    for _rr in (tuple(rr_grid) if rr_grid else RR_GRID):
+        tt = walk_scalp_bundle(bundle, rr=_rr, stop_atr=stop_atr, max_bars=max_bars,
+                               maker=maker, sides=sides)
+        if tt.empty:
+            continue
+        ee = expectancy(tt["R"])
+        cr = float(tt["cost_R"].median())
+        need = 100 * breakeven_win_rate(cr, _rr)
+        w = tt[tt["R"] > 0]
+        rows.append({"R:R": f"1:{_rr:g}", "n": ee["n"], "win%": ee["win%"],
+                     "need%": (">100 (impossible)" if need > 100 else round(need, 1)),
+                     "gap": (np.nan if need > 100 else round(ee["win%"] - need, 1)),
+                     "tgtHits%": (round(float((w["why"] == "target").mean() * 100), 1)
+                                  if len(w) else np.nan),
+                     "E_R": ee["expectancy_R"], "t": ee["t"],
+                     "1R_bps": round(float(tt["risk_bps"].median()), 1),
+                     "cost_R": round(cr, 3)})
+    fills = bundle.get("_fill", {})
+    got = sum(a for a, _b in fills.values())
+    tried = sum(b for _a, b in fills.values())
+    meta["fill_rate"] = round(100 * got / tried, 1) if tried else None
+    meta["med_cost_R"] = round(med_cost_r, 3)
+    return {"trades": t, "summary": e, "rr_curve": pd.DataFrame(rows), "meta": meta}

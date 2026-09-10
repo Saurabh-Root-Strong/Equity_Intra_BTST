@@ -1152,6 +1152,149 @@ if tf == "📝 Paper trade (R)":
             "non-circular version of the formula. Read the **R:R sweep** table first; "
             "everything else on the page is detail.")
 
+    # ── SCALPER MODE ────────────────────────────────────────────────────────────────
+    # Its own path, not another entry in the horizon table, because three things change at a
+    # 1-minute trigger that the slower simulator has no concept of: the position MUST be
+    # squared off (carrying moves it onto the delivery schedule and roughly triples the bill),
+    # cost is a FUNCTION of position size and price rather than a constant, and the FILL MODEL
+    # decides the answer. cost_R = cost / stop, so the tight stop that defines a scalp is
+    # exactly what makes the round trip an enormous fraction of risk.
+    _sc_on = st.columns([5, 2])[1].toggle(
+        "\u26a1 Scalper mode", key="paper_scalp",
+        help=("Switch the simulator to the **1m trigger / 5m confirm** lane.\n\n"
+              "Different arithmetic, not a faster version of the same thing. **cost_R = "
+              "round trip \u00f7 stop**, so the tighter you scalp the LARGER a fraction of "
+              "your risk the exchange takes. At a 10-tick stop on a \u20b91,000 name the "
+              "round trip EXCEEDS the whole stop and breakeven needs a win rate above "
+              "100%.\n\n"
+              "It needs a live broker token (1-minute bars are not in the archive) and takes "
+              "1\u20133 minutes."))
+    if _sc_on:
+        st.title("\u26a1 Scalper paper trade \u2014 1m trigger / 5m confirm")
+        st.caption("Squared off every session. Cost from the real sheet, by position size "
+                   "and price. The question is not whether the chart is right \u2014 it is "
+                   "whether anything can pay a bill this large relative to the stop.")
+        _q = st.columns([2, 2, 2, 2])
+        _sl = _q[0].radio("Which lens?", ["STRUCTURE", "SR"], horizontal=True,
+                          format_func=lambda k: {"STRUCTURE": "\U0001f4d0 Structure",
+                                                 "SR": "\U0001f9f2 S/R"}[k],
+                          key="sc_lens")
+        _srr = _q[1].slider("Reward multiple", 1.0, 5.0, 2.0, 0.5, key="sc_rr")
+        _shold = _q[2].select_slider("Hold (minutes)", options=list(paper.SCALP_HOLDS),
+                                     value=15, key="sc_hold",
+                                     help="Time stop in 1-minute bars. A position still open "
+                                          "at the session's last bar is closed there "
+                                          "regardless \u2014 a scalp does not carry.")
+        _sfill = _q[3].radio("Fill model", ["TAKER", "MAKER"], horizontal=True, key="sc_fill",
+                             help=("**TAKER** \u2014 cross the spread, fill at the next "
+                                   "bar's open. You PAY the spread line.\n\n"
+                                   "**MAKER** \u2014 rest a limit at the signal bar's close; "
+                                   "filled only if the next bar actually trades through it. "
+                                   "You do not pay the spread.\n\n"
+                                   "\u26a0\ufe0f This is **not a discount**. A resting order "
+                                   "fills when price comes TO it \u2014 disproportionately "
+                                   "when the market is about to continue against you. That is "
+                                   "adverse selection, and it is why 'just use limit orders' "
+                                   "mostly fails. Unfilled signals are not counted as trades; "
+                                   "the fill rate is reported separately."))
+        _q2 = st.columns([2, 2, 2, 2])
+        _sn = _q2[0].slider("Names", 4, 30, 12, 2, key="sc_names",
+                            help=("Taken from the scalper universe, ranked by **ATR%** not "
+                                  "turnover \u2014 Spearman +0.902 against realised mean "
+                                  "5-minute move, where turnover ranks \u22120.10. 1R is the "
+                                  "only term in cost_R you control, so the study runs where "
+                                  "it is LARGEST. These are the best case, not the average."))
+        _sd = _q2[1].slider("Days of 1m history", 5, 30, 20, 5, key="sc_days")
+        _spos = _q2[2].number_input("Position size (\u20b9)", 25_000, 5_000_000,
+                                    int(scalp.DEFAULT_POSITION), 25_000, key="sc_pos",
+                                    help=("Cost is NOT a constant. The flat \u20b920 "
+                                          "brokerage is 6bps of a \u20b950,000 trade and "
+                                          "0.4bps of a \u20b910,00,000 one \u2014 but STT "
+                                          "(2.50bps) and the spread do not scale at all, so "
+                                          "the floor is ~5bps however large you go."))
+        _ssp = _q2[3].number_input("Spread (ticks)", 0.0, 10.0, 2.0, 1.0, key="sc_spread")
+        _ssides = st.multiselect("Sides", ["LONG", "SHORT"], default=["LONG", "SHORT"],
+                                 key="sc_sides")
+        if not _ssides:
+            st.warning("Pick at least one side.")
+            st.stop()
+
+        @st.cache_data(show_spinner=False, ttl=1800)
+        def _sc_bundle(lens, n, days, pos, spread):
+            return paper.build_scalp_bundle(n_names=int(n), days=int(days), lens=lens,
+                                            position=float(pos), spread_ticks=float(spread))
+
+        _k = ("sc", _sl, _sn, _sd, _spos, _ssp)
+        if st.button("\u25b6 Run the scalp simulation", type="primary"):
+            st.session_state["sc_key"] = _k
+        if st.session_state.get("sc_key") != _k:
+            st.caption("\u2b06 Set the knobs, then press **Run**. Needs a live broker token "
+                       "\u2014 1-minute bars are not in the EOD archive \u2014 and takes "
+                       "1\u20133 minutes.")
+            st.stop()
+        with st.spinner("Fetching 1-minute bars and replaying every one\u2026"):
+            _b = _sc_bundle(_sl, _sn, _sd, _spos, _ssp)
+        if not _b["sig"]:
+            st.error("No 1-minute data came back. The Fyers token is the usual cause \u2014 "
+                     "it expires ~06:00 IST daily. Run `run_dashboard.bat` to re-auth.")
+            st.stop()
+        _r = paper.simulate_scalp(bundle=_b, rr=_srr, max_bars=int(_shold),
+                                  maker=(_sfill == "MAKER"), sides=tuple(_ssides))
+        _m, _t = _r["meta"], _r["trades"]
+        if _t.empty:
+            st.warning("No fills. Try TAKER, or more names/days.")
+            st.stop()
+        st.caption(f"{_m['n_names']} names \u00b7 {_m['days']}d of 1m bars \u00b7 "
+                   f"{_m['n_signals']:,} raw signals \u00b7 median round trip "
+                   f"**{_m['med_cost_bps']}bps** \u00b7 fill rate {_m.get('fill_rate')}% "
+                   f"\u00b7 median **cost_R {_m.get('med_cost_R')}**")
+
+        st.subheader("What the cost demands vs what the signal delivers")
+        st.dataframe(_r["rr_curve"], use_container_width=True, hide_index=True)
+        st.caption(
+            "`need%` is the breakeven win rate implied by cost alone: "
+            "**p = (1 + cost_R) / (1 + R:R)**. `gap` is measured minus required \u2014 "
+            "it must be POSITIVE for the setting to pay.")
+        st.warning(
+            "\u26a0\ufe0f **Read `gap` together with `tgtHits%`.** The breakeven formula "
+            "assumes every win is a FULL target hit. At a wide target that is mostly false "
+            "\u2014 when `tgtHits%` is low, most 'wins' are small time-stop exits worth a "
+            "fraction of R, so a positive `gap` there can still sit beside a negative `E_R`. "
+            "**`E_R` is the number that decides it**; `gap` only shows how far the cost bar is "
+            "from the hit rate.")
+        _e = _r["summary"]
+        _cc = st.columns(6)
+        _cc[0].metric("trades", _e["n"])
+        _cc[1].metric("win rate", f"{_e['win%']:.1f}%")
+        _cc[2].metric("expectancy", f"{_e['expectancy_R']:+.3f}R")
+        _cc[3].metric("t-stat", _e["t"])
+        _cc[4].metric("median hold", f"{int(_t['mins'].median())}m")
+        _cc[5].metric("1R", f"{_t['risk_bps'].median():.1f}bps")
+        _w = _t["why"].value_counts().rename_axis("exit").reset_index(name="n")
+        _w["share%"] = (100 * _w["n"] / len(_t)).round(1)
+        _c1, _c2 = st.columns(2)
+        _c1.markdown("**How trades ended**")
+        _c1.dataframe(_w, use_container_width=True, hide_index=True)
+        _c1.caption("`session` = squared off at the close because the time stop had not been "
+                    "reached. A scalp does not carry.")
+        _c2.markdown("**By tag**")
+        _c2.dataframe(_t.groupby("tag")["R"].agg(["count", "mean"]).round(3)
+                      .rename(columns={"count": "n", "mean": "E_R"}).reset_index()
+                      .sort_values("n", ascending=False),
+                      use_container_width=True, hide_index=True)
+        with st.expander(f"All {len(_t)} trades"):
+            st.dataframe(_t.sort_values("ts", ascending=False), use_container_width=True,
+                         hide_index=True)
+        st.caption(
+            "\U0001f9ea **Assumptions.** Confirm bar counted CLOSED-ONLY (indexing a 1m bar "
+            "to the 5m bar CONTAINING it is what made this lane's first replay print "
+            "+16.6bps at t=33). Ambiguous bar resolves to the STOP. Hard session-end exit. "
+            "Cost per name from `scalp.cost_parts` at your size and the name's price. "
+            "**The maker fill model is OPTIMISTIC**: it fills whenever price TOUCHES the "
+            "limit, whereas a real resting order sits in a queue and often does not fill on a "
+            "touch \u2014 so the true maker win rate is below what is shown here.")
+        st.stop()
+
     _pc = st.columns([2, 2, 2, 2])
     _lens = _pc[0].radio("Which lens?", ["STRUCTURE", "SR"], horizontal=True,
                          format_func=lambda k: {"STRUCTURE": "📐 Structure",

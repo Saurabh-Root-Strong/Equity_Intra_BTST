@@ -179,3 +179,88 @@ def test_only_the_archive_backed_frame_pair_is_offered():
     """Intraday pairs need broker history (~60 days, rate-limited). Offering them would dress a
     few months of one regime up as a backtest."""
     assert paper.FRAMES == {"positional": ("1D", "1W")}
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# SCALP LANE — 1m trigger / 5m confirm
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+def test_breakeven_is_a_pure_function_of_the_cost_fraction():
+    """p = (1 + cost_R) / (1 + R:R). This is the lane's whole argument: cost_R = cost / stop,
+    so the TIGHTER the scalp stop the HIGHER the bar — the opposite of the intuition that a
+    tight stop is conservative."""
+    assert abs(paper.breakeven_win_rate(0.0, 1.0) - 0.5) < 1e-9
+    assert abs(paper.breakeven_win_rate(0.688, 1.0) - 0.844) < 1e-3
+    assert abs(paper.breakeven_win_rate(0.688, 3.0) - 0.422) < 1e-3
+    # a stop so tight the round trip exceeds it -> no hit rate whatsoever can pay
+    assert paper.breakeven_win_rate(1.376, 1.0) > 1.0
+
+
+def test_tighter_stops_raise_the_bar_monotonically():
+    prev = 0.0
+    for stop_bps in (200, 100, 50, 25, 15, 10, 5):
+        need = paper.breakeven_win_rate(6.88 / stop_bps, 1.0)
+        assert need > prev, "a tighter stop must demand a HIGHER win rate"
+        prev = need
+
+
+def test_scalp_walk_squares_off_at_the_session_end():
+    """A scalp that rolls into the next session is not a scalp — and carrying moves it onto the
+    delivery schedule (STT on both legs), roughly tripling the bill."""
+    d = _day(n=30)
+    d.loc[:, "open"] = 100.0
+    se = np.array([9] * 10 + [29] * 20)          # session 1 ends at bar 9
+    tr = paper._walk_scalp(d, se, i=5, side="LONG", stop_atr=1.0, rr=99.0,
+                           max_bars=50, atr=2.0)
+    assert tr["exit_i"] == 9, "must close on the last bar of the ENTRY's session"
+    assert tr["why"] == "session"
+
+
+def test_maker_fill_requires_price_to_actually_trade_through_the_limit():
+    """Simulating a maker as 'the same fills minus one bp' is the most flattering lie available
+    here. A resting order fills only when price comes TO it."""
+    d = _day(n=10)
+    se = np.array([9] * 10)
+    d.loc[0, "close"] = 100.0                    # limit sits here
+    d.loc[1, ["high", "low"]] = [105.0, 101.0]   # next bar never trades down to 100
+    tr = paper._walk_scalp(d, se, i=0, side="LONG", stop_atr=1.0, rr=2.0,
+                           max_bars=5, atr=2.0, maker=True)
+    assert tr.get("unfilled") is True
+    d.loc[1, ["high", "low"]] = [105.0, 99.0]    # now it does
+    tr2 = paper._walk_scalp(d, se, i=0, side="LONG", stop_atr=1.0, rr=2.0,
+                            max_bars=5, atr=2.0, maker=True)
+    assert not tr2.get("unfilled") and tr2["entry"] == 100.0
+
+
+def test_an_unfilled_maker_signal_is_not_counted_as_a_trade():
+    """It is not a loss and not a win — it is not a trade. Counting it either way corrupts the
+    win rate; the fill rate is reported separately instead."""
+    import inspect
+    src = inspect.getsource(paper.walk_scalp_bundle)
+    assert 'tr.get("unfilled")' in src and "continue" in src
+    assert "fills" in src, "the fill rate has to be tracked, not discarded"
+
+
+def test_the_scalp_confirm_frame_is_counted_closed_only():
+    """scalp.py's first offline replay printed WITH-TREND CONTINUATION at +16.6bps, t=33, 100%
+    of sessions positive — because each 1m bar was indexed to the 5m bar CONTAINING it rather
+    than the last to have CLOSED. Same guard, same reason."""
+    import inspect
+    src = inspect.getsource(paper.scalp_signals)
+    assert 'np.searchsorted(ht[1:], lt, side="right")' in src
+    assert "- 1" not in src.split("closed =")[1].split("\n")[0], "the containing-bar bug"
+
+
+def test_every_exit_branch_reports_the_entry_it_actually_filled_at():
+    """`entry` used to come back only from the time-stop path, so a MAKER trade that hit its
+    stop or target had its cost_R priced off the TAKER fill (the next bar's open) — a fill it
+    never got. Small in rupees, wrong in kind: comparing those two fills is the lane's job."""
+    d = _day(n=10)
+    se = np.array([9] * 10)
+    d.loc[0, "close"] = 100.0
+    d.loc[1, ["high", "low"]] = [105.0, 99.0]
+    d.loc[2, ["high", "low"]] = [130.0, 90.0]        # trips both -> stop branch
+    for maker in (False, True):
+        tr = paper._walk_scalp(d, se, i=0, side="LONG", stop_atr=1.0, rr=2.0,
+                               max_bars=5, atr=2.0, maker=maker)
+        assert "entry" in tr, (maker, tr)
