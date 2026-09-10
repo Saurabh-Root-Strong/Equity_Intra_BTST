@@ -855,3 +855,48 @@ def test_gap_arithmetic_reads_the_pinned_side_not_the_displayed_one():
     blk = src[i:src.index("    return _live_levels(b)", i)]
     assert "_side0" in blk and '_sup = _side0 == "SUP"' in blk
     assert '_sup = b["_conf_side"].astype(str) == "SUP"' not in blk, "reads the mutated field"
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# TWO NAMED LENSES, NOT A FILTER TOGGLE
+# Only the S/R side ever had a name; the default read was literally "the table". That made
+# the switch look like it narrows one list rather than swapping the question being asked.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+def test_both_lenses_are_named_on_screen():
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("_lens = (")
+    blk = src[i:src.index("_c.toggle(", i)]
+    assert "**Structure**" in blk, "the default read must be named, not left as 'the table'"
+    assert "**Support / Resistance**" in blk
+    assert "way" in blk and "where" in blk, "each lens must say WHICH question it answers"
+
+
+def test_the_lens_line_distinguishes_all_three_states():
+    """Structure alone / Structure-then-S-R / S-R alone. The middle one is a BLEND — S/R as
+    the last cut in a chain that still runs the price band, Setup quality, Upper-TF and the
+    structure boxes — and conflating it with the pure lens is what made the two scope options
+    look identical when nothing else was narrowing the board."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("_lens = (")
+    blk = src[i:src.index("_c.toggle(", i)]
+    assert "not _conf_f" in blk and "_sr_universe" in blk, "must branch on BOTH controls"
+    assert blk.count("Structure") >= 2, "structure is named in the off state AND the blend"
+
+
+def test_the_toggle_says_rules_so_it_pairs_with_the_other_lens():
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    # ASCII-ONLY ANCHOR. dashboard.py stores this emoji as a \u escape in SOURCE, so
+    # an assertion written with the interpreted character silently fails to match.
+    assert 'Support / Resistance rules", key="mtf_conff"' in src
+
+
+def test_the_tooltip_opens_by_naming_what_it_switches_FROM():
+    """A reader at this control has no way to know the board they were already looking at is a
+    named thing. Saying what the switch swaps FROM is half the explanation."""
+    src = io.open("eqbtst/dashboard.py", encoding="utf-8").read()
+    i = src.index("_conf_help = (")
+    head = src[i:i + 1800]
+    assert "read two ways" in head
+    assert "Structure rules" in head and "Support / Resistance rules" in head
+    assert "pull against each other" in head, "the conflict is the point, not a caveat"

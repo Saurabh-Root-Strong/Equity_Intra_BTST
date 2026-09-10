@@ -1691,7 +1691,24 @@ if tf == "Intraday":
             # It does NOT live in this row: it is the only control here that is a plain
             # on/off, and the three selectboxes beside it are all "pick a value" — mixing the
             # two shapes in one row read as a fourth dropdown that had lost its label.
-            _conf_help = ("**Show me only stocks that are SITTING ON a price level BOTH of my "
+            # THE TOOLTIP OPENS BY NAMING BOTH LENSES. A reader arriving at this control has
+            # no way to know that the board they were already looking at IS a named thing —
+            # so the switch reads as "filter on/off" rather than "swap the question". Saying
+            # what it swaps FROM is half the explanation.
+            _conf_help = ("**This board can be read two ways. This switch picks which.**\n\n"
+                      "\U0001f4d0 **Structure rules** (off) — *which WAY is price "
+                      "going?* Your two charts' shapes (trend / range / breakout / squeeze) "
+                      "plus WHERE price sits inside the slow chart's box. The answer is a "
+                      "**direction**: LONG, SHORT, or no side.\n\n"
+                      "\U0001f9f2 **Support / Resistance rules** (on) — *WHERE is price "
+                      "standing?* A price level both charts mark in the same place. The "
+                      "answer is a **place**: at support, or at resistance.\n\n"
+                      "⚠️ **They pull against each other, and that is not a bug.** A "
+                      "stock parked on a level both charts agree on is usually a stock going "
+                      "SIDEWAYS — which is exactly what Structure calls *no side*. So "
+                      "expect the two reads to disagree; that disagreement is information.\n\n"
+                      "---\n\n"
+                      "**Show me only stocks that are SITTING ON a price level BOTH of my "
                       "charts agree on.**\n\n"
                       f"**Which two charts?** The two your **Trade horizon** already uses: "
                       f"the fast one you time the entry on (**{_P['ltf']}**) and the slow one "
@@ -2037,7 +2054,35 @@ if tf == "Intraday":
             if not _P:
                 return                       # custom TF pair: no horizon, so no second frame
             _c = st.columns([5, 2])[1]
-            _c.toggle("🧲 Support / Resistance", key="mtf_conff",
+            # NAME BOTH LENSES, NOT JUST ONE. Until now only the S/R side had a name; the
+            # default read was nameless — literally just "the table" — which made the toggle
+            # look like a filter that narrows one list rather than a switch between two
+            # different questions. They are not variations of one idea:
+            #
+            #   Structure asks WHICH WAY price is going  (HTF box x LTF structure, `loc`
+            #                                             decides; output is a DIRECTION)
+            #   S/R asks     WHERE price is STANDING     (both frames' pivots agreeing on a
+            #                                             price; output is a PLACE)
+            #
+            # And they pull against each other by construction: a name parked on a level both
+            # frames agree on is, almost by definition, a name that is NOT trending — which is
+            # exactly the case Structure files under "no side". Measured on the last archive
+            # close, every aligned name on the 1D/1W pair carried a no-side tag.
+            #
+            # THE SCOPE RADIO, NOT THE TOGGLE, IS WHAT SWITCHES LENS. Toggle on + Current list
+            # is a BLEND (S/R is the last cut in a chain that still runs the price band, Setup
+            # quality, Upper-TF and the structure boxes); only Whole universe is the pure S/R
+            # lens. That is precisely why those two scope options produced identical tables
+            # when nothing else was narrowing the board — the blend collapses onto the lens.
+            _lens = ("\U0001f4d0 **Structure** — reading which **way** price is going."
+                     if not _conf_f else
+                     ("\U0001f9f2 **Support / Resistance** — reading **where** price is "
+                      "standing. Structure is not applied."
+                      if _sr_universe else
+                      "\U0001f4d0 **Structure** → \U0001f9f2 **S/R** — direction "
+                      "first, then the level."))
+            _c.caption(_lens)
+            _c.toggle("\U0001f9f2 Support / Resistance rules", key="mtf_conff",
                       help=_conf_help)
             if not _conf_f:
                 return                       # the knob only exists while the filter is on
