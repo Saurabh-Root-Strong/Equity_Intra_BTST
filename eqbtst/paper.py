@@ -207,14 +207,19 @@ def _walk(day: pd.DataFrame, i: int, side: str, stop_atr: float, rr: float,
     return {"exit_i": k, "exit_px": px, "R": round(r, 3), "why": "time"}
 
 
-def simulate(lens: str = "STRUCTURE", rr: float = 3.0, stop_atr: float = 1.0,
-             max_bars: int = 20, start: str | None = None, end: str | None = None,
-             symbols: list[str] | None = None, max_names: int | None = None,
-             cost_bps: float | None = None, sides: tuple[str, ...] = ("LONG", "SHORT"),
-             conf_tol_bps: float | None = None, near_atr: float | None = None,
-             rr_grid: tuple[float, ...] | None = None) -> dict:
-    """Run the simulator. Returns {"trades", "summary", "by_year", "rr_curve", "meta"}."""
-    cost_bps = float(config.COST_BPS if cost_bps is None else cost_bps)
+def build_signals(lens: str = "STRUCTURE", start: str | None = None, end: str | None = None,
+                  symbols: list[str] | None = None, max_names: int | None = None,
+                  conf_tol_bps: float | None = None, near_atr: float | None = None) -> dict:
+    """Replay the tape ONCE and keep every signal, independent of any exit rule.
+
+    Signals are a function of the bars and the lens alone -- the reward multiple, the stop
+    width and the time stop all belong to trade MANAGEMENT. Regenerating them per setting (the
+    first version of the sweep did) costs five full replays through struct_full / synthesize /
+    walls_kind to answer a question that changes only the exit, and it also lets the five sweep
+    rows drift apart: any difference between regenerations would show up as a target effect
+    while actually being a signal difference. One generation makes the rows comparable by
+    construction.
+    """
     conf_tol_bps = float(config.SR_CONF_TOL_BPS if conf_tol_bps is None else conf_tol_bps)
     near_atr = float(config.SR_CONF_NEAR_ATR if near_atr is None else near_atr)
     df = data.load_eod(start=start, end=end)
@@ -226,13 +231,30 @@ def simulate(lens: str = "STRUCTURE", rr: float = 3.0, stop_atr: float = 1.0,
         keep = (df.groupby("symbol")["turnover_lacs"].median()
                   .sort_values(ascending=False).head(max_names).index)
         df = df[df["symbol"].isin(keep)]
-    rows = []
     i0 = config.STRUCT_LOOKBACK + 5
+    sig = {}
     for sym, d in df.groupby("symbol", sort=False):
         d = d.sort_values("trade_date").reset_index(drop=True)
-        if len(d) < i0 + max_bars + 2:
+        if len(d) < i0 + 30:
             continue
-        day = _bars(d)
+        got = _signals_for_symbol(d, lens, i0, conf_tol_bps, near_atr)
+        if got:
+            sig[sym] = (_bars(d), d["trade_date"].to_numpy(), got)
+    return {"sig": sig, "meta": {
+        "lens": lens, "conf_tol_bps": conf_tol_bps, "near_atr": near_atr,
+        "ltf": FRAMES["positional"][0], "htf": FRAMES["positional"][1],
+        "n_names": int(df["symbol"].nunique()),
+        "start": str(df["trade_date"].min().date()) if len(df) else None,
+        "end": str(df["trade_date"].max().date()) if len(df) else None}}
+
+
+def walk_signals(bundle: dict, rr: float = 3.0, stop_atr: float = 1.0, max_bars: int = 20,
+                 cost_bps: float | None = None,
+                 sides: tuple[str, ...] = ("LONG", "SHORT")) -> pd.DataFrame:
+    """Turn one signal bundle into trades under one exit rule."""
+    cost_bps = float(config.COST_BPS if cost_bps is None else cost_bps)
+    rows = []
+    for sym, (day, dates, got) in bundle["sig"].items():
         # ONE POSITION PER NAME AT A TIME. A structure tag PERSISTS for many bars, so a naive
         # loop re-enters the same trade every session: the smoke run showed AXISBANK firing
         # SHORT on six consecutive days, 1,467 "trades" from 8 names in under four years --
@@ -240,11 +262,13 @@ def simulate(lens: str = "STRUCTURE", rr: float = 3.0, stop_atr: float = 1.0,
         # positions counted many times, and every statistic built on them is wrong in the
         # flattering direction: n is inflated, the trades overlap so they are not independent,
         # and the t-stat inherits both errors. It is also not a thing anyone can trade -- you
-        # cannot hold six overlapping shorts in one name and call each a 1R risk. Skipping any
-        # signal that arrives while the previous one is still open fixes the arithmetic and
-        # the realism in the same line.
-        _free_at = -1                              # bar index the last position closed on
-        for i, side, lvl, a in _signals_for_symbol(d, lens, i0, conf_tol_bps, near_atr):
+        # cannot hold six overlapping shorts in one name and call each a 1R risk.
+        #
+        # NOTE THIS LIVES HERE, NOT IN build_signals: which signals are BLOCKED depends on when
+        # the previous position EXITED, which is a function of the exit rule. Filtering at
+        # generation time would freeze one rule's blocking pattern into every other.
+        _free_at = -1
+        for i, side, lvl, a in got:
             if side not in sides or i <= _free_at:
                 continue
             tr = _walk(day, i, side, stop_atr, rr, max_bars, a)
@@ -258,32 +282,41 @@ def simulate(lens: str = "STRUCTURE", rr: float = 3.0, stop_atr: float = 1.0,
             # across names and across stop settings.
             cost_r = (cost_bps / 1e4 * entry) / risk if risk > 0 else np.nan
             rows.append({
-                "symbol": sym, "signal_date": d["trade_date"].iloc[i],
-                "entry_date": d["trade_date"].iloc[i + 1], "side": side,
-                "entry": round(entry, 2), "risk_pts": round(risk, 2),
+                "symbol": sym, "signal_date": dates[i], "entry_date": dates[i + 1],
+                "side": side, "entry": round(entry, 2), "risk_pts": round(risk, 2),
                 "risk%": round(100 * risk / entry, 2), "level": lvl,
-                "exit_date": d["trade_date"].iloc[tr["exit_i"]],
-                "exit": round(tr["exit_px"], 2), "bars": int(tr["exit_i"] - i),
-                "why": tr["why"], "R_gross": tr["R"],
+                "exit_date": dates[tr["exit_i"]], "exit": round(tr["exit_px"], 2),
+                "bars": int(tr["exit_i"] - i), "why": tr["why"], "R_gross": tr["R"],
                 "R": round(tr["R"] - cost_r, 3), "cost_R": round(cost_r, 3),
             })
-    trades = pd.DataFrame(rows)
-    meta = {"lens": lens, "rr": rr, "stop_atr": stop_atr, "max_bars": max_bars,
-            "cost_bps": cost_bps, "ltf": FRAMES["positional"][0],
-            "htf": FRAMES["positional"][1], "n_names": int(df["symbol"].nunique()),
-            "start": str(df["trade_date"].min().date()) if len(df) else None,
-            "end": str(df["trade_date"].max().date()) if len(df) else None}
+    return pd.DataFrame(rows)
+
+
+def simulate(lens: str = "STRUCTURE", rr: float = 3.0, stop_atr: float = 1.0,
+             max_bars: int = 20, start: str | None = None, end: str | None = None,
+             symbols: list[str] | None = None, max_names: int | None = None,
+             cost_bps: float | None = None, sides: tuple[str, ...] = ("LONG", "SHORT"),
+             conf_tol_bps: float | None = None, near_atr: float | None = None,
+             rr_grid=None, bundle: dict | None = None) -> dict:
+    """Run the simulator. Returns {"trades", "summary", "by_year", "rr_curve", "meta"}."""
+    cost_bps = float(config.COST_BPS if cost_bps is None else cost_bps)
+    if bundle is None:
+        bundle = build_signals(lens=lens, start=start, end=end, symbols=symbols,
+                               max_names=max_names, conf_tol_bps=conf_tol_bps,
+                               near_atr=near_atr)
+    trades = walk_signals(bundle, rr=rr, stop_atr=stop_atr, max_bars=max_bars,
+                          cost_bps=cost_bps, sides=sides)
+    meta = {**bundle["meta"], "rr": rr, "stop_atr": stop_atr, "max_bars": max_bars,
+            "cost_bps": cost_bps}
     if trades.empty:
         return {"trades": trades, "summary": {}, "by_year": pd.DataFrame(),
                 "rr_curve": pd.DataFrame(), "meta": meta}
     out = {"trades": trades, "summary": expectancy(trades["R"]), "meta": meta,
            "by_year": _by_year(trades)}
     if rr_grid is not False:
-        out["rr_curve"] = rr_sweep(lens=lens, stop_atr=stop_atr, max_bars=max_bars,
-                                   start=start, end=end, symbols=symbols,
-                                   max_names=max_names, cost_bps=cost_bps, sides=sides,
-                                   conf_tol_bps=conf_tol_bps, near_atr=near_atr,
-                                   grid=rr_grid or RR_GRID)
+        out["rr_curve"] = rr_sweep(bundle=bundle, stop_atr=stop_atr, max_bars=max_bars,
+                                   cost_bps=cost_bps, sides=sides,
+                                   grid=tuple(rr_grid) if rr_grid else RR_GRID)
     return out
 
 
@@ -333,17 +366,23 @@ def _by_year(trades: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def rr_sweep(grid=RR_GRID, **kw) -> pd.DataFrame:
+def rr_sweep(bundle: dict | None = None, grid=RR_GRID, stop_atr: float = 1.0,
+             max_bars: int = 20, cost_bps: float | None = None,
+             sides: tuple[str, ...] = ("LONG", "SHORT"), **kw) -> pd.DataFrame:
     """THE POINT OF THE WHOLE PAGE: win rate is not independent of the target.
 
-    Runs the identical signal at each reward multiple and reports the win rate each one
-    actually earned. Expectancy is then computed from the MEASURED pair, which is the only
-    version of Tharp's formula that is not circular.
+    Walks ONE signal bundle at each reward multiple and reports the win rate each one actually
+    earned. Expectancy is then computed from the MEASURED pair, which is the only version of
+    Tharp's formula that is not circular. Because every row comes from the same generation,
+    any difference between rows is the TARGET and nothing else.
     """
+    if bundle is None:
+        bundle = build_signals(**kw)
     rows = []
     for rr in grid:
-        r = simulate(rr=rr, rr_grid=False, **kw)
-        e = r["summary"]
+        t = walk_signals(bundle, rr=rr, stop_atr=stop_atr, max_bars=max_bars,
+                         cost_bps=cost_bps, sides=sides)
+        e = expectancy(t["R"]) if len(t) else {}
         if not e:
             continue
         rows.append({"R:R": f"1:{rr:g}", "n": e["n"], "win%": e["win%"],

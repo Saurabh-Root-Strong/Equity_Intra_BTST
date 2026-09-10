@@ -142,11 +142,33 @@ def test_cost_in_R_scales_with_the_stop_width():
 def test_no_overlapping_positions_in_one_name():
     """A structure tag PERSISTS, so an unguarded loop re-enters daily: measured on a smoke run,
     1,467 'trades' from 8 names in under four years, the same AXISBANK short opened on six
-    consecutive sessions. Those are not independent observations and they are not tradeable."""
+    consecutive sessions. Those are not independent observations and they are not tradeable.
+
+    BEHAVIOURAL, not a source grep -- the guard has to live in the WALK (which signals are
+    blocked depends on when the previous position exited, and that is an exit-rule question),
+    so a test tied to one function's text breaks on a correct refactor."""
+    d = _day(n=30)
+    d.loc[:, "open"] = 100.0
+    dates = pd.bdate_range("2024-01-01", periods=30).to_numpy()
+    # a signal on EVERY bar, exactly the pathological case
+    got = [(i, "LONG", float("nan"), 2.0) for i in range(5, 25)]
+    bundle = {"sig": {"X": (d, dates, got)}, "meta": {}}
+    t = paper.walk_signals(bundle, rr=3.0, stop_atr=1.0, max_bars=5, cost_bps=0.0)
+    assert len(t) < len(got), "every signal became a trade -- the guard is gone"
+    # no trade may start before the previous one ended
+    ent = pd.to_datetime(t["entry_date"]).tolist()
+    ex = pd.to_datetime(t["exit_date"]).tolist()
+    for a, b in zip(ex, ent[1:]):
+        assert b > a, f"position opened {b} while the previous was still open until {a}"
+
+
+def test_the_sweep_walks_ONE_signal_generation():
+    """Every sweep row must come from the same signals, or a difference between rows could be
+    a regeneration artifact while being read as a target effect."""
     import inspect
-    src = inspect.getsource(paper.simulate)
-    assert "_free_at" in src
-    assert "i <= _free_at" in src, "a signal arriving mid-position must be skipped"
+    src = inspect.getsource(paper.rr_sweep)
+    assert "walk_signals(bundle" in src
+    assert "build_signals" in src and "if bundle is None" in src
 
 
 def test_the_rr_sweep_covers_the_folklore_range():
