@@ -1898,7 +1898,7 @@ _SCAN_WORKERS = 6                  # concurrent /history fetches — the scan is
                                    # yields 'n/a' for that name, non-fatal; a re-scan fills it).
 
 
-def universe_mtf_scan(date=None) -> dict:
+def universe_mtf_scan(date=None, allow_offhours: bool = False) -> dict:
     """STRUCTURE-FIRST scan: the WHOLE liquid universe with its 6-timeframe structure —
     NO day-move / close-strength pre-screen. This is the source list the HTF/LTF structure
     filter then narrows (e.g. keep only BREAKOUT_UP on 4h + CONSOLIDATION on 1h).
@@ -1917,7 +1917,10 @@ def universe_mtf_scan(date=None) -> dict:
     if not ts["usable"]:
         return {"ok": False, "status": ts["describe"], "risk_on": risk_on, "board": pd.DataFrame()}
 
-    key = _bucket5()
+    # THE MODE IS PART OF THE KEY. An off-hours (test-mode) board keeps rows whose session range
+    # is degenerate -- every price at yesterday's close, every day% zero -- and must never be
+    # served to a live request that happens to land in the same 5-minute bucket.
+    key = f"{_bucket5()}|{'off' if allow_offhours else 'live'}"
     hit = _UNISCAN_CACHE.get(key)
     if hit is not None and date is None:
         return {"ok": True, **hit}
@@ -1944,8 +1947,19 @@ def universe_mtf_scan(date=None) -> dict:
             continue
         c, pc = v.get("lp"), v.get("prev_close_price") or uni.loc[sym, "ref_close"]
         h, l = v.get("high_price"), v.get("low_price")
-        if None in (c, pc, h, l) or h == l:
+        if None in (c, pc):
             continue
+        # A ZERO SESSION RANGE MEANS TWO DIFFERENT THINGS. During the session it is a halted or
+        # frozen name, and it breaks bar_clr downstream -- drop it. BEFORE the first trade it is
+        # simply every name: measured at 09:05 IST, lp == prev_close == high == low with volume
+        # 0 across the whole universe, so the live rule discarded all 249 and test mode showed
+        # an empty board in the one window it exists for. Off-hours, keep the row and use the
+        # quote itself as the range; nothing below this reads h/l except the turnover estimate,
+        # which is correctly ~0 when nothing has traded.
+        if h is None or l is None or h == l:
+            if not allow_offhours:
+                continue
+            h = l = c
         h, l = max(float(h), float(c)), min(float(l), float(c))   # broker range can lag the LTP
         # NO liquidity floor (user override): the WHOLE F&O universe appears; turn₹L is carried
         # so you can SEE how thin a name is and judge fill risk yourself.

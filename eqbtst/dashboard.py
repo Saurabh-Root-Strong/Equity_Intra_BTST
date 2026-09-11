@@ -659,7 +659,7 @@ def _tf_scan(tf: str):
 
 
 @st.cache_data(show_spinner=False, max_entries=1)
-def _uni_scan(nonce: int):
+def _uni_scan(nonce: int, offhours: bool = False):
     # max_entries=1 CAPS MEMORY. There is deliberately no TTL (the nonce is the only trigger),
     # but without a size cap st.cache_data kept ONE full-universe board (~270 names x 6 TF + wall
     # lists) PER nonce for the whole session -- and the nonce only increments, so a heavy day of
@@ -678,7 +678,11 @@ def _uni_scan(nonce: int):
     # button (which bumps the nonce), never as a side effect of moving a filter widget. Without
     # this, a filter change that happens to land after the 5-min memo bucket rolls would trigger
     # a surprise ~30s cold re-scan. Filters must be instant; scanning must be deliberate.
-    sc = live.universe_mtf_scan()
+    # `offhours` IS A CACHE KEY, NOT JUST AN ARGUMENT. The nonce does not change when the
+    # market opens, so a pre-open test board cached under it would otherwise be served as
+    # the LIVE board at 09:15: every price at yesterday's close, every day% zero. The flag
+    # flips the moment the session opens, which forces a fresh live scan.
+    sc = live.universe_mtf_scan(allow_offhours=offhours)
     # RAISE on failure OR on an empty board, so st.cache_data NEVER stores a barren result.
     # Two poisoning paths this closes: (1) a scan before the ~06:00 token refresh -> ok=False;
     # (2) a scan in the pre-open / first seconds of the session -> ok=True but ZERO quotes ->
@@ -1637,7 +1641,8 @@ if tf == "Intraday":
         try:
             with st.spinner("Scanning the full F&O universe on 6 timeframes (concurrent fetch, "
                             "~30s cold; instant once pinned)…"):
-                sc = _uni_scan(st.session_state["uni_nonce"])
+                sc = _uni_scan(st.session_state["uni_nonce"],
+                               offhours=bool(test_mode and not live.market_open()))
             st.session_state.pop("_uni_retried", None)      # success — clear the retry guard
         except Exception as _e:
             # DIAGNOSE THE CAUSE, DO NOT INFER IT FROM THE CLOCK. This branch used to decide
