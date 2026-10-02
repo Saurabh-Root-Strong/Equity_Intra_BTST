@@ -74,6 +74,17 @@ PRESETS: dict[str, dict] = {
 }
 PRESET_ORDER = ["intraday", "btst", "swing", "positional"]
 
+# THE ONE FRAME ABOVE THE PAIR -- the Upper-TF S/R frame. Walks the 4x confirmation ladder
+# (1h -> 4h -> 1D -> 1W -> 1M); the 2h "tweener" is skipped because no preset confirms on it.
+# Intraday (HTF 1h) -> 4h, BTST (4h) -> 1D, Swing (1D) -> 1W, Positional (1W) -> 1M.
+_TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W", "1M")
+_LADDER = ("1h", "4h", "1D", "1W", "1M")
+
+
+def one_frame_up(htf: str) -> str | None:
+    hi = _TF_ORD.index(htf) if htf in _TF_ORD else -1
+    return next((f for f in _LADDER if _TF_ORD.index(f) > hi), None)
+
 # ── HOW PROVISIONAL IS THE READ? (measured, not asserted) ────────────────────────────
 # The trigger bar is still PRINTING, so its label can change until it closes. Measured by
 # replaying a full session on 49 names: at every 15-minute checkpoint both frames were

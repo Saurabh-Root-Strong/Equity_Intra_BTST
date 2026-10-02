@@ -489,6 +489,37 @@ def walls_kind(h, l, tol: float, w: int = 2) -> list[tuple[float, int, int, int]
     mean, same merge order); only the bookkeeping is added.
     """
     his, los = pivots(h, l, w=w)
+    return walls_kind_from(his, los, tol)
+
+
+def pivot_flags(h, l, w: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """pivots() as boolean flags over the WHOLE series, computed once.
+
+    A pivot at bar k depends only on bars k-w..k+w, so for any window [lo, hi) the pivots()
+    of that window are exactly the flagged bars with lo+w <= k < hi-w, in order. A simulator
+    that asks for the levels at every bar can therefore slice flags instead of re-running the
+    O(window) Python loop per bar. Same NaN and zero-range rules as pivots(); tested equal."""
+    h = np.asarray(h, float)
+    l = np.asarray(l, float)
+    n = len(h)
+    fh, fl = np.zeros(n, bool), np.zeros(n, bool)
+    if n < 2 * w + 1:
+        return fh, fl
+    from numpy.lib.stride_tricks import sliding_window_view as _sw
+    wh, wl = _sw(h, 2 * w + 1), _sw(l, 2 * w + 1)
+    with np.errstate(invalid="ignore"):
+        mx, mn = wh.max(axis=1), wl.min(axis=1)
+        # A NaN in the window makes max/min NaN, and every comparison against NaN is False --
+        # exactly as in pivots(), so no extra NaN rule is needed (or wanted).
+        ok = np.isfinite(wh).any(axis=1) & np.isfinite(wl).any(axis=1) & ~(mx <= mn)
+        core = slice(w, n - w)
+        fh[core] = ok & (h[core] >= mx - 1e-9)
+        fl[core] = ok & (l[core] <= mn + 1e-9)
+    return fh, fl
+
+
+def walls_kind_from(his, los, tol: float) -> list[tuple[float, int, int, int]]:
+    """walls_kind's clustering on pivot lists the caller already has."""
     pts = [(x, 0) for x in los] + [(x, 1) for x in his]      # 0 = swing low, 1 = swing high
     lv: list[list] = []
     for x, k in sorted(pts, key=lambda z: z[0]):
@@ -637,6 +668,58 @@ def sr_levels(candles: pd.DataFrame, spot: float | None = None,
         "head_dn": round((px - max(dn2)) / a, 2) if dn2 else None,
         "atr": a, "levels": lv, "levels_ext": lv_ext, "levels_kind": lv_kind, "blind": blind,
     }
+
+
+def big_wall(px: float, a: float, look_up: bool, frames, min_dist_atr: float = 0.25):
+    """The nearest higher-frame wall IN THE TRADE'S DIRECTION -> (label, gap_in_atr, wall_px).
+
+    `frames` is an iterable of (frame_label, levels, blind) where `levels` is sr_levels'
+    levels_ext [(level, touches, lo, hi)] (plain (level, touches) is tolerated) and `blind` is
+    its (low, high) pivot-blind-zone extreme. `a` is the TRIGGER frame's ATR, so the gap is in
+    the same unit as the 1xATR stop/target it is compared against. No wall -> ("", inf, nan):
+    inf means CLEAR ROAD, the opposite of unknown.
+
+    Shared by the live board (live.add_setup) and the paper simulator (paper_hz) so the
+    Upper-TF S/R filter means one thing on both.
+    """
+    md = min_dist_atr * a
+    walls = []
+    for f, wl, bz in frames:
+        for _lv in (wl if isinstance(wl, (list, tuple)) else []):
+            x, t = float(_lv[0]), int(_lv[1])
+            lo, hi = (float(_lv[2]), float(_lv[3])) if len(_lv) >= 4 else (x, x)
+            # (3) CLUSTER EDGE. A cluster is quoted at its touch-weighted MEAN. When price
+            # sits INSIDE the cluster that mean falls on the wrong side, so the ceiling over
+            # a long renders as a floor under it. Quote the edge facing the trade instead.
+            if look_up and x <= px < hi:
+                x = hi
+            elif (not look_up) and x >= px > lo:
+                x = lo
+            # (1) KEEP 1-TOUCH LEVELS. Identical rule to the pair path in _live_levels: a
+            # single violent rejection IS a level, and only the min-distance filter should
+            # drop it. This gate used to be a bare `t >= 2`, which is the same bug already
+            # found and fixed for headroom -- it made a lone spike-and-crash read "clear"
+            # while the level sat plainly on the chart.
+            if t >= 2 or (x > px + md if look_up else x < px - md):
+                walls.append((x, t, f, ""))
+        # (2) THE PIVOT BLIND ZONE. pivots() needs +/-2 neighbours, so the last two bars of
+        # the frame can never BE a level -- two WEEKS on 1W, two MONTHS on 1M. That is where
+        # "price is testing the high right now" lives, and it was the single biggest source
+        # of a false "clear" (50.2% of names on 1W, 57.0% on 1M). Closed bars only, so it
+        # cannot repaint. Marked "~" because it is an untested extreme, not a defended level.
+        if isinstance(bz, (list, tuple)) and len(bz) == 2:
+            e = bz[1] if look_up else bz[0]
+            try:
+                e = float(e)
+            except (TypeError, ValueError):
+                e = float("nan")
+            if e == e and ((e > px) if look_up else (e < px)):
+                walls.append((e, 1, f, "~"))
+    side_walls = [w for w in walls if (w[0] > px) == look_up]
+    if not side_walls:
+        return "", float("inf"), float("nan")
+    x, t, f, k = (min if look_up else max)(side_walls, key=lambda z: z[0])
+    return f"{f} {x:.2f} ×{t}{k}", round(abs(x - px) / a, 2), x
 
 
 def band_pct(candles: pd.DataFrame, label: str | None = None,

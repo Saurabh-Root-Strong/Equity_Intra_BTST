@@ -2515,13 +2515,10 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str,
     # reach the monthly. Direction follows the trade: a ceiling above a long, a floor below a
     # short. Distance in the TRIGGER frame's ATR. CONTEXT, not a veto -- a break of the big
     # level is often the move -- but you must SEE it before you buy in.
-    _TF_ORD = ("15m", "1h", "2h", "4h", "1D", "1W", "1M")
-    _LADDER = ("1h", "4h", "1D", "1W", "1M")      # the 4x confirmation-frame ladder, incl. month
     # Same 0.25-ATR min-distance the pair path uses: a 1-touch pivot hugging price is inside the
     # noise, a >=2-touch wall is never noise however close it sits.
     _BIG_MIN_DIST_ATR = 0.25
-    _hi = _TF_ORD.index(htf) if htf in _TF_ORD else -1
-    _one = next((f for f in _LADDER if _TF_ORD.index(f) > _hi), None)
+    _one = _mtf_mod.one_frame_up(htf)             # the 4x ladder, shared with the simulator
     _ctx = [_one] if _one else []
     big_w, big_g, big_px = [], [], []
     for _, r in b.iterrows():
@@ -2534,50 +2531,13 @@ def add_setup(board: pd.DataFrame, ltf: str, htf: str,
         if px <= 0 or a <= 0 or not _ctx:
             big_w.append(""); big_g.append(np.inf); big_px.append(np.nan); continue
         look_up = r.get("side") != "SHORT"          # long / no-side watch the ceiling; short the floor
-        md = _BIG_MIN_DIST_ATR * a
-        walls = []
-        for f in _ctx:
-            wl = r.get(f"sr_wallx{f}") or r.get(f"sr_wall{f}")
-            for _lv in (wl if isinstance(wl, list) else []):
-                # tolerate both shapes: (level, touches) and (level, touches, lo, hi)
-                x, t = float(_lv[0]), int(_lv[1])
-                lo, hi = (float(_lv[2]), float(_lv[3])) if len(_lv) >= 4 else (x, x)
-                # (3) CLUSTER EDGE. A cluster is quoted at its touch-weighted MEAN. When price
-                # sits INSIDE the cluster that mean falls on the wrong side, so the ceiling over
-                # a long renders as a floor under it. Quote the edge facing the trade instead.
-                if look_up and x <= px < hi:
-                    x = hi
-                elif (not look_up) and x >= px > lo:
-                    x = lo
-                # (1) KEEP 1-TOUCH LEVELS. Identical rule to the pair path in _live_levels: a
-                # single violent rejection IS a level, and only the min-distance filter should
-                # drop it. This gate used to be a bare `t >= 2`, which is the same bug already
-                # found and fixed for headroom -- it made a lone spike-and-crash read "clear"
-                # while the level sat plainly on the chart.
-                if t >= 2 or (x > px + md if look_up else x < px - md):
-                    walls.append((x, t, f, ""))
-            # (2) THE PIVOT BLIND ZONE. pivots() needs +/-2 neighbours, so the last two bars of
-            # the frame can never BE a level -- two WEEKS on 1W, two MONTHS on 1M. That is where
-            # "price is testing the high right now" lives, and it was the single biggest source
-            # of a false "clear" (50.2% of names on 1W, 57.0% on 1M). Closed bars only, so it
-            # cannot repaint. Marked "~" because it is an untested extreme, not a defended level.
-            bz = r.get(f"sr_blind{f}")
-            if isinstance(bz, (list, tuple)) and len(bz) == 2:
-                e = bz[1] if look_up else bz[0]
-                try:
-                    e = float(e)
-                except (TypeError, ValueError):
-                    e = float("nan")
-                if e == e and ((e > px) if look_up else (e < px)):
-                    walls.append((e, 1, f, "~"))
-        side_walls = [w for w in walls if (w[0] > px) == look_up]
-        if side_walls:
-            x, t, f, k = (min if look_up else max)(side_walls, key=lambda z: z[0])
-            big_w.append(f"{f} {x:.2f} ×{t}{k}")
-            big_g.append(round(abs(x - px) / a, 2))
-            big_px.append(x)                        # the wall PRICE, so the 5s tick re-derives the gap
-        else:
-            big_w.append(""); big_g.append(np.inf); big_px.append(np.nan)
+        # ONE IMPLEMENTATION, shared with the paper simulator (paper_hz), so the Upper-TF S/R
+        # filter the board applies and the one the simulator measures cannot drift apart.
+        w_, g_, x_ = indicators.big_wall(
+            px, a, look_up,
+            [(f, r.get(f"sr_wallx{f}") or r.get(f"sr_wall{f}"), r.get(f"sr_blind{f}"))
+             for f in _ctx], min_dist_atr=_BIG_MIN_DIST_ATR)
+        big_w.append(w_); big_g.append(g_); big_px.append(x_)   # PRICE, so the 5s tick re-derives the gap
     b["big_wall"], b["big_gap"], b["_big_wall_px"] = big_w, big_g, big_px
 
     # ── S/R CONFLUENCE — THE SAME LEVEL ON BOTH FRAMES OF THE HORIZON ────────────────────
