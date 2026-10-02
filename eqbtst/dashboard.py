@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import (arb, config, data, fno, ledger, live, mtf, paper, scalp, screen,
+from eqbtst import (arb, config, data, fno, ledger, live, mtf, paper, paper_hz, scalp, screen,
                     sector_tilt)
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
@@ -1299,181 +1299,405 @@ if tf == "📝 Paper trade (R)":
             "touch \u2014 so the true maker win rate is below what is shown here.")
         st.stop()
 
-    _pc = st.columns([2, 2, 2, 2])
-    _lens = _pc[0].radio("Which lens?", ["STRUCTURE", "SR"], horizontal=True,
-                         format_func=lambda k: {"STRUCTURE": "📐 Structure",
-                                                "SR": "🧲 Support / Resistance"}[k],
-                         key="paper_lens",
-                         help=("The same two reads the Intraday board renders.\n\n"
-                               "📐 **Structure** — trade when the higher-frame box "
-                               "× lower-frame structure read takes a SIDE (the directional "
-                               "tags: continuation, a range-edge break, a pullback, a coil at "
-                               "the extreme).\n\n"
-                               "🧲 **Support / Resistance** — trade when both "
-                               "frames mark a level at the same price and price is standing on "
-                               "it: LONG at a support, SHORT at a resistance."))
-    _rr = _pc[1].slider("Reward multiple (R:R)", 1.0, 5.0, 3.0, 0.5, key="paper_rr",
-                        help="Target distance as a multiple of the initial risk. The sweep "
-                             "table below reports every setting at once, so this only "
-                             "controls the detailed tables.")
-    _stop_atr = _pc[2].slider("Stop (× ATR)", 0.5, 3.0, 1.0, 0.25, key="paper_stopatr",
-                              help=("Initial risk = this × the trigger frame's ATR, which "
-                                    "is what **1R** means everywhere on this page. A wider "
-                                    "stop is not free: it is stopped out less often but each "
-                                    "loss costs the same 1R, and the target moves the same "
-                                    "multiple further away."))
-    _maxbars = _pc[3].slider("Time stop (bars)", 5, 60, 20, 5, key="paper_maxbars",
-                             help="Close at the market if neither the stop nor the target is "
-                                  "touched within this many daily bars. The exit books "
-                                  "whatever fraction of R it is worth.")
+    # ── HORIZON LANE — the 20 most volatile Nifty 100 names, on the board's four horizons ──
+    # The same Trade horizon and Upper-TF S/R controls the Intraday board carries, so a setup
+    # read there can be checked here against every time it fired before. Signals are built
+    # ONCE per (horizon, lens, years, universe) behind the Run button; every exit knob below
+    # re-walks those signals instantly, so dragging R:R never re-replays the tape.
+    _hz_opts = paper_hz.HORIZON_ORDER
+    _r1 = st.columns([3, 2, 2, 2])
+    _hz = _r1[0].selectbox(
+        "Trade horizon (sets both timeframes)", _hz_opts, index=_hz_opts.index("btst"),
+        key="paper_hz", format_func=lambda k: paper_hz.HORIZONS[k]["label"],
+        help=("**Pick the HOLD, and the timeframes follow** — same presets as the Intraday "
+              "board.\n\n| Horizon | Trigger | Confirm | Upper-TF S/R | History |\n"
+              "|---|---|---|---|---|\n"
+              "| Sml-Intraday | 5m | 15m | 1h | 2 yr of 5m bars |\n"
+              "| Intraday | 15m | 1h | 4h | 2 yr of 15m bars |\n"
+              "| BTST | 1h | 4h | 1D | 2 yr of 15m bars |\n"
+              "| Swing | 4h | 1D | 1W | 2 yr of 15m bars |\n"
+              "| Positional | 1D | 1W | 1M | 8 yr EOD archive |\n\n"
+              "Sml-Intraday and Intraday trades are **squared off at the session's last "
+              "bar**. The intraday-built horizons read Tradebot's 2-year 5- and 15-minute "
+              "downloads plus this page's broker top-up — not the 60-day live fetch.\n\n"
+              "⚠ **Sml-Intraday has the tightest stop on the page** (one 5m ATR ≈ 0.2–0.3% "
+              "of price), so the same ~7bps intraday cost is the LARGEST fraction of risk "
+              "here. It is a paper-page horizon only; the live board has no 5m frame."))
+    _HZ = paper_hz.HORIZONS[_hz]
+    _room = _r1[1].selectbox(
+        "Upper-TF S/R (one frame up)", ["All", *paper_hz.ROOM_BUCKETS[:3]], index=0,
+        key="paper_room",
+        help=(f"The wall on the ONE frame above the pair — **{_HZ['up']}** for this horizon "
+              "— in the trade's direction (a ceiling over a long, a floor under a short), "
+              "measured in trigger-frame ATR. Same rule and thresholds as the board's "
+              "`big wall` column: ✅ **Has room** ∞ or ≥ 1 ATR · ⚠ **Tight** 0.5–1 ATR · "
+              "🧱 **Capped** < 0.5 ATR.\n\nFiltering here changes WHICH signals are taken. "
+              "The *By Upper-TF S/R* table below measures all three buckets on the same "
+              "signals, so whether the filter earns its place is read off evidence."))
+    _lens = _r1[2].radio(
+        "Which lens?", ["STRUCTURE", "SR"], horizontal=True, key="paper_lens",
+        format_func=lambda k: {"STRUCTURE": "📐 Structure", "SR": "🧲 S/R"}[k],
+        help=("📐 **Structure** — trade when the confirm-frame box × trigger-frame structure "
+              "read takes a SIDE.\n\n🧲 **S/R** — trade when both frames mark a level at the "
+              "same price and price stands on it: LONG at a support, SHORT at a resistance. "
+              "Measured on this board: a shared support tends to BREAK, not bounce."))
+    _umode = _r1[3].radio(
+        "Universe", ["pit", "today"], horizontal=True, key="paper_umode",
+        format_func=lambda k: {"pit": "Point-in-time", "today": "Today's 20"}[k],
+        help=("**Point-in-time** (honest) — the top 20 by ATR% is re-ranked every month on "
+              "data that ended BEFORE the month began; a name only trades in months it was "
+              "really in the list.\n\n**Today's 20** — the current list across all of history. "
+              "⚠️ Look-ahead: those names are in the list BECAUSE they were volatile, so the "
+              "past is judged by a filter it could not have known.\n\nBoth use TODAY's "
+              "Nifty 100 membership (NSE publishes no free historical constituent file)."))
 
-    _sc2 = st.columns([2, 2, 2, 2])
-    _yrs = _sc2[0].slider("Years of history", 1, 8, 3, 1, key="paper_years",
-                          help="More years = more regimes and a firmer answer, and a longer "
-                               "run. The archive starts in 2018.")
-    _nmax = _sc2[1].slider("Names (by turnover)", 10, 250, 60, 10, key="paper_names",
-                           help=("How many of the most-traded names to simulate. Ranked by "
-                                 "median turnover, never alphabetically — a truncated "
-                                 "universe has to be a TRADEABLE subset or the study quietly "
-                                 "becomes 'how does this do on names beginning with A'."))
-    _sides = _sc2[2].multiselect("Sides", ["LONG", "SHORT"], default=["LONG", "SHORT"],
-                                 key="paper_sides",
-                                 help=("Shorts are included by default so the number is "
-                                       "honest, but remember what this board measured "
-                                       "elsewhere: overnight short is proven -EV on this "
-                                       "universe (win ~20%). Untick SHORT to see the long "
-                                       "side alone."))
-    _cost = _sc2[3].number_input("Cost (bps round trip)", 0.0, 100.0,
-                                 float(config.COST_BPS), 1.0, key="paper_cost",
-                                 help=("Charged **in R**, not in bps. A flat 22bps is a "
-                                       "different fraction of risk for every stop width — "
-                                       "0.11R on a 2%-of-price stop, 0.44R on a 0.5% one. "
-                                       "Subtracting a flat '0.1R' would flatter tight stops "
-                                       "exactly where they are least survivable."))
-
-    st.info("⏳ **Frames are 1D trigger + 1W confirm** (the Positional horizon). That is "
-            "the only pair the 8-year EOD archive can reproduce leak-free and without a "
-            "broker call. The intraday pairs (15m/1h, 1h/4h, 4h/1D) need broker history, "
-            "which serves ~60 days and is rate-limited — a 'backtest' on them would be a "
-            "few months of one regime dressed up as evidence, so this page does not offer "
-            "one rather than quietly running a worse study.")
-
-    @st.cache_data(show_spinner=False, ttl=3600)
-    def _run_paper(lens, rr, stop_atr, maxbars, yrs, nmax, sides, cost):
-        _start = (pd.Timestamp(last) - pd.DateOffset(years=int(yrs))).strftime("%Y-%m-%d")
-        return paper.simulate(lens=lens, rr=float(rr), stop_atr=float(stop_atr),
-                              max_bars=int(maxbars), start=_start, max_names=int(nmax),
-                              sides=tuple(sides), cost_bps=float(cost))
-
+    _r2 = st.columns([2, 2, 2, 2, 2])
+    _rr = _r2[0].slider("Reward multiple (R:R)", 1.0, 5.0, 2.0, 0.5, key="paper_rr",
+                        help="Target = this × the initial risk. The R:R sweep below reports "
+                             "every setting at once.")
+    _stop_atr = _r2[1].slider("Stop (× ATR)", 0.5, 3.0, 1.0, 0.25, key="paper_stopatr",
+                              help="1R = this × the TRIGGER frame's ATR.")
+    _h0, _h1 = paper_hz.HOLD_RANGE[_hz]
+    _maxbars = _r2[2].slider(f"Time stop ({_HZ['ltf']} bars)", _h0, _h1,
+                             paper_hz.DEFAULT_HOLD[_hz], 1, key=f"paper_maxbars_{_hz}",
+                             help=("Close at the market after this many trigger bars. "
+                                   "Defaults: Intraday 12×15m (3h, and square-off at the "
+                                   "close regardless) · BTST 6×1h = one session · Swing "
+                                   "10×4h = 5 sessions · Positional 20 days."))
+    # INTRADAY PAYS THE MIS SHEET, NOT DELIVERY. Squared-off equity carries STT on the sell leg
+    # only (2.5bps vs 10bps each way on delivery), so charging 22bps to an intraday trade would
+    # overstate its bill ~3x. The default comes from scalp.cost_parts at ₹2L, the same sheet the
+    # scalper lane prints line by line.
+    _cost_def = (round(float(sum(scalp.cost_parts(scalp.DEFAULT_POSITION, 1000.0).values())), 1)
+                 if paper_hz.SQUARE_OFF[_hz] else float(config.COST_BPS))
+    _cost = _r2[3].number_input("Cost (bps round trip)", 0.0, 100.0, _cost_def, 1.0,
+                                key=f"paper_cost_{_hz}",
+                                help=("Charged **in R**: a flat bps charge is a different "
+                                      "fraction of risk for every stop width.\n\nDefault: "
+                                      "Intraday = the MIS sheet at ₹2L incl. a 1-tick spread; "
+                                      "other horizons = the 22bps delivery round trip."))
+    _src = paper_hz.SOURCE[_hz]
+    _intra_src = _src != "1D"
+    # 5m is 3x the bars of 15m and every one goes through the real structure code, so the
+    # default window is a year there -- two years is still one click away.
+    _ydef = 1 if _src == "5m" else (2 if _intra_src else 3)
+    _yrs = _r2[4].slider("Years of history", 1, 2 if _intra_src else 8, _ydef, 1,
+                         key=f"paper_years_{_hz}",
+                         help="5- and 15-minute history starts 2024-06, so the intraday-built "
+                              "horizons are capped at 2 years (Sml-Intraday defaults to 1: three "
+                              "times the bars of 15m). Positional reads the 8-year EOD archive.")
+    _sides = st.pills("Sides", ["LONG", "SHORT"], selection_mode="multi",
+                      default=["LONG", "SHORT"], key="paper_sides",
+                      help=("A SHORT held overnight is not a cash-equity trade (a delivery "
+                            "short cannot be carried). On BTST / Swing / Positional read the "
+                            "short side as a stock-futures proxy — all 20 names are F&O."))
     if not _sides:
         st.warning("Pick at least one side.")
         st.stop()
-    _go = st.button("▶ Run the simulation", type="primary")
-    _key = ("paper_last", _lens, _rr, _stop_atr, _maxbars, _yrs, _nmax, tuple(_sides), _cost)
-    if _go:
+
+    # ── the focus universe, shown before anything runs ──
+    @st.cache_data(show_spinner=False, ttl=3600)
+    def _focus20(_stamp):
+        _syms = paper_hz.nifty100()
+        _d = paper_hz.daily_adjusted(_syms, start=(pd.Timestamp(_stamp) - pd.Timedelta(days=260))
+                                     .strftime("%Y-%m-%d"))
+        return paper_hz.vol_rank(_d, as_of=pd.Timestamp(_stamp) + pd.Timedelta(days=1)), len(_syms)
+
+    try:
+        _top, _n100 = _focus20(str(last))
+    except Exception as _e:                   # noqa: BLE001 — DuckDB lock (DCM writer)
+        st.error(f"EOD archive unavailable — {str(_e)[:240]}")
+        st.stop()
+    with st.expander(f"🎯 Focus universe — the {paper_hz.N_NAMES} most volatile of the Nifty 100 "
+                     f"(ATR%, last {paper_hz.VOL_WINDOW} sessions to {pd.Timestamp(last).date()})",
+                     expanded=False):
+        if _top.empty:
+            st.error("Could not rank the universe — the EOD archive returned nothing.")
+        else:
+            st.dataframe(_top[["rank", "symbol", "atr%", "close"]], hide_index=True,
+                         width="stretch", height=260)
+        st.caption(f"Nifty 100 list: {_n100} names from NSE (`ind_nifty100list.csv`, cached "
+                   f"{paper_hz.universe_asof()}). Ranked by **ATR%** (mean true range ÷ close) — "
+                   "the unit a stop and a target are measured in — not by beta. "
+                   "Split-adjusted before ranking.")
+        if st.button("⟳ Refresh the Nifty 100 list from NSE", key="paper_n100"):
+            paper_hz.nifty100(refresh=True)
+            _focus20.clear()
+            st.rerun()
+
+    if _intra_src:
+        _tp = [paper_hz.load_bars(s, _src) for s in _top["symbol"].head(3)] if not _top.empty else []
+        _tape = max((f["ts"].max() for f in _tp if not f.empty), default=None)
+        _age = ((pd.Timestamp(last) - pd.Timestamp(_tape).normalize()).days
+                if _tape is not None else None)
+        _tc = st.columns([5, 2])
+        if _tape is None or (_age is not None and _age > 4):
+            _tc[0].warning(f"⏳ {_src} history ends **{_tape}** — "
+                           f"{_age} days behind the archive. Trades after that date cannot "
+                           "appear until it is topped up from the broker.")
+        else:
+            _tc[0].caption(f"{_src} history through **{_tape}**.")
+        if _tc[1].button(f"⟳ Top up {_src} history", key="paper_topup",
+                         help="Pulls the missing tail for every Nifty 100 name from Fyers in "
+                              "90-day chunks. Needs a live token; ~1–2 minutes."):
+            _pb = st.progress(0.0, text=f"Fetching {_src} bars…")
+            paper_hz.topup_bars(paper_hz.nifty100(), _src,
+                               progress=lambda f, s: _pb.progress(f, text=f"{s}…"))
+            st.cache_data.clear()
+            st.rerun()
+
+    @st.cache_data(show_spinner=False, ttl=6 * 3600, max_entries=8)
+    def _hz_bundle(hz, lens, yrs, umode, _stamp):
+        return paper_hz.build_bundle(hz, lens=lens, years=float(yrs), universe_mode=umode)
+
+    _key = ("paper_hz", _hz, _lens, _yrs, _umode)
+    if st.button("▶ Run the simulation", type="primary", key="paper_go"):
         st.session_state["paper_key"] = _key
     if st.session_state.get("paper_key") != _key:
-        # A RUN IS EXPENSIVE AND MUST BE ASKED FOR. Every widget above changes the result, so
-        # re-running on each slider nudge would put a ~1-4 minute job behind a drag gesture.
-        st.caption("⬆ Set the knobs, then press **Run the simulation**. "
-                   "A run takes roughly 1–4 minutes depending on the name count and "
-                   "years — it replays every bar through the real structure and level "
-                   "code, not a fast copy of it.")
+        # A RUN IS EXPENSIVE AND MUST BE ASKED FOR — but only the SIGNAL replay is. Exit knobs
+        # (R:R, stop, time stop, cost, sides, Upper-TF) re-walk the cached signals instantly.
+        st.caption("⬆ Pick the horizon, lens and universe, then press **Run**. Signal replay "
+                   "takes ~1–4 minutes on the 15m-built horizons and ~5–15 on Sml-Intraday (5m "
+                   "is three times the bars; every bar goes through the real structure / level "
+                   "code). After that every other knob is instant.")
         st.stop()
-    with st.spinner("Replaying every bar through the real structure / level code…"):
-        _res = _run_paper(_lens, _rr, _stop_atr, _maxbars, _yrs, _nmax, _sides, _cost)
-    _tr, _sm, _meta = _res["trades"], _res["summary"], _res["meta"]
-    if _tr.empty:
-        st.warning("No trades. Widen the window or the name count.")
+    with st.spinner(f"Replaying every {_HZ['ltf']} bar through the real structure / level code…"):
+        _bundle = _hz_bundle(_hz, _lens, _yrs, _umode, str(last))
+    _meta = _bundle["meta"]
+    if not _bundle["sig"]:
+        _hz_bundle.clear()                    # a failed read must not be cached for 6 hours
+        st.error(f"No signals. {_meta.get('error', '')}")
         st.stop()
 
-    st.caption(f"{_meta['n_names']} names · {_meta['start']} → {_meta['end']} "
-               f"· {_meta['ltf']} trigger / {_meta['htf']} confirm · "
-               f"stop {_meta['stop_atr']}×ATR · cost {_meta['cost_bps']:.0f}bps")
+    _wk = dict(rr=float(_rr), stop_atr=float(_stop_atr), max_bars=int(_maxbars),
+               cost_bps=float(_cost), sides=tuple(_sides))
+    _all = paper_hz.walk_bundle(_bundle, room=_room, **_wk)
+    if _all.empty:
+        st.warning("No trades under these settings. Loosen the Upper-TF filter or add a side.")
+        st.stop()
+    st.caption(f"**{_HZ['ltf']} trigger / {_HZ['htf']} confirm / {_HZ['up']} upper-TF** · "
+               f"{_meta['start']} → {_meta['end']} · universe "
+               f"{'point-in-time top ' if _umode == 'pit' else 'today’s top '}{_meta['n']} "
+               f"({len(_bundle['sig'])} names traded at some point) · stop {_stop_atr}×ATR · "
+               f"cost {_cost:g}bps · Upper-TF filter: {_room}")
+    if _meta.get("missing"):
+        st.caption("No usable history for: " + ", ".join(_meta["missing"]))
 
-    # ── THE HEADLINE: win rate is not independent of the target ─────────────────────────
-    st.subheader("R:R sweep — what each target actually earns")
-    _sweep = _res.get("rr_curve", pd.DataFrame())
-    if not _sweep.empty:
-        st.dataframe(_sweep, use_container_width=True, hide_index=True)
-        _best = _sweep.loc[_sweep["expectancy_R"].idxmax()]
-        _w1 = _sweep.iloc[0]["win%"]
-        _wN = _sweep.iloc[-1]["win%"]
-        st.caption(
-            f"Win rate falls from **{_w1:.1f}%** at {_sweep.iloc[0]['R:R']} to "
-            f"**{_wN:.1f}%** at {_sweep.iloc[-1]['R:R']} — that fall is the whole point. "
-            f"Best expectancy here is **{_best['expectancy_R']:+.3f}R** at "
-            f"**{_best['R:R']}** (n={int(_best['n'])}, t={_best['t']}).")
-        if float(_sweep["expectancy_R"].max()) <= 0:
-            st.error(
-                "⛔ **Every reward multiple is NEGATIVE after cost.** This is the "
-                "answer the formula cannot give you from assumed inputs: no R:R rescues a "
-                "signal that has no directional edge — it only redistributes the same "
-                "negative expectancy between a smaller number of bigger wins and a larger "
-                "number of losses. Consistent with what the rest of this board measured: "
-                "the one validated edge here is the **BTST overnight carry**, not "
-                "intraday/structure direction.")
+    _pend = _all[_all["status"] == "PENDING"]
+    _open = _all[_all["status"] == "OPEN"]
+    _closed = _all[_all["status"] == "CLOSED"]
+    _cols_live = ["symbol", "side", "setup", "signal_ts", "entry", "stop", "target", "risk%",
+                  "upper_tf", "room"]
+    _cfg = {
+        "result": st.column_config.TextColumn("Result", help="✅ WIN = made money AFTER cost. "
+                                              "❌ LOSS = lost money after cost. A target hit is "
+                                              "almost always a win; a time-limit exit a few "
+                                              "paise up can still be a LOSS once cost is paid."),
+        "symbol": st.column_config.TextColumn("Stock"),
+        "side": st.column_config.TextColumn("Side", help="LONG = bought first; SHORT = sold first."),
+        "signal_ts": st.column_config.DatetimeColumn("Signal bar", format="YYYY-MM-DD HH:mm"),
+        "entry_ts": st.column_config.DatetimeColumn("Bought/sold at", format="DD-MMM HH:mm"),
+        "exit_ts": st.column_config.DatetimeColumn("Closed at", format="DD-MMM HH:mm"),
+        "entry": st.column_config.NumberColumn("Entry ₹", format="%.2f"),
+        "exit": st.column_config.NumberColumn("Exit ₹", format="%.2f"),
+        "stop": st.column_config.NumberColumn("Stop ₹", format="%.2f"),
+        "target": st.column_config.NumberColumn("Target ₹", format="%.2f"),
+        "exit_how": st.column_config.TextColumn("How it ended"),
+        "pnl_pct": st.column_config.NumberColumn(
+            "P&L % (after cost)", format="%+.2f%%",
+            help="Price move in the trade's favour, as % of entry, minus the round-trip cost."),
+        "pnl_rs": st.column_config.NumberColumn("P&L ₹ per share (before cost)", format="%+.2f"),
+        "R": st.column_config.NumberColumn(
+            "Result in R", format="%+.2f",
+            help="R = multiples of the risk taken. +1.00 = won as much as the stop would have "
+                 "lost; −1.00 = the full stop. After cost."),
+        "R_gross": st.column_config.NumberColumn("R before cost", format="%+.2f"),
+        "cost_R": st.column_config.NumberColumn("Cost in R", format="%.2f"),
+        "bars": st.column_config.NumberColumn(f"Held ({_HZ['ltf']} bars)"),
+        "setup": st.column_config.TextColumn("Setup"),
+        "upper_tf": st.column_config.TextColumn(f"{_HZ['up']} wall (price ×touches)"),
+        "up_gap_atr": st.column_config.NumberColumn(
+            "Distance to wall (ATR)", format="%.2f",
+            help="In ATR = Average True Range of the trigger frame. ∞ = no wall in the way."),
+        "room": st.column_config.TextColumn("Upper-TF S/R"),
+        "risk%": st.column_config.NumberColumn("Risk % (entry→stop)", format="%.2f"),
+    }
 
-    # ── expectancy card ────────────────────────────────────────────────────────────────
-    st.subheader(f"Detail at 1:{_rr:g}")
+    def _tint(df, col="result"):
+        # Row colour follows the RESULT, not the exit reason: green made money after cost,
+        # red lost it. Low alpha so the numbers stay readable in both themes.
+        good = df[col].astype(str).str.startswith("✅").to_numpy()
+        css = np.where(good, "background-color: rgba(34,197,94,0.16)",
+                       "background-color: rgba(239,68,68,0.16)")
+        return pd.DataFrame(np.repeat(css[:, None], df.shape[1], axis=1),
+                            index=df.index, columns=df.columns)
+
+    st.subheader("🔔 Signals on the latest bar — fill at the next open")
+    if _pend.empty:
+        st.caption(f"No stock fired on the last {_HZ['ltf']} bar of the data ({_meta['end']}).")
+    else:
+        st.dataframe(_pend[_cols_live], hide_index=True, width="stretch", column_config=_cfg)
+        st.caption("Entry/stop/target are quoted off the signal bar's close; the simulator "
+                   "fills at the NEXT bar's open, so the real levels shift by the gap.")
+
+    st.subheader("📂 Open positions — marked to the last bar")
+    if _open.empty:
+        st.caption("None open at the end of the data.")
+    else:
+        _ov = paper_hz.trade_view(_open, float(_cost))
+        _ov["result"] = np.where(_ov["R"] > 0, "✅ in profit", "❌ in loss")
+        st.dataframe(_ov[["result", "symbol", "side", "entry_ts", "entry", "exit", "pnl_pct",
+                          "R", "stop", "target", "setup", "upper_tf", "room"]]
+                     .style.apply(_tint, axis=None),
+                     hide_index=True, width="stretch",
+                     column_config={**_cfg, "exit": st.column_config.NumberColumn(
+                         "Last price ₹", format="%.2f")})
+        st.caption("Still running, so NOT counted in any result below.")
+
+    # ── TRADE LOG — every closed trade, coloured by whether it made money ─────────────
+    _v = paper_hz.trade_view(_closed, float(_cost))
+    st.subheader("📋 Trade log — every closed trade")
+    st.caption("Each row is ONE simulated trade: the setup fired on a bar's close, the trade "
+               "was entered at the next bar's open, and closed at the stop, the target, the "
+               "time limit or the session close. **Green = made money after cost, red = lost "
+               "money.**")
+    _f = st.columns([2, 2, 2, 3])
+    _period = _f[0].selectbox(
+        "Period", ["Last session", "Last 5 sessions", "Last 20 sessions", "Last 60 sessions",
+                   "Everything"], index=1, key="paper_period")
+    _res_f = _f[1].segmented_control("Result", ["All", "✅ Wins", "❌ Losses"], default="All",
+                                     key="paper_resf") or "All"
+    _side_f = _f[2].segmented_control("Side", ["Both", "LONG", "SHORT"], default="Both",
+                                      key="paper_sidef") or "Both"
+    _pick = _f[3].multiselect("Stocks", sorted(_v["symbol"].unique()), key="paper_pick",
+                              placeholder="All stocks")
+    _days = sorted(pd.to_datetime(_v["entry_ts"]).dt.normalize().unique())
+    _nd = {"Last session": 1, "Last 5 sessions": 5, "Last 20 sessions": 20,
+           "Last 60 sessions": 60}.get(_period)
+    _log = _v
+    if _nd and _days:
+        _log = _log[pd.to_datetime(_log["entry_ts"]).dt.normalize() >= _days[-min(_nd, len(_days))]]
+    if _side_f != "Both":
+        _log = _log[_log["side"] == _side_f]
+    if _pick:
+        _log = _log[_log["symbol"].isin(_pick)]
+    # The scoreboard describes the filtered set BEFORE the Wins/Losses view narrows it --
+    # otherwise picking "Wins" would print a 100% win rate.
+    _scope = _log
+    if _res_f == "✅ Wins":
+        _log = _log[_log["R"] > 0]
+    elif _res_f == "❌ Losses":
+        _log = _log[_log["R"] <= 0]
+
+    _wn, _ls = int((_scope["R"] > 0).sum()), int((_scope["R"] <= 0).sum())
+    _sb = st.columns(6)
+    _sb[0].metric("Trades", f"{len(_scope):,}")
+    _sb[1].metric("✅ Wins", f"{_wn:,}")
+    _sb[2].metric("❌ Losses", f"{_ls:,}")
+    _sb[3].metric("Win rate", f"{100 * _wn / max(len(_scope), 1):.1f}%")
+    _sb[4].metric("Avg P&L per trade",
+                  f"{_scope['pnl_pct'].mean() if len(_scope) else 0:+.2f}%",
+                  help="Average % gained or lost per trade, after cost.")
+    _sb[5].metric("Net result", f"{_scope['R'].sum():+.1f}R",
+                  help="Sum of every trade's result in R (multiples of risk), after cost. "
+                       "Risking ₹1,000 per trade, this × ₹1,000 is the rupee outcome.")
+
+    _show = ["result", "symbol", "side", "entry_ts", "entry", "exit_ts", "exit", "exit_how",
+             "pnl_pct", "R", "stop", "target", "bars", "setup", "upper_tf", "up_gap_atr", "room",
+             "R_gross", "cost_R", "pnl_rs", "signal_ts"]
+    _cap = 2000                                     # colouring 10k+ rows stalls the browser
+    if _log.empty:
+        st.info("No trades match these filters.")
+    else:
+        st.dataframe(_log[_show].head(_cap).style.apply(_tint, axis=None), hide_index=True,
+                     width="stretch", height=460, column_config=_cfg)
+        if len(_log) > _cap:
+            st.caption(f"Showing the newest {_cap:,} of {len(_log):,}. Narrow the period or "
+                       "use the CSV for all of them.")
+
+    with st.expander("📅 Day by day — did each session make or lose money?", expanded=False):
+        _dsb = paper_hz.day_scoreboard(_scope)
+        if not _dsb.empty:
+            st.dataframe(_dsb.style.apply(_tint, col="day_result", axis=None),
+                         hide_index=True, width="stretch", height=320,
+                         column_config={"day": st.column_config.DateColumn("Session"),
+                                        "day_result": st.column_config.TextColumn("Day"),
+                                        "net_R": st.column_config.NumberColumn(
+                                            "Net R", format="%+.2f"),
+                                        "avg_pnl_pct": st.column_config.NumberColumn(
+                                            "Avg P&L %", format="%+.2f%%")})
+    st.download_button("⬇ All trades as CSV", _v.to_csv(index=False).encode(), key="paper_csv",
+                       file_name=f"paper_{_hz}_{_lens}_{_rr:g}R.csv", mime="text/csv")
+
+    _sm = paper_hz.summarize(_all)
+    if not _sm:
+        st.stop()
+    st.subheader(f"Result at 1:{_rr:g}")
     _m = st.columns(6)
-    _m[0].metric("trades", _sm["n"])
+    _m[0].metric("trades", f"{_sm['n']:,}")
     _m[1].metric("win rate", f"{_sm['win%']:.1f}%")
-    _m[2].metric("avg win", f"{_sm['avg_win_R']:+.2f}R")
-    _m[3].metric("avg loss", f"-{_sm['avg_loss_R']:.2f}R")
-    _m[4].metric("expectancy", f"{_sm['expectancy_R']:+.3f}R",
-                 help="Mean R per trade, net of cost. This is the number that decides "
-                      "whether the system makes money, not the win rate.")
-    _m[5].metric("total", f"{_sm['total_R']:+.1f}R")
-    _m2 = st.columns(4)
-    _m2[0].metric("profit factor", _sm["profit_factor"])
-    _m2[1].metric("t-stat", _sm["t"],
-                  help=("Expectancy divided by its standard error. R-multiples are heavy "
-                        "tailed and at a wide target the distribution is two spikes, so this "
-                        "is the only thing separating a real edge from a lucky run. |t| under "
-                        "~2 means the mean is not distinguishable from zero."))
-    _m2[2].metric("max drawdown", f"{_sm['max_dd_R']:.1f}R",
-                  help="Worst peak-to-trough of the cumulative R curve. Position sizing "
-                       "lives or dies here, not on expectancy.")
-    _m2[3].metric("expectancy check", f"{_sm['expectancy_check']:+.3f}R",
-                  help="The win%/avg-win decomposition recomputed. It must equal expectancy; "
-                       "if the two ever disagree the decomposition is wrong, not the mean.")
+    _m[2].metric("expectancy", f"{_sm['expectancy_R']:+.3f}R",
+                 help="Mean R per closed trade, net of cost. The number that decides it.")
+    _m[3].metric("t (per trade)", _sm["t"])
+    _m[4].metric("t (by session)", _sm["t_clustered"],
+                 help=("Trades CLUSTERED by entry session. Twenty volatile names are one "
+                       "market: on a gap-down morning half of them stop out together, and the "
+                       "per-trade t counts those as independent. Trust this one. |t| under ~2 "
+                       "= indistinguishable from zero."))
+    _m[5].metric("max drawdown", f"{_sm['max_dd_R']:.1f}R")
 
-    # ── equity curve, per year, trades ─────────────────────────────────────────────────
-    _eq = _tr.sort_values("entry_date").copy()
-    _eq["cum_R"] = _eq["R"].cumsum()
-    st.line_chart(_eq.set_index("entry_date")["cum_R"], height=220)
-    st.caption("Cumulative R, trades in entry order. Flat-to-down is the common outcome for "
-               "a directional screen on this universe and is not a bug in the page.")
+    st.markdown("**R:R sweep — same signals, every target** (win rate is not independent of "
+                "the target)")
+    _sw = paper_hz.rr_sweep(_bundle, room=_room, stop_atr=float(_stop_atr),
+                            max_bars=int(_maxbars), cost_bps=float(_cost), sides=tuple(_sides))
+    st.dataframe(_sw, hide_index=True, width="stretch")
+    if not _sw.empty and float(_sw["expectancy_R"].max()) <= 0:
+        st.error("⛔ **Every reward multiple is NEGATIVE after cost.** No R:R rescues a signal "
+                 "with no directional edge — it only reshuffles the same negative expectancy.")
 
     _c1, _c2 = st.columns(2)
     with _c1:
-        st.markdown("**By year** — an edge that only exists in one year is not an edge.")
-        st.dataframe(_res["by_year"], use_container_width=True, hide_index=True)
+        st.markdown(f"**By Upper-TF S/R ({_HZ['up']})** — same signals, each bucket alone")
+        st.dataframe(paper_hz.by_room(_bundle, **_wk), hide_index=True, width="stretch")
+        st.caption("If ✅ Has room does not beat 🧱 Capped here, the filter is a chart "
+                   "preference, not an edge.")
     with _c2:
         st.markdown("**How trades ended**")
-        _why = _tr["why"].value_counts().rename_axis("exit").reset_index(name="n")
-        _why["share%"] = (100 * _why["n"] / len(_tr)).round(1)
-        st.dataframe(_why, use_container_width=True, hide_index=True)
-        st.caption("`stop` −1R · `target` +{:g}R · `time` whatever it was worth "
-                   "at the time stop. When a bar contains BOTH the stop and the target the "
-                   "STOP is assumed to hit first — daily bars carry no intrabar path, and "
-                   "resolving that in the trade's favour is how a backtest invents an edge "
-                   "that dies live.".format(_rr))
+        _why = _closed["why"].value_counts().rename_axis("exit").reset_index(name="n")
+        _why["share%"] = (100 * _why["n"] / len(_closed)).round(1)
+        _why["mean R"] = _why["exit"].map(_closed.groupby("why")["R"].mean()).round(2)
+        st.dataframe(_why, hide_index=True, width="stretch")
+        st.caption("`gap-stop` = the bar OPENED beyond the stop and filled there — a loss "
+                   "worse than −1R. The old simulator capped these at −1R.")
 
-    with st.expander(f"All {len(_tr)} trades"):
-        st.dataframe(_tr.sort_values("entry_date", ascending=False),
-                     use_container_width=True, hide_index=True)
-        st.download_button("⬇ CSV", _tr.to_csv(index=False).encode(),
-                           file_name=f"paper_{_lens}_{_rr:g}R.csv", mime="text/csv")
+    _c3, _c4 = st.columns(2)
+    with _c3:
+        st.markdown("**By name**")
+        _bn = (_closed.groupby("symbol")["R"].agg(["count", "mean", "sum"]).round(3)
+               .rename(columns={"count": "n", "mean": "E_R", "sum": "total_R"})
+               .sort_values("total_R", ascending=False).reset_index())
+        st.dataframe(_bn, hide_index=True, width="stretch", height=300)
+    with _c4:
+        st.markdown("**By setup**")
+        st.dataframe(_closed.groupby("setup")["R"].agg(["count", "mean"]).round(3)
+                     .rename(columns={"count": "n", "mean": "E_R"})
+                     .sort_values("n", ascending=False).reset_index(),
+                     hide_index=True, width="stretch", height=300)
 
-    st.caption("🧪 **Assumptions, in one place.** Signal at bar *t* reads bars ≤ *t*; "
-               "entry fills at *t+1*'s OPEN; the weekly confirm frame uses only weeks CLOSED "
-               "before *t*; **one position per name at a time** (a persistent tag would "
-               "otherwise re-enter daily and count one position many times); cost charged in "
-               "R. Slippage beyond the cost figure, gaps through the stop, borrow and "
-               "position sizing are NOT modelled — each of them makes the real number "
-               "worse, never better.")
+    _eq = _closed.sort_values("entry_ts").copy()
+    _eq["cum_R"] = _eq["R"].cumsum()
+    st.line_chart(_eq.set_index("entry_ts")["cum_R"], height=220)
+    st.caption("Cumulative R, closed trades in entry order.")
+
+    st.caption(
+        "🧪 **Assumptions, in one place.** Signal at a bar's CLOSE reads that bar and earlier; "
+        "entry at the NEXT bar's open. A higher-frame bar counts only once it has CLOSED "
+        "(weekly from Friday 15:30, monthly from month-end). Prices split-adjusted. A bar "
+        "that OPENS through the stop or target fills at that open; a bar containing both is "
+        "a STOP. One position per name at a time. Intraday squared off at the session's last "
+        "bar. Trades still running at the end are OPEN and excluded. Cost in R. **Not "
+        "modelled:** slippage beyond the cost figure, short-borrow, position sizing, and "
+        "historical index membership (survivorship) — each makes the real number worse.")
     st.stop()
 
 

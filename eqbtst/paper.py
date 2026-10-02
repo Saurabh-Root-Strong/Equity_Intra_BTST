@@ -177,34 +177,17 @@ def _signals_for_symbol(d: pd.DataFrame, lens: str, i0: int,
 # ── trade management ─────────────────────────────────────────────────────────────────
 def _walk(day: pd.DataFrame, i: int, side: str, stop_atr: float, rr: float,
           max_bars: int, atr: float) -> dict | None:
-    """Fill at bar i+1's OPEN, then walk forward to the stop, the target or the time stop."""
-    j = i + 1
-    if j >= len(day) or atr <= 0:
-        return None
-    entry = float(day["open"].iloc[j])
-    if entry <= 0:
-        return None
-    risk = stop_atr * atr
-    if risk <= 0:
-        return None
-    long = side == "LONG"
-    stop = entry - risk if long else entry + risk
-    targ = entry + rr * risk if long else entry - rr * risk
-    for k in range(j, min(j + max_bars, len(day))):
-        hi, lo = float(day["high"].iloc[k]), float(day["low"].iloc[k])
-        hit_stop = (lo <= stop) if long else (hi >= stop)
-        hit_targ = (hi >= targ) if long else (lo <= targ)
-        # BOTH IN ONE BAR -> ASSUME THE STOP. A daily bar carries no intrabar path, and
-        # resolving the ambiguity in the trade's favour is precisely how a backtest invents an
-        # edge that does not survive contact with a real tape.
-        if hit_stop:
-            return {"exit_i": k, "exit_px": stop, "R": -1.0, "why": "stop"}
-        if hit_targ:
-            return {"exit_i": k, "exit_px": targ, "R": rr, "why": "target"}
-    k = min(j + max_bars, len(day)) - 1
-    px = float(day["close"].iloc[k])
-    r = (px - entry) / risk if long else (entry - px) / risk
-    return {"exit_i": k, "exit_px": px, "R": round(r, 3), "why": "time"}
+    """Fill at bar i+1's OPEN, then walk forward to the stop, the target or the time stop.
+
+    Delegates to paper_hz.walk, which fixes two optimistic assumptions this walk used to make:
+    a bar that OPENS through the stop now fills at that open (it used to cap every gap loss at
+    exactly -1R), and a trade still running when the data ends is why='open' rather than a
+    time-stop exit counted in the statistics. The ambiguous-bar rule is unchanged: STOP first.
+    """
+    from . import paper_hz
+    return paper_hz.walk(day["open"].to_numpy(float), day["high"].to_numpy(float),
+                         day["low"].to_numpy(float), day["close"].to_numpy(float),
+                         i, side, stop_atr, rr, max_bars, atr)
 
 
 def build_signals(lens: str = "STRUCTURE", start: str | None = None, end: str | None = None,
@@ -235,6 +218,12 @@ def build_signals(lens: str = "STRUCTURE", start: str | None = None, end: str | 
     sig = {}
     for sym, d in df.groupby("symbol", sort=False):
         d = d.sort_values("trade_date").reset_index(drop=True)
+        # SPLIT-ADJUST. The archive is unadjusted: a 1:5 split is a -80% bar, which books a
+        # fake target on any short open across it and puts every level at pre-split prices.
+        _px = {"open_price": "open", "high_price": "high", "low_price": "low",
+               "close_price": "close"}
+        d = (indicators.adjust_corporate_actions(d.rename(columns=_px))
+             .rename(columns={v: k for k, v in _px.items()}))
         if len(d) < i0 + 30:
             continue
         got = _signals_for_symbol(d, lens, i0, conf_tol_bps, near_atr)
@@ -275,6 +264,8 @@ def walk_signals(bundle: dict, rr: float = 3.0, stop_atr: float = 1.0, max_bars:
             if tr is None:
                 continue
             _free_at = tr["exit_i"]
+            if tr["why"] == "open":
+                continue                  # still running at the end of the data: not a result
             entry = float(day["open"].iloc[i + 1])
             risk = stop_atr * a
             # COST IN R. A flat bps charge is a different fraction of risk for every stop

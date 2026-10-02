@@ -176,8 +176,9 @@ def test_the_rr_sweep_covers_the_folklore_range():
 
 
 def test_only_the_archive_backed_frame_pair_is_offered():
-    """Intraday pairs need broker history (~60 days, rate-limited). Offering them would dress a
-    few months of one regime up as a backtest."""
+    """paper.py stays the daily-only engine. The intraday pairs live in paper_hz, which reads
+    Tradebot's 2-year 15-minute download (+ broker top-up) -- not the ~60-day live fetch that
+    this restriction was originally written against."""
     assert paper.FRAMES == {"positional": ("1D", "1W")}
 
 

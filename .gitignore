@@ -16,3 +16,7 @@ data/live_state/
 # scratch outputs from ad-hoc studies (kept out of the repo root)
 *.parquet
 streamlit.err
+
+# Paper-trade horizon lane: broker 15m top-up cache (rebuildable)
+data/intraday15/
+data/intraday5/
