@@ -18,8 +18,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import (arb, config, data, fno, ledger, live, mtf, paper, paper_hz, scalp, screen,
-                    sector_tilt)
+from eqbtst import (arb, config, data, fno, index_mgmt, ledger, live, mtf, paper, paper_hz,
+                    scalp, screen, sector_tilt)
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
 
@@ -236,7 +236,11 @@ st.sidebar.title("Equity BTST")
 last = None
 for _try in range(3):
     try:
-        _last_date.clear() if _try else None      # bypass the cached exception on retry
+        # A statement, not `x() if _try else None`: Streamlit's "magic" renders the value of
+        # any bare expression, and that one is None on the first pass -- it printed a stray
+        # "None" pill at the top of EVERY page.
+        if _try:
+            _last_date.clear()                # bypass the cached exception on retry
         last = _last_date()
         break
     except Exception as _e:
@@ -263,14 +267,62 @@ if last is None:
     # `AttributeError: 'NoneType' has no attribute 'date'` four lines from the actual cause.
     # Re-raise so the lock names itself wherever this module is loaded.
     raise RuntimeError(str(_err))
-tf = st.sidebar.radio("Timeframe",
-                      ["BTST (overnight)", "Intraday", "🎬 Replay (practice)",
-                       "🧮 Arbitrage", "📝 Paper trade (R)"],
-                      index=0)
+# ── LANE ↔ URL. Every lane has its own address (?lane=index etc.) so two lanes can sit in two
+# browser tabs: each tab is its own Streamlit session, the radio in one never moves the other.
+# A radio button is not a link, so Ctrl+click on it can never open a tab -- the "open in a new
+# tab" links under it are real <a href>s. The URL follows the radio too, so a browser refresh,
+# a bookmark or "Duplicate tab" lands on the lane you were on instead of jumping back to BTST.
+# Data cost of a second tab: the Fyers reads sit behind st.cache_data / live's own memos, which
+# every session on this server shares, and Index Management makes no Fyers calls at all.
+LANES = {"btst": "BTST (overnight)", "intraday": "Intraday", "replay": "🎬 Replay (practice)",
+         "arbitrage": "🧮 Arbitrage", "paper": "📝 Paper trade (R)",
+         "index": "🏛️ Index Management"}
+_LANE_OF = {v: k for k, v in LANES.items()}
+
+
+def _lane_from_url() -> str:
+    """The lane named in ?lane=..., or BTST. Unknown / repeated / odd-case values fall back
+    instead of raising -- a hand-typed or stale bookmark must still open the board."""
+    raw = st.query_params.get_all("lane")
+    slug = (raw[-1] if raw else "").strip().lower()
+    return LANES.get(slug, LANES["btst"])
+
+
+def _lane_to_url() -> None:
+    # only the lane key is touched: any other query parameter on the URL is left alone
+    st.query_params["lane"] = _LANE_OF.get(st.session_state["tf_lane"], "btst")
+
+
+if "tf_lane" not in st.session_state:            # once per tab: the URL decides the start lane
+    st.session_state["tf_lane"] = _lane_from_url()
+tf = st.sidebar.radio("Timeframe", list(LANES.values()), key="tf_lane",
+                      on_change=_lane_to_url)
+if st.query_params.get("lane") != _LANE_OF[tf]:  # first load / bad value: show the real lane
+    st.query_params["lane"] = _LANE_OF[tf]
+st.sidebar.markdown(
+    "<div style='font-size:0.8rem;opacity:0.75;margin:-0.4rem 0 0.6rem 0'>Open in a new tab: "
+    + " · ".join(f"<a href='?lane={k}' target='_blank' rel='noopener'>{lbl}</a>"
+                 for k, lbl in (("intraday", "Intraday"), ("index", "Index Mgmt"),
+                                ("btst", "BTST"), ("replay", "Replay"),
+                                ("arbitrage", "Arbitrage"), ("paper", "Paper")))
+    + "</div>", unsafe_allow_html=True)
+# Index Management capture starts with the board, not with the page: in market hours it logs
+# all four indices from NSE (zero Fyers calls) so the session trend exists from the open even
+# if that lane is never clicked. Returns at once when already running; never raises.
+try:
+    index_mgmt.ensure_poller()
+except Exception:                                            # noqa: BLE001
+    pass
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
 if st.sidebar.button("↻ refresh"):
     st.cache_data.clear()
+    # Index Management reads NSE through its own background session; clearing caches never
+    # reached it, so a stuck session stayed stuck through any number of clicks.
+    try:
+        index_mgmt.request_refresh()
+    except Exception:                                        # noqa: BLE001
+        pass
     live.clear_universe_cache()      # also drop the EOD universe cache (picks up a new sync)
     sector_tilt.clear_cache()        # lru_cache is invisible to st.cache_data.clear()
     fno.clear_cache()
@@ -1700,6 +1752,15 @@ if tf == "📝 Paper trade (R)":
         "historical index membership (survivorship) — each makes the real number worse.")
     st.stop()
 
+
+if tf == "🏛️ Index Management":
+    # Its own LANE and deliberately ABOVE the token gate: it reads NSE's website feed, not
+    # Fyers, so it spends none of the broker quota Tradebot runs close to (~4,237 of 5,000
+    # data calls a day) and it works with a dead broker session. st.stop() keeps the live
+    # boards from also drawing.
+    index_mgmt.render_page(st)
+    st.stop()
+    raise SystemExit  # st.stop() is a no-op outside a script-run context (tests, tooling)
 
 if tf == "🧮 Arbitrage":
     # Its own LANE, not a tab inside another board, because it answers a different question

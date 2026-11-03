@@ -20,3 +20,6 @@ streamlit.err
 # Paper-trade horizon lane: broker 15m top-up cache (rebuildable)
 data/intraday15/
 data/intraday5/
+
+# Index Management lane: intraday price/OI log + last NSE weights (rebuildable)
+data/index_mgmt/
