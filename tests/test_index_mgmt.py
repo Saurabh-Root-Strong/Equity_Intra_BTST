@@ -1673,7 +1673,7 @@ def test_a_sweep_logs_each_stocks_option_read_and_the_contracts_every_ten_minute
     assert im.poll_deriv("NIFTY", object()) == 1
     e = im._load_jsonl(im._path("oi", "NIFTY", when.date()))[-1]
     assert e["q"]["A"]["iv"]["CE"][0][0] == 100                # long build, 100 contracts
-    assert e["o"]["A"] == [["C", 1000.0, "2026-11-23", up, prev, 100.0]]
+    assert e["o"]["A"] == [["C", 1000.0, "2026-11-23", up, prev, 100.0, None]]
     s["deriv_busy"] = False
     s["deriv_at"] = 0.0
     monkeypatch.setattr(im, "_D", {})
@@ -1734,3 +1734,132 @@ def test_the_recorder_steps_aside_when_its_code_changes():
     src = pathlib.Path(im.__file__).read_text(encoding="utf-8")
     body = src[src.index("def capture("):]
     assert "st_mtime != _code_mtime" in body and "break" in body
+
+
+# ── NSE's stock rows stuck while the index moves (4 Nov 2026) ───────────────────────────
+_T = dt.datetime(2026, 11, 4, 9, 34, 39)
+
+
+def _stuck_cash(status="Open"):
+    return dict(code="NIFTY", ts=_T, status=status, fetched=_T,
+                index=dict(last=23937.2, prev=23810.8, open=None, high=None, low=None),
+                stocks={"HDFCBANK": dict(ltp=725.75, prev=725.5, open=None, pct=0.0345,
+                                         value=9e9, upd="2026-11-04 09:15:46"),
+                        "SBIN": dict(ltp=1010.0, prev=1000.0, open=None, pct=1.0,
+                                     value=5e9, upd="2026-11-04 09:34:30")})
+
+
+def _quote(S, ts):
+    return dict(by_exp={"S": S}, ts=ts)
+
+
+def test_a_stuck_stock_row_takes_its_derivatives_quote_price():
+    deriv = {"HDFCBANK": _quote(738.5, dt.datetime(2026, 11, 4, 9, 34, 56)),
+             "SBIN": _quote(1012.0, dt.datetime(2026, 11, 4, 9, 34, 50))}
+    out = im._fresh_prices(_stuck_cash(), deriv)
+    h = out["stocks"]["HDFCBANK"]
+    assert h["ltp"] == 738.5 and h["pct"] == pytest.approx((738.5 / 725.5 - 1) * 100)
+    assert h["value"] is None and h["src"] == "deriv"         # frozen value is not used
+    assert out["stocks"]["SBIN"]["ltp"] == 1010.0               # current row: left alone
+    assert out["stuck"] == [["HDFCBANK"], "09:15:46"]
+    json.dumps(out["stuck"])                                    # goes to latest_*.json
+    assert _stuck_cash()["stocks"]["HDFCBANK"]["ltp"] == 725.75  # input never mutated
+
+
+def test_no_swap_after_the_close_or_from_an_older_quote_or_without_one():
+    deriv = {"HDFCBANK": _quote(738.5, dt.datetime(2026, 11, 4, 9, 34, 56))}
+    assert "stuck" not in im._fresh_prices(_stuck_cash("Closed"), deriv)
+    old = {"HDFCBANK": _quote(738.5, dt.datetime(2026, 11, 4, 9, 15, 0))}
+    assert im._fresh_prices(_stuck_cash(), old)["stocks"]["HDFCBANK"]["ltp"] == 725.75
+    assert im._fresh_prices(_stuck_cash(), {})["stocks"]["HDFCBANK"]["ltp"] == 725.75
+
+
+def test_half_the_index_not_updating_is_called_a_feed_fault_not_halts():
+    moves = {s: 0.1 for s in "ABCD"}
+    cash = _cash(moves, ts=dt.datetime(2026, 10, 13, 12, 0))
+    for s in "ABC":
+        cash["stocks"][s]["upd"] = "2026-10-13 11:40:00"
+    notes = im.decompose(cash, {s: 25.0 for s in moves}, {}, "NIFTY",
+                         now=dt.datetime(2026, 10, 13, 12, 0))["notes"]
+    assert any("feed fault, not a trading halt" in n for n in notes)
+    assert not any(n.startswith("No trade for 10+ minutes") for n in notes)
+
+
+def test_an_entirely_empty_numeric_column_shows_a_dash_not_the_word_none():
+    df = im._blank(pd.DataFrame({"Bucket": ["Top 10", "Next 10"], "Activity %": [None, None],
+                                 "Weight %": [53.1, None]}), ["Activity %", "Weight %"])
+    out, spec = im._dash_empty(df, {"Activity %": ("%+.0f", "tip"), "Weight %": ("%.1f", "tip")})
+    assert out["Activity %"].tolist() == ["—", "—"] and spec["Activity %"][0] is None
+    assert spec["Weight %"][0] == "%.1f"                    # partly filled: stays a number
+
+
+# ── trade gate + one chart per side (5 Nov 2026) ─────────────────────────────────────────
+def _gate_rows(last, vol, doi=100):
+    prev = round(_premium(1000, 1000, _PREV, 0.25), 2)
+    return [("CE", 1000.0, _EXP, last, prev, doi, vol)]
+
+
+def _gate_side(out):
+    return next((q for q in im.OPT_QUADS if out["CE"][q][0]), "unread")
+
+
+def test_an_untraded_contract_keeps_its_side_however_the_stock_moves():
+    """Its 'last price' is minutes old: against a moving future it seemed to flip between
+    buyer and writer every sweep (14.6% of readings switched on 4 Nov 2026)."""
+    mem = {}
+    bid = round(_premium(1000, 1000, _NOW, 0.29), 2)
+    first = im.option_flow(_gate_rows(bid, 500), {_EXP: (1000.0, 1000.0)}, {_EXP: 250},
+                           _NOW, _PREV, "iv", mem)
+    assert _gate_side(first) == "long build"
+    # the stock rises 1.5%, the option has NOT traded since (same volume, same stale
+    # price): without the gate the stale premium now reads as offered
+    moved = {_EXP: (1015.0, 1000.0)}
+    assert _gate_side(im.option_flow(_gate_rows(bid, 500), moved, {_EXP: 250}, _NOW, _PREV,
+                                     "iv", None)) == "writing"
+    assert _gate_side(im.option_flow(_gate_rows(bid, 500), moved, {_EXP: 250}, _NOW, _PREV,
+                                     "iv", mem)) == "long build"
+    # once it trades again (volume up) at an offered price, it is re-judged
+    offered = round(_premium(1015, 1000, _NOW, 0.21), 2)
+    assert _gate_side(im.option_flow(_gate_rows(offered, 650), moved, {_EXP: 250}, _NOW,
+                                     _PREV, "iv", mem)) == "writing"
+
+
+def test_a_premium_back_inside_the_band_keeps_its_side_instead_of_turning_unclear():
+    mem = {}
+    bid = round(_premium(1000, 1000, _NOW, 0.29), 2)
+    im.option_flow(_gate_rows(bid, 500), {_EXP: (1000.0, 1000.0)}, {_EXP: 250}, _NOW, _PREV,
+                   "iv", mem)
+    flat = round(_premium(1000, 1000, _NOW, 0.25), 2)      # traded again, at 'no change'
+    assert _gate_side(im.option_flow(_gate_rows(flat, 600), {_EXP: (1000.0, 1000.0)},
+                                     {_EXP: 250}, _NOW, _PREV, "iv", mem)) == "long build"
+
+
+def test_the_premium_read_and_past_days_never_use_the_gate():
+    mem = {("CE", 1000.0, _EXP): (1, 999)}
+    prev = round(_premium(1000, 1000, _PREV, 0.25), 2)
+    dn = round(_premium(1000, 1000, _NOW, 0.21), 2)
+    out = im.option_flow([("CE", 1000.0, _EXP, dn, prev, 100, 5)], {_EXP: (1000.0, 1000.0)},
+                         {_EXP: 250}, _NOW, _PREV, "premium", mem)
+    assert out["CE"]["writing"][0] == 100                     # premium read: no memory
+    src = pathlib.Path(im.__file__).read_text(encoding="utf-8")
+    body = src[src.index("def session_snapshot"):src.index("def official_close_read")]
+    assert "stock_option_flow" not in body                    # replays read the logged q
+
+
+def test_calls_and_puts_each_get_their_own_line(monkeypatch):
+    monkeypatch.setattr(im, "SERIES_QUORUM", 0.5)
+    tape = [dict(t="2026-11-05T10:00:00", q={"A": _q(CE_writing=10.0, PE_long_build=4.0)}),
+            dict(t="2026-11-05T10:02:00", q={"A": _q(CE_long_build=6.0, PE_writing=3.0)})]
+    op = im.option_positioning(tape, {"Top": ["A"]})
+    assert op["net_leg"]["CE"]["Top"].tolist() == [-10.0, 6.0]
+    assert op["net_leg"]["PE"]["Top"].tolist() == [-4.0, 3.0]
+    assert op["net"]["Top"].tolist() == [-14.0, 9.0]          # = the two added
+
+
+def test_the_options_section_has_no_futures_price_panel():
+    src = pathlib.Path(im.__file__).read_text(encoding="utf-8")
+    body = src[src.index("def _option_positioning_view"):src.index("def _tip_optq")
+               if "def _tip_optq" in src[src.index("def _option_positioning_view"):] else None]
+    view = body[:body.index("st.caption(\n        \"Every option contract")]
+    assert "futures move since yesterday" not in view
+    assert view.count("st.altair_chart(") == 1                # one call inside the per-side loop

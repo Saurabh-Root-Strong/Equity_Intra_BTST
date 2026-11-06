@@ -2075,10 +2075,17 @@ if tf == "Intraday":
                        + (" — prices tick live, but STRUCTURE and LEVELS are this old. "
                           "↻ re-scan universe." if _warn else
                           " · filters re-apply instantly; ↻ re-scan universe to re-pull bars."))
+        # idx_ret is None when the Nifty quote failed in THAT scan (broker timeout/rate-limit,
+        # 4 Nov 2026 10:02). `.get(k, 0)` does not cover a key that exists with None, and the
+        # cached scan made the whole Intraday lane crash on every refresh until a re-scan.
+        _ir = sc.get("idx_ret")
         st.caption(f"scanned **{sc['n_scanned']}** liquid names · Nifty "
-                   f"{sc.get('idx_ret', 0):+.2f}% · regime "
+                   + (f"{_ir:+.2f}%" if _ir is not None else "—") + " · regime "
                    f"{'RISK-ON' if sc['risk_on'] else 'RISK-OFF'}"
                    + ("  ·  🔄 auto-refresh ON (next 15-min close)" if auto_struct else ""))
+        if _ir is None:
+            st.warning("The Nifty quote failed in this scan, so relative strength vs Nifty "
+                       "could not be worked out for it. Press **↻ re-scan universe**.")
         # A name with no intraday candles cannot match ANY intraday structure filter — it just
         # disappears. Say how many, so the board is never silently answering from a subset.
         # A failed /quotes chunk removes FIFTY names before a single row is built, so
@@ -3634,7 +3641,8 @@ if tf == "Intraday":
         scounts = bd["sell"].value_counts().to_dict()
         h1, h2, h3, h4 = st.columns(4)
         h1.metric("Regime", "RISK-ON" if lb["risk_on"] else "RISK-OFF")
-        h2.metric("Nifty today", f"{lb.get('idx_ret', 0):+.2f}%")
+        _lir = lb.get("idx_ret")          # None when the Nifty quote failed (see the scan caption)
+        h2.metric("Nifty today", f"{_lir:+.2f}%" if _lir is not None else "—")
         h3.metric("BUY (carry/forming)",
                   f"{counts.get('BTST-CARRY', 0) + counts.get('FORMING', 0)}")
         h4.metric("SELL (short/weak)",

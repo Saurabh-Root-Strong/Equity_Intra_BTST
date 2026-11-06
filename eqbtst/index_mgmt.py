@@ -341,7 +341,7 @@ def fetch_deriv(symbol: str, client) -> dict:
                 cur[2] += vol
                 if chg:
                     opts.append(("CE" if key == "ce" else "PE", _num(r.get("strikePrice")), k,
-                                 _num(r.get("lastPrice")), _num(r.get("prevClose")), chg))
+                                 _num(r.get("lastPrice")), _num(r.get("prevClose")), chg, vol))
         out[key + "_oi"] += oi
         out[key + "_chg"] += chg
     if not n_fut:
@@ -626,7 +626,7 @@ def _years(t0: dt.datetime, expiry: dt.date) -> float:
 
 
 def option_flow(opts: list, fut: dict, lots: dict, now: dt.datetime,
-                prev_close_at: dt.datetime, mode: str = "iv") -> dict:
+                prev_close_at: dt.datetime, mode: str = "iv", memory: dict | None = None) -> dict:
     """{"CE"|"PE": {quadrant: [contracts, Rs Cr], "unread": [contracts, Rs Cr]}} for ONE
     stock, every option changed since yesterday's close.
 
@@ -683,15 +683,35 @@ def option_flow(opts: list, fut: dict, lots: dict, now: dt.datetime,
                       np.where(np.isfinite(iv0), iv0, 0.3), typ)
         div = np.where(np.isfinite(iv0) & np.isfinite(iv1), last - same, np.nan)
         band = OPT_TICK * OPT_MIN_TICKS - 1e-9
+    # TRADE GATE (live, volatility read only). A contract's 'last price' is its last TRADE,
+    # often minutes older than the future it is judged against, so an untraded contract
+    # seemed to move against every tick of the stock: 14.6% of contract readings switched
+    # buyer <-> writer between 10-minute snapshots on 4 Nov 2026 and the line jumped by
+    # +-Rs 1,000 Cr. With `memory` a contract is re-judged only when its volume has risen
+    # since it was last judged (proof its price is new); a premium back inside the band keeps
+    # the side it had instead of dropping to 'unclear'.
+    vols = [o[6] if len(o) > 6 else None for o in rows]
+    gate = memory is not None and mode != "premium"
     for i in range(len(rows)):
         leg = "CE" if typ[i] else "PE"
         cr = abs(doi[i]) * lot[i] * F1[i] * abs(delta[i]) / 1e7 if lot[i] and F1[i] else 0.0
-        if not np.isfinite(div[i]) or abs(div[i]) <= band:
+        side = None
+        if np.isfinite(div[i]) and abs(div[i]) > band:
+            side = 1 if div[i] > 0 else -1
+        if gate:
+            key = (leg, float(K[i]), exp[i])
+            had = memory.get(key)
+            traded = had is None or vols[i] is None or had[1] is None or vols[i] > had[1]
+            if had is not None and (not traded or side is None):
+                side = had[0]                     # stale price, or back inside the band
+            if side is not None:
+                memory[key] = (side, vols[i] if traded or had is None else had[1])
+        if side is None:
             q = "unread"
         elif doi[i] > 0:
-            q = "long build" if div[i] > 0 else "writing"
+            q = "long build" if side > 0 else "writing"
         else:
-            q = "short covering" if div[i] > 0 else "long unwind"
+            q = "short covering" if side > 0 else "long unwind"
         out[leg][q][0] += doi[i]
         out[leg][q][1] += cr
     return out
@@ -710,19 +730,28 @@ def _lots_by_exp(F: dict, base: dict | None, sym: str | None) -> dict:
     return out
 
 
+_OPT_MEM: dict = {}      # (day, stock) -> option_flow's per-contract trade-gate memory
+
+
 def stock_option_flow(d: dict, base: dict | None, sym: str, now: dt.datetime,
-                      prev_close_at: dt.datetime) -> dict | None:
+                      prev_close_at: dt.datetime, remember: bool = True) -> dict | None:
     """{"iv"|"premium": {"CE"|"PE": [[contracts, Rs Cr] per OPT_QUADS + unread]}} for one
-    stock's latest read, or None without per-contract rows or futures prices."""
+    stock's latest read, or None without per-contract rows or futures prices. `remember`
+    keeps each contract's last judged side for the day (the trade gate in option_flow)."""
     F = (d.get("by_exp") or {}).get("F") or {}
     opts = d.get("opts") or []
     if not F or not opts:
         return None
     fut = {e: (v[3], v[4] if len(v) > 4 else None) for e, v in F.items()}
     lots = _lots_by_exp(F, base, sym)
+    mem = None
+    if remember:
+        for k in [k for k in _OPT_MEM if k[0] != now.date()]:
+            _OPT_MEM.pop(k, None)                     # a new session starts with no memory
+        mem = _OPT_MEM.setdefault((now.date(), sym), {})
     out = {}
     for mode in ("iv", "premium"):
-        r = option_flow(opts, fut, lots, now, prev_close_at, mode)
+        r = option_flow(opts, fut, lots, now, prev_close_at, mode, mem if mode == "iv" else None)
         out[mode] = {leg: [[round(r[leg][q][0]), round(r[leg][q][1], 2)]
                            for q in (*OPT_QUADS, "unread")] for leg in ("CE", "PE")}
     return out
@@ -866,7 +895,15 @@ def decompose(cash: dict, weights: dict | None, deriv: dict | None, code: str, *
                          "(POLICYBZR −36% on 24 Sep 2026), but check for a corporate action.")
     if cash.get("status") == "Open":
         halted = df[(df["lag_s"].notna()) & (df["lag_s"] > 600)]
-        if len(halted):
+        if len(halted) > len(df) / 2:
+            # half the index cannot all stop trading at once: NSE's rows are stuck (4 Nov 2026,
+            # all 50 Nifty rows frozen at 09:15:46 while the index print moved +126 points)
+            notes.append(f"NSE's stock price rows for {len(halted)} of {len(df)} stocks are "
+                         f"{halted['lag_s'].median() / 60:.0f}+ minutes behind its index print — "
+                         "a feed fault, not a trading halt. Index points, returns and breadth "
+                         "below are stale until NSE's rows move again (or the next derivatives "
+                         "sweep supplies fresh prices).")
+        elif len(halted):
             notes.append("No trade for 10+ minutes: " + ", ".join(halted["symbol"]) + ".")
 
     explained = float(df["pts"].sum()) if have_w else None
@@ -1867,26 +1904,30 @@ def option_positioning(oi_tape: list, buckets: dict, mode: str = "iv") -> dict:
     From the per-stock option reads logged with each sweep (option_flow). A stock NSE skipped
     keeps its last read; a bucket is drawn once SERIES_QUORUM of its stocks have one."""
     cur: dict = {}
-    rows = []
+    rows, rows_leg = [], {"CE": [], "PE": []}
     for e in oi_tape:
         for s, q in (e.get("q") or {}).items():
             if q and q.get(mode):
                 cur[s] = q[mode]
         if not cur:
             continue
-        row = {"t": pd.Timestamp(e["t"])}
+        t = pd.Timestamp(e["t"])
+        row, legrow = {"t": t}, {"CE": {"t": t}, "PE": {"t": t}}
         for lbl, mem in buckets.items():
             have = [cur[s] for s in mem if s in cur]
             if len(have) < max(1, int(np.ceil(len(mem) * SERIES_QUORUM))):
-                row[lbl] = None
+                row[lbl] = legrow["CE"][lbl] = legrow["PE"][lbl] = None
                 continue
-            net = 0.0
+            per = {"CE": 0.0, "PE": 0.0}
             for q in have:
                 for leg in ("CE", "PE"):
                     for i, name in enumerate(OPT_QUADS):
-                        net += q[leg][i][1] if name in OPT_BULL[leg] else -q[leg][i][1]
-            row[lbl] = net
+                        per[leg] += q[leg][i][1] if name in OPT_BULL[leg] else -q[leg][i][1]
+            row[lbl] = per["CE"] + per["PE"]
+            legrow["CE"][lbl], legrow["PE"][lbl] = per["CE"], per["PE"]
         rows.append(row)
+        for leg in ("CE", "PE"):
+            rows_leg[leg].append(legrow[leg])
     last = {}
     for lbl, mem in buckets.items():
         agg = {leg: {q: [0.0, 0.0] for q in (*OPT_QUADS, "unread")} for leg in ("CE", "PE")}
@@ -1897,8 +1938,11 @@ def option_positioning(oi_tape: list, buckets: dict, mode: str = "iv") -> dict:
                         agg[leg][name][0] += cur[s][leg][i][0]
                         agg[leg][name][1] += cur[s][leg][i][1]
         last[lbl] = agg
-    net = pd.DataFrame(rows).set_index("t").astype(float) if rows else pd.DataFrame()
-    return dict(last=last, net=net, n=len(cur))
+    def frame(rs):
+        return pd.DataFrame(rs).set_index("t").astype(float) if rs else pd.DataFrame()
+    # net = calls + puts together; net_leg = each side on its own (the page draws these two)
+    return dict(last=last, net=frame(rows), n=len(cur),
+                net_leg={leg: frame(rows_leg[leg]) for leg in ("CE", "PE")})
 
 
 def observed_refresh(tape: list) -> float | None:
@@ -2468,6 +2512,43 @@ def _sync_from_disk(code: str) -> None:
             s["tape_day"] = day
 
 
+STUCK_ROW_S = 120.0     # a stock row this far behind the index stamp is not current
+
+
+def _fresh_prices(cash: dict, deriv: dict) -> dict:
+    """The cash read with each STUCK stock price replaced by the one in that stock's own
+    derivatives quote, when that quote is newer.
+
+    4 Nov 2026, 09:15-09:35+: NSE's index-constituents feed served every stock row frozen at
+    its 09:15:46 opening print (two NSE servers alternated: one stuck at 09:15, one at 09:19)
+    while the index row moved on. The 50 frozen prices rebuilt -47 points against the
+    index's +126; the derivatives quotes' underlying prices, stamped a minute old, rebuilt
+    +108. A replaced stock's traded value is dropped (it is as frozen as its price), so
+    Activity and value share are not computed from a 09:15 number. Only while the market is
+    open: after the close every row is final anyway. Returns a NEW dict; marks it with
+    "stuck" = (stocks replaced, the stuck rows' newest update time)."""
+    ts = cash.get("ts")
+    if cash.get("status") != "Open" or ts is None or not deriv:
+        return cash
+    out, swapped, stuck_at = dict(cash, stocks=dict(cash["stocks"])), [], None
+    for sym, q in cash["stocks"].items():
+        u = _ts(q.get("upd"))
+        if u is not None and (ts - u).total_seconds() <= STUCK_ROW_S:
+            continue
+        d = deriv.get(sym) or {}
+        S, dts = (d.get("by_exp") or {}).get("S"), d.get("ts")
+        if not S or dts is None or (u is not None and dts <= u) or not q.get("prev"):
+            continue
+        stuck_at = max(stuck_at, u) if (stuck_at and u) else (u or stuck_at)
+        out["stocks"][sym] = dict(q, ltp=S, pct=(S / q["prev"] - 1) * 100, value=None,
+                                  upd=f"{dts:%Y-%m-%d %H:%M:%S}", src="deriv")
+        swapped.append(sym)
+    if swapped:
+        # plain types only: this dict is written to latest_{code}.json for reader processes
+        out["stuck"] = [swapped, f"{stuck_at:%H:%M:%S}" if stuck_at else None]
+    return out
+
+
 def poll_cash(code: str, client=None) -> bool:
     """One price poll (+ weights when due). Updates state and the tape. Never raises."""
     client = client or _client()
@@ -2510,6 +2591,9 @@ def poll_cash(code: str, client=None) -> bool:
             s["tape_day"] = day
             if s["deriv_ts"] and s["deriv_ts"].date() != day:
                 s["deriv_ts"] = None
+        # stuck NSE stock rows -> each stock's own derivatives-quote price, BEFORE logging,
+        # so the tape and every chart built on it carry current prices too
+        cash = _fresh_prices(cash, _fresh_deriv(list(cash["stocks"]), day))
         s.update(cash=cash, cash_at=time.time(), err=None, weights=w, weights_day=wday)
         if w is not None:
             s["weights_at"] = time.time()
@@ -2662,7 +2746,8 @@ def poll_deriv(code: str, client=None) -> int:
                     # the contracts themselves every OPT_DETAIL_EVERY: enough to re-derive
                     # or audit the read later, without 90 rows x 50 stocks every 2 minutes
                     if time.time() - s.get("opt_detail_at", 0.0) >= OPT_DETAIL_EVERY:
-                        e["o"] = {k: [[o[0][0], o[1], o[2], o[3], o[4], o[5]] for o in v["opts"]]
+                        e["o"] = {k: [[o[0][0], o[1], o[2], o[3], o[4], o[5],
+                                       o[6] if len(o) > 6 else None] for o in v["opts"]]
                                   for k, v in got.items() if v.get("opts")}
                         s["opt_detail_at"] = time.time()
                     s["oi_tape"].append(e)
@@ -2862,6 +2947,8 @@ def snapshot(code: str) -> dict | None:
         return dict(empty=True, **meta)
     syms = tuple(sorted(cash["stocks"]))
     day = (cash["ts"] or cash["fetched"]).date()
+    # again at draw time: an OI sweep may have landed since the last price poll
+    cash = _fresh_prices(cash, deriv)
     base = _archive_oi_base(syms, day)
     corp = dict(_archive_corp(syms, day))
     ban = fetch_ban_list(day)
@@ -2871,6 +2958,16 @@ def snapshot(code: str) -> dict | None:
     snap = decompose(cash, w, deriv, code, dcm=_dcm(), norms=_archive_norms(syms),
                      corp=corp, oi_base=base)
     snap["withheld"] = set(corp)
+    snap["stuck"] = cash.get("stuck")
+    if cash.get("stuck"):
+        names, at = cash["stuck"]
+        snap["notes"].insert(0, (
+            f"NSE's live stock prices are stuck{f' at {at}' if at else ''} for {len(names)} of "
+            f"{len(cash['stocks'])} stocks while its index figure keeps moving — an NSE feed "
+            "fault, not a trading halt. For those stocks this page uses the price in each "
+            "stock's own derivatives quote instead (refreshed every couple of minutes), so "
+            "index points, returns and breadth stay current; their traded value is left out, "
+            "so Activity and value share cover only the stocks NSE is updating."))
     stamps = [d["ts"] for d in deriv.values() if d.get("ts")]
     lags = snap["stocks"]["lag_s"].dropna() if "lag_s" in snap["stocks"] else []
     snap.update(meta, empty=False, weights=w or {},
@@ -3603,6 +3700,18 @@ def _blank(df: pd.DataFrame, cols) -> pd.DataFrame:
     return df
 
 
+def _dash_empty(df: pd.DataFrame, spec: dict) -> tuple:
+    """(df, spec) with every numeric column that is ENTIRELY empty shown as '—' text.
+    Streamlit renders a missing number as the word 'None', which reads as a bug; a dash says
+    'not available'. Partly filled columns stay numeric, so their formatting is kept."""
+    spec = dict(spec)
+    for c, (fmt, tip) in list(spec.items()):
+        if fmt and c in df.columns and df[c].isna().all():
+            df[c] = "—"
+            spec[c] = (None, tip)
+    return df, spec
+
+
 FRESH_OK, FRESH_WARN = 180.0, 360.0      # seconds: green below, orange below, red above
 
 
@@ -3994,32 +4103,37 @@ def _option_positioning_view(st, snap: dict, labels: list, buckets: dict,
                     + " + ".join(q for q in OPT_QUADS if q not in bull))
         st.dataframe(_blank(pd.DataFrame(rows), list(rows[0])[1:]), hide_index=True,
                      width="stretch", column_config=_cfg(st.column_config, TIP_OPTQ[leg]))
-    net = op["net"].reindex(columns=labels)
-    if len(net.dropna(how="all")) >= 2 and not price.empty:
-        long_n = _with_segments(net.reset_index().melt("t", var_name="bucket", value_name="cr")
-                                .dropna(), "t", "bucket")
-        long_px = (price[labels].reset_index().rename(columns={"end": "t"})
-                   .melt("t", var_name="bucket", value_name="pct").dropna())
-        colors = alt.Scale(domain=labels, range=["#e8826b", "#6aa9e9", "#9aa4b2"][:len(labels)])
-        x = alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M"))
-        top = (alt.Chart(long_px).mark_line(strokeWidth=2)
-               .encode(x=x, y=alt.Y("pct:Q", title="futures move since yesterday, %",
-                                    scale=alt.Scale(zero=False)),
-                       color=alt.Color("bucket:N", scale=colors, title=None,
-                                       legend=alt.Legend(orient="bottom")),
-                       tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"), "bucket:N",
-                                alt.Tooltip("pct:Q", title="futures %", format="+.2f")])
-               .properties(height=150))
-        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888").encode(y="y:Q")
-        bot = (alt.Chart(long_n).mark_line(strokeWidth=2)
-               .encode(x=x, y=alt.Y("cr:Q", title="options bullish − bearish, ₹ Cr"),
-                       color=alt.Color("bucket:N", scale=colors, title=None),
-                       detail="line:N",
-                       tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"), "bucket:N",
-                                alt.Tooltip("cr:Q", title="bullish − bearish ₹ Cr",
-                                            format="+,.0f")])
-               .properties(height=200))
-        st.altair_chart(alt.vconcat(top, bot + zero).resolve_scale(x="shared"), width="stretch")
+        # ITS OWN CHART, straight under its own table: calls and puts used to share one line
+        # (with a futures-price panel on top), so a call-writing hour and a put-buying hour
+        # cancelled into a flat line and neither could be read
+        net = op["net_leg"][leg].reindex(columns=labels) if not op["net_leg"][leg].empty \
+            else pd.DataFrame()
+        if len(net.dropna(how="all")) >= 2:
+            long_n = _with_segments(net.reset_index().melt("t", var_name="bucket",
+                                                          value_name="cr").dropna(),
+                                    "t", "bucket")
+            colors = alt.Scale(domain=labels,
+                               range=["#e8826b", "#6aa9e9", "#9aa4b2"][:len(labels)])
+            zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888").encode(y="y:Q")
+            line = (alt.Chart(long_n).mark_line(strokeWidth=2)
+                    .encode(x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M")),
+                            y=alt.Y("cr:Q", title=f"{name.lower()}: bullish − bearish, ₹ Cr",
+                                    axis=alt.Axis(tickCount=8, format=",.0f")),
+                            color=alt.Color("bucket:N", scale=colors, title=None,
+                                            legend=alt.Legend(orient="bottom")),
+                            detail="line:N",
+                            tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"),
+                                     "bucket:N",
+                                     alt.Tooltip("cr:Q", title=f"{name} bullish − bearish ₹ Cr",
+                                                 format="+,.0f")])
+                    .properties(height=400))   # 220 flattened a day's swing into a strip
+            st.altair_chart(line + zero, width="stretch")
+            st.caption(f"{name} through the session, each bucket's bullish − bearish (the last "
+                       "column of the table above, reading by reading). Above zero = "
+                       + ("call buying + calls bought back outweigh call writing + call "
+                          "buyers leaving." if leg == "CE" else
+                          "put writing + put buyers leaving outweigh put buying + puts bought "
+                          "back."))
     st.caption(
         "Every option contract whose open interest changed since yesterday's close is put in "
         "one box. Open interest says whether positions were OPENED (up) or CLOSED (down). "
@@ -4611,8 +4725,17 @@ def _draw(st, code: str, snap: dict | None = None) -> None:
     cc = st.column_config
     _num_cols = ["Weight %", "Index pts", "Share of move %", "Return %", "Activity %",
                  "Value share %", "Usual share %", "Futures OI %", "Call OI %", "Put OI %"]
-    st.dataframe(_blank(pd.DataFrame(tbl), _num_cols), hide_index=True, width="stretch",
-                 column_config=_cfg(cc, TIP_MAIN))
+    _tdf, _tspec = _dash_empty(_blank(pd.DataFrame(tbl), _num_cols), TIP_MAIN)
+    st.dataframe(_tdf, hide_index=True, width="stretch", column_config=_cfg(cc, _tspec))
+    if snap.get("stuck"):
+        st.caption(f"**Activity % and Value share % are '—' because NSE's traded value is "
+                   f"frozen along with its prices** ({len(snap['stuck'][0])} stocks stuck"
+                   + (f" since {snap['stuck'][1]}" if snap["stuck"][1] else "")
+                   + "). Using the frozen figure would show trading 60–80% below normal, "
+                   "which is false. No other NSE source gives live traded value per stock "
+                   "(the per-stock quote page refuses scripts; the other index lists are "
+                   "frozen too), so both columns come back by themselves when NSE's feed "
+                   "moves again.")
     st.caption("ℹ️ Hover over any column heading for a plain-English explanation with an "
                "example.")
     if snap["have_weights"] and out_of_step(ix["pts"], snap["explained_pts"]):
