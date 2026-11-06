@@ -1733,7 +1733,9 @@ def test_yesterday_is_the_previous_session_not_the_archives_last_date(monkeypatc
 def test_the_recorder_steps_aside_when_its_code_changes():
     src = pathlib.Path(im.__file__).read_text(encoding="utf-8")
     body = src[src.index("def capture("):]
-    assert "st_mtime != _code_mtime" in body and "break" in body
+    assert "_mtimes() != _code_mtime" in body and "break" in body
+    # it watches index_fno.py too: that poller rides on this job
+    assert 'with_name("index_fno.py")' in body
 
 
 # ── NSE's stock rows stuck while the index moves (4 Nov 2026) ───────────────────────────

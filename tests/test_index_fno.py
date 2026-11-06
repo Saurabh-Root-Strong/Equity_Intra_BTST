@@ -1,0 +1,609 @@
+"""Index F&O Management (eqbtst/index_fno.py) — offline tests, no NSE, no DCM."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from eqbtst import index_fno as f
+
+EXP = dt.date(2026, 11, 9)
+DAY = dt.date(2026, 11, 6)
+
+
+def _side(K, spot, call, oi=1000.0, doi=100.0, vol=5000.0, iv=15.0, chg=1.0):
+    intr = max(spot - K, 0) if call else max(K - spot, 0)
+    ltp = intr + 50.0
+    return {"strikePrice": K, "lastPrice": ltp, "change": chg, "openInterest": oi,
+            "changeinOpenInterest": doi, "totalTradedVolume": vol,
+            "impliedVolatility": iv, "buyPrice1": ltp - 0.5, "sellPrice1": ltp + 0.5,
+            "underlyingValue": spot}
+
+
+def payload(spot=25030.0, lo=24000, hi=26000, step=50, ts="06-Nov-2026 10:00:00",
+            oi=None, doi=None, iv=None, vol=None, exp="09-Nov-2026", drop_pe=()):
+    oi, doi, iv, vol = oi or {}, doi or {}, iv or {}, vol or {}
+    data = []
+    for K in range(lo, hi + 1, step):
+        r = {"strikePrice": K, "expiryDates": exp}
+        for s in ("CE", "PE"):
+            if s == "PE" and K in drop_pe:
+                continue
+            r[s] = _side(K, spot, s == "CE", oi.get((s, K), 1000.0), doi.get((s, K), 100.0),
+                         vol.get((s, K), 5000.0), iv.get((s, K), 15.0))
+        data.append(r)
+    return {"records": {"data": data, "timestamp": ts, "underlyingValue": spot,
+                        "expiryDates": [exp]},
+            "filtered": {"data": data, "CE": {"totOI": 5e5, "totVol": 1e7},
+                         "PE": {"totOI": 8e5, "totVol": 9e6}}}
+
+
+# ── parsing ─────────────────────────────────────────────────────────────────────────────
+def test_parse_chain_basic():
+    ch = f.parse_chain(payload(), EXP)
+    assert ch["spot"] == 25030.0 and ch["ts"] == dt.datetime(2026, 11, 6, 10, 0)
+    assert len(ch["strikes"]) == 41 and ch["tot"] == [5e5, 1e7, 8e5, 9e6]
+    assert ch["ce"][25000.0][2] == 1000.0
+
+
+def test_parse_chain_zero_means_missing():
+    j = payload()
+    s = j["records"]["data"][10]["CE"]
+    s["lastPrice"], s["impliedVolatility"], s["buyPrice1"] = 0, 0, 0
+    ch = f.parse_chain(j, EXP)
+    v = dict(zip(f.FIELDS, ch["ce"][float(s["strikePrice"])]))
+    assert v["ltp"] is None and v["iv"] is None and v["bid"] is None and v["oi"] == 1000.0
+
+
+def test_parse_chain_rejects_other_expiry_rows_and_thin_chain():
+    j = payload(lo=24900, hi=25100)                      # only 5 strikes
+    with pytest.raises(f.im.NseError):
+        f.parse_chain(j, EXP)
+    j = payload()
+    for r in j["records"]["data"][:20]:
+        r["expiryDates"] = "17-Nov-2026"
+    ch = f.parse_chain(j, EXP)
+    assert len(ch["strikes"]) == 21
+    for r in j["records"]["data"][:30]:                  # 11 left: too thin to show 17
+        r["expiryDates"] = "17-Nov-2026"
+    with pytest.raises(f.im.NseError):
+        f.parse_chain(j, EXP)
+
+
+def test_parse_chain_empty_raises():
+    with pytest.raises(f.im.NseError):
+        f.parse_chain({"records": {"data": []}}, EXP)
+
+
+def test_one_sided_strike_not_atm_candidate():
+    ch = f.parse_chain(payload(spot=25010, drop_pe=(25000,)), EXP)
+    assert 25000.0 not in ch["strikes"]
+    assert f.pick_atm(ch["strikes"], ch["spot"]) == 25050.0 or \
+        f.pick_atm(ch["strikes"], ch["spot"]) == 24950.0
+
+
+def test_parse_expiries_and_monthly():
+    ex = f.parse_expiries({"expiryDates": ["17-Nov-2026", "09-Nov-2026", "23-Nov-2026",
+                                           "01-Dec-2026", "29-Dec-2026", "bad"]})
+    assert ex[0] == dt.date(2026, 11, 9) and len(ex) == 5
+    assert not f.is_monthly(dt.date(2026, 11, 9), ex)
+    assert f.is_monthly(dt.date(2026, 11, 23), ex)
+    cap = f.captured_expiries(ex, DAY)
+    assert cap == [dt.date(2026, 11, 9), dt.date(2026, 11, 17), dt.date(2026, 11, 23)]
+    # monthly-only index: nearest IS the monthly -> two expiries
+    mo = [dt.date(2026, 11, 23), dt.date(2026, 12, 29), dt.date(2027, 1, 25)]
+    assert f.captured_expiries(mo, DAY) == mo[:2]
+    # expiry day: today's expiry still captured; a past one never
+    assert f.captured_expiries(ex, dt.date(2026, 11, 9))[0] == dt.date(2026, 11, 9)
+    assert f.captured_expiries(ex, dt.date(2026, 11, 10))[0] == dt.date(2026, 11, 17)
+
+
+# ── strikes ─────────────────────────────────────────────────────────────────────────────
+def test_pick_atm_tie_goes_lower():
+    assert f.pick_atm([24950.0, 25000.0, 25050.0], 25025.0) == 25000.0
+    assert f.pick_atm([24950.0, 25000.0, 25050.0], 25026.0) == 25050.0
+    assert f.pick_atm([], 25000) is None
+
+
+def test_window_uses_listed_strikes_and_edges():
+    ks = [float(k) for k in range(24000, 25001, 50)] + [25100.0, 25200.0, 25300.0]
+    w = f.window(ks, 25000.0, 8)
+    assert w[0] == 24600.0 and w[-1] == 25300.0 and len(w) == 12     # only 3 listed above
+    assert len(f.window(ks, 24500.0, 8)) == 17
+    assert f.window(ks, 24990.0, 2) == [24900.0, 24950.0, 25000.0, 25100.0, 25200.0]
+
+
+def test_max_pain_known_answer():
+    ce = {100.0: 0, 110.0: 1000, 120.0: 0}
+    pe = {100.0: 0, 110.0: 0, 120.0: 0}
+    assert f.max_pain(ce, pe) in (100.0, 110.0)
+    ce = {100.0: 10, 110.0: 10, 120.0: 500}
+    pe = {100.0: 500, 110.0: 10, 120.0: 10}
+    assert f.max_pain(ce, pe) == 110.0
+    assert f.max_pain({}, {}) is None
+
+
+def test_compact_roundtrip():
+    ch = f.parse_chain(payload(), EXP)
+    row = f.compact(ch, keep=5)
+    assert row["a"] == 25050.0 and len(row["k"]) == 11
+    ce, pe = f.row_sides(row)
+    assert set(ce) == set(pe) and ce[25050.0]["oi"] == 1000.0
+    json.dumps(row)                                      # serialisable
+
+
+# ── reads ───────────────────────────────────────────────────────────────────────────────
+def test_premium_read_quadrants():
+    assert f.premium_read("CE", 5, 10) == "long build"
+    assert f.premium_read("CE", -5, 10) == "writing"
+    assert f.premium_read("CE", 5, -10) == "short covering"
+    assert f.premium_read("CE", -5, -10) == "long unwind"
+    assert f.premium_read("CE", 0, 10) is None and f.premium_read("CE", None, 1) is None
+
+
+def test_iv_read_and_lean():
+    assert f.iv_read(500, 1.0, 1000) == "buyers adding"
+    assert f.iv_read(500, -1.0, 1000) == "writers adding"
+    assert f.iv_read(-500, 1.0, 1000) == "writers covering"
+    assert f.iv_read(-500, -1.0, 1000) == "buyers exiting"
+    assert f.iv_read(500, 0.2, 1000) == "unclear"
+    assert f.iv_read(5, 2.0, 1000) == "little change"
+    assert f.iv_read(None, 1.0, 1000) is None and f.iv_read(np.nan, 1.0, 1000) is None
+    assert f.lean("PE", "writers adding") == "🟢" and f.lean("CE", "writers adding") == "🔴"
+    assert f.lean("PE", "writing") == "🟢" and f.lean("CE", "long build") == "🟢"
+    assert f.lean("CE", "unclear") == "⚪"
+
+
+def _session(n=30, start=dt.datetime(2026, 11, 6, 9, 16), gap_after=None, drift=5.0):
+    """n compact rows a minute apart: spot drifts up, 25000 PE OI builds, IV falls."""
+    rows = []
+    for i in range(n):
+        t = start + dt.timedelta(minutes=i + (60 if gap_after is not None and i > gap_after
+                                               else 0))
+        spot = 25000 + drift * i
+        oi = {("PE", 25000): 1000.0 + 100 * i, ("CE", 25200): 2000.0 + 50 * i}
+        doi = {("PE", 25000): 100.0 + 100 * i, ("CE", 25200): 100.0 + 50 * i}
+        iv = {("PE", 25000): 16.0 - 0.1 * i}
+        vol = {("PE", 25000): 1000.0 * (i + 1)}
+        j = payload(spot=spot, ts=t.strftime("%d-%b-%Y %H:%M:%S"), oi=oi, doi=doi, iv=iv,
+                    vol=vol)
+        rows.append(f.compact(f.parse_chain(j, EXP)))
+    return rows
+
+
+def test_ladder_iv_read_from_first_reading():
+    rows = _session()
+    ks = f.window([k[0] for k in rows[-1]["k"]], rows[-1]["a"])
+    tab = f.ladder(rows[-1], rows[0], ks, "iv")
+    r = tab[tab["Strike"] == 25000.0].iloc[0]
+    assert r["PE ΔOI since first"] == 2900.0 and r["PE ΔIV"] == pytest.approx(-2.9)
+    assert r["PE read"] == "🟢 writers adding"
+    assert tab["atm"].sum() == 1
+    tab2 = f.ladder(rows[-1], None, ks, "premium")
+    assert tab2["PE ΔIV"].isna().all()
+
+
+def test_headline_numbers():
+    rows = _session()
+    last = rows[-1]
+    ks = f.window([k[0] for k in last["k"]], last["a"])
+    h = f.headline(last, rows[0], ks)
+    assert h["atm"] == last["a"] and h["straddle"] == pytest.approx(
+        2 * 50 + abs(last["u"] - last["a"]))
+    assert h["pcr_all"] == pytest.approx(1.6) and h["pe_oi"] == 25000.0
+    assert h["mp"] is not None
+
+
+def test_session_series_fixed_strikes_and_units():
+    rows = _session()
+    df = f.frame(rows)
+    ks = f.window([k[0] for k in rows[-1]["k"]], rows[-1]["a"])
+    ss = f.session_series(df, rows, ks, lot=65, base="yday")
+    assert len(ss) == 30
+    # calls: 17 strikes, 16 at doi 100 + 25200 at 100+50i ; ₹ Cr = contracts*65*spot/1e7
+    i = 29
+    calls = (16 * 100 + 100 + 50 * i) * 65 * rows[0]["u"] / 1e7   # first reading's level
+    assert ss["calls"].iloc[-1] == pytest.approx(calls)
+    first = f.session_series(df, rows, ks, lot=None, base="first")
+    assert first["puts"].iloc[0] == 0 and first["puts"].iloc[-1] == pytest.approx(2900.0)
+    assert (ss["calls − puts"] == ss["calls"] - ss["puts"]).all()
+    assert ss["straddle"].notna().all() and ss["atm iv"].notna().all()
+
+
+def test_session_series_quorum_blanks_partial_readings():
+    rows = _session(5)
+    rows[2]["k"] = rows[2]["k"][:15]                     # most of the window missing
+    df = f.frame(rows)
+    ks = f.window([k[0] for k in rows[-1]["k"]], rows[-1]["a"])
+    ss = f.session_series(df, rows, ks, lot=65)
+    assert np.isnan(ss["calls"].iloc[2]) and not np.isnan(ss["calls"].iloc[3])
+
+
+def test_strike_panels_volume_blocks_never_negative():
+    rows = _session(20)
+    # NSE volume going backwards once (a bad print) must not plot negative volume
+    for k in rows[10]["k"]:
+        if k[0] == 25000.0:
+            k[1 + f.NF + 4] = 10.0
+    df = f.frame(rows)
+    p = f.strike_panels(df, [25000.0], "Volume per 5 min")
+    assert (p["v"].dropna() >= 0).all() and len(p)
+    p2 = f.strike_panels(df, [25000.0, 25050.0], "Implied volatility")
+    assert set(p2["side"]) == {"CE", "PE"}
+
+
+def test_oi_blocks_sum_to_days_change():
+    rows = _session(40)
+    df = f.frame(rows)
+    blk = f.oi_blocks(df, [25000.0], 15)
+    pe = blk[(blk["side"] == "PE") & (blk["K"] == 25000.0)]
+    # day's change at last reading = doi of last row = 100 + 100*39
+    assert pe["chg"].sum() == pytest.approx(100 + 100 * 39)
+
+
+def test_frame_skips_malformed():
+    rows = _session(2)
+    rows.append({"t": "bad"})
+    rows.append({"t": "2026-11-06T10:00:00", "k": [[25000.0, 1, 2]]})
+    df = f.frame(rows)
+    assert df["t"].nunique() == 2
+
+
+def test_fut_series_and_word():
+    rows = [{"t": "2026-11-06T09:20:00", "s": 25000.0,
+             "F": {"2026-11-23": [25050.0, 24900.0, 2.0e5, 5000.0, 1e5],
+                   "2026-12-29": [25200.0, 25000.0, 2e4, 100.0, 1e4]}},
+            {"t": "2026-11-23T09:20:00", "s": 25000.0,                 # expiry day -> next
+             "F": {"2026-11-23": [25001.0, 24900.0, 1e5, -1e5, 1e5],
+                   "2026-12-29": [25200.0, 25000.0, 2e4, 100.0, 1e4]}}]
+    fs = f.fut_series(rows)
+    assert fs["expiry"].tolist() == ["2026-11-23", "2026-12-29"]
+    assert fs["premium bps"].iloc[0] == pytest.approx(20.0)
+    assert f.fut_word(5, 10) == "long build" and f.fut_word(-5, 10) == "short build"
+    assert f.fut_word(5, -10) == "short covering" and f.fut_word(-5, -10) == "long unwind"
+    assert f.fut_word(0, 10) is None
+
+
+def test_parse_fut():
+    j = {"timestamp": "06-Nov-2026 10:00:00",
+         "data": [{"instrumentType": "FUTIDX", "expiryDate": "23-Nov-2026", "lastPrice": 25008,
+                   "prevClose": 24588, "openInterest": 203350, "changeinOpenInterest": 8864,
+                   "totalTradedVolume": 125137, "underlyingValue": 25030.35},
+                  {"instrumentType": "OPTIDX", "expiryDate": "09-Nov-2026"}]}
+    r = f.parse_fut(j)
+    assert r["t"] == "2026-11-06T10:00:00" and list(r["F"]) == ["2026-11-23"]
+    with pytest.raises(f.im.NseError):
+        f.parse_fut({"data": [{"instrumentType": "OPTIDX"}]})
+
+
+# ── capture: dedupe, session clock, lock ───────────────────────────────────────────────
+@pytest.fixture
+def tmpdir_fno(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(f, "_S", {})
+    monkeypatch.setattr(f, "_READ", {})
+    return tmp_path
+
+
+class _Client:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.calls = 0
+
+    def get(self, path):
+        self.calls += 1
+        return self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+
+
+def test_poll_chain_logs_once_per_nse_stamp(tmpdir_fno, monkeypatch):
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 10, 0, 30))
+    moved = {("CE", 25000): 1500.0}
+    c = _Client([payload(ts="06-Nov-2026 10:00:00"), payload(ts="06-Nov-2026 10:00:00"),
+                 payload(ts="06-Nov-2026 10:01:00", oi=moved),
+                 payload(ts="06-Nov-2026 10:02:00", oi=moved)])   # clock moved, numbers did not
+    for _ in range(4):
+        assert f.poll_chain("NIFTY", EXP, c)
+    rows = f.chain_log("NIFTY", DAY, EXP.isoformat())
+    assert [r["t"][11:16] for r in rows] == ["10:00", "10:01"]
+    # a restarted writer reads the log and does not re-log the same numbers
+    monkeypatch.setattr(f, "_S", {})
+    f.poll_chain("NIFTY", EXP, _Client([payload(ts="06-Nov-2026 10:03:00", oi=moved)]))
+    f._READ.clear()
+    assert len(f.chain_log("NIFTY", DAY, EXP.isoformat())) == 2
+    assert EXP.isoformat() in f.load_latest("NIFTY")["chain"]
+
+
+def test_poll_chain_outside_session_not_logged(tmpdir_fno, monkeypatch):
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 15, 40))
+    f.poll_chain("NIFTY", EXP, _Client([payload(ts="06-Nov-2026 15:37:23")]))
+    assert f.chain_log("NIFTY", DAY, EXP.isoformat()) == []
+    assert f.load_latest("NIFTY")["chain"][EXP.isoformat()]["t"].startswith("2026-11-06T15:37")
+
+
+def test_poll_chain_bad_payload_keeps_last_good(tmpdir_fno, monkeypatch):
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 10, 0, 30))
+    f.poll_chain("NIFTY", EXP, _Client([payload(ts="06-Nov-2026 10:00:00")]))
+    assert not f.poll_chain("NIFTY", EXP, _Client([{"records": {"data": []}}]))
+    assert f.load_latest("NIFTY")["chain"][EXP.isoformat()]["t"].endswith("10:00:00")
+
+
+def test_claim_respects_live_owner(tmpdir_fno):
+    (tmpdir_fno / "poller.lock").write_text(json.dumps({"pid": -1, "beat": 9e12}))
+    assert not f._claim()
+    (tmpdir_fno / "poller.lock").write_text(json.dumps({"pid": -1, "beat": 0}))
+    assert f._claim()
+    f._release()
+    assert not (tmpdir_fno / "poller.lock").exists()
+
+
+def test_cycle_polls_captured_expiries_only_in_hours(tmpdir_fno, monkeypatch):
+    calls = []
+    monkeypatch.setattr(f, "market_window", lambda now=None: True)
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 10, 0))
+    monkeypatch.setattr(f, "poll_expiries", lambda code, client=None: f._st(code).update(
+        expiries=[dt.date(2026, 11, 9), dt.date(2026, 11, 17), dt.date(2026, 11, 23),
+                  dt.date(2026, 12, 29)], exp_at=9e12, exp_day=DAY) or f._st(code)["expiries"])
+    monkeypatch.setattr(f, "poll_chain", lambda code, e, client=None: calls.append((code, e))
+                        or f._st(code)["chain_at"].__setitem__(e.isoformat(), 9e12))
+    monkeypatch.setattr(f, "poll_fut", lambda code, client=None: f._st(code).update(fut_at=9e12))
+    f._cycle()
+    nifty = [e for c, e in calls if c == "NIFTY"]
+    assert nifty == [dt.date(2026, 11, 9), dt.date(2026, 11, 17), dt.date(2026, 11, 23)]
+    calls.clear()
+    f._cycle()
+    assert calls == []                                    # cadence respected
+    # outside hours: nothing unless someone is looking
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 20, 0))
+    monkeypatch.setattr(f, "_S", {})
+    f._cycle()
+    assert calls == []
+
+
+def test_viewer_in_another_process_drives_off_hours_fetch(tmpdir_fno, monkeypatch):
+    """The writer may be the scheduled job; a page open in the dashboard must still get an
+    off-hours chain, and an expiry outside the captured three must still be read."""
+    calls = []
+    monkeypatch.setattr(f, "market_window", lambda now=None: False)
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 20, 0))
+    monkeypatch.setattr(f, "poll_expiries", lambda code, client=None: f._st(code).update(
+        expiries=[dt.date(2026, 11, 9), dt.date(2026, 11, 17), dt.date(2026, 11, 23),
+                  dt.date(2026, 12, 29)], exp_at=9e12, exp_day=DAY) or f._st(code)["expiries"])
+    monkeypatch.setattr(f, "poll_chain", lambda code, e, client=None: calls.append((code, e))
+                        or f._st(code)["chain_at"].__setitem__(e.isoformat(), 9e12))
+    monkeypatch.setattr(f, "poll_fut", lambda code, client=None: f._st(code).update(fut_at=9e12))
+    f._cycle()
+    assert calls == []
+    # "another process" = a view file this process's memory knows nothing about
+    f.im._write_json(tmpdir_fno / "view_BANKNIFTY.json",
+                     {"at": __import__("time").time(), "exp": "2026-12-29"})
+    f._cycle()
+    assert [c for c, _ in calls] and {c for c, _ in calls} == {"BANKNIFTY"}
+    assert dt.date(2026, 12, 29) in [e for _, e in calls]
+    # touch() writes the file
+    f.touch("NIFTY", dt.date(2026, 11, 17))
+    assert json.loads((tmpdir_fno / "view_NIFTY.json").read_text())["exp"] == "2026-11-17"
+
+
+def test_compress_old_logs(tmpdir_fno):
+    p = f._path("chain", "NIFTY", dt.date(2026, 11, 5))
+    p.write_text('{"t": "2026-11-05T10:00:00", "e": "2026-11-09"}\n', encoding="utf-8")
+    today = f._path("chain", "NIFTY", DAY)
+    today.write_text("{}\n", encoding="utf-8")
+    assert f.compress_old_logs(DAY) == 1
+    assert not p.exists() and today.exists()
+    assert f.chain_log("NIFTY", dt.date(2026, 11, 5), "2026-11-09")[0]["t"].startswith("2026")
+    assert dt.date(2026, 11, 5) in f.logged_days("NIFTY")
+
+
+# ── audit 6 Nov 2026: model IV, corrected close, heal, holidays, races ─────────────────
+def _b76_payload(F=25000.0, sig=0.18, T=5 / 252, spot=None, ts="06-Nov-2026 10:00:00",
+                 skew=0.0, nse_iv=(14.0, 21.0)):
+    """A chain priced by Black-76 off forward F (spot may differ — carry / stale index)."""
+    spot = spot or F
+    data = []
+    for K in range(24000, 26001, 50):
+        s = sig + skew * (25000 - K) / 1000
+        c, _ = f.im.b76(F, K, T, s, True)
+        p, _ = f.im.b76(F, K, T, s, False)
+        r = {"strikePrice": K, "expiryDates": "09-Nov-2026"}
+        for side, px, iv in (("CE", float(c), nse_iv[0]), ("PE", float(p), nse_iv[1])):
+            r[side] = {"strikePrice": K, "lastPrice": round(px, 2), "change": 1.0,
+                       "openInterest": 1000, "changeinOpenInterest": 10,
+                       "totalTradedVolume": 100, "impliedVolatility": iv,
+                       "buyPrice1": round(px - 0.05, 2), "sellPrice1": round(px + 0.05, 2)}
+        data.append(r)
+    return {"records": {"data": data, "timestamp": ts, "underlyingValue": spot},
+            "filtered": {}}
+
+
+def test_model_iv_recovers_vol_and_forward_despite_bad_spot(monkeypatch):
+    """NSE prices IV off spot; with spot 60 pts off the forward its call and put IVs split.
+    The model takes the forward from parity and recovers one IV for both sides."""
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    ch = f.parse_chain(_b76_payload(F=25000.0, spot=25060.0), EXP)
+    row = f.compact(ch)
+    m = f.model_iv(row, EXP, dt.datetime(2026, 11, 6, 10, 0))
+    assert m["F"] == pytest.approx(25000.0, abs=0.5)
+    row.update(m)
+    ce, pe = f.row_sides(row)
+    for K in (24700.0, 25000.0, 25300.0):
+        assert ce[K]["IV"] == pytest.approx(18.0, abs=0.15)
+        assert pe[K]["IV"] == pytest.approx(18.0, abs=0.15)
+        assert ce[K]["iv"] == 14.0                       # NSE's figure kept, not used
+    h = f.headline(row, None, f.window(sorted(ce), row["a"]))
+    assert h["atm_iv"] == pytest.approx(18.0, abs=0.15) and h["fwd"] == m["F"]
+
+
+def test_model_iv_empty_without_time_or_parity(monkeypatch):
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 0.0)
+    row = f.compact(f.parse_chain(_b76_payload(), EXP))
+    assert f.model_iv(row, EXP, dt.datetime(2026, 11, 9, 15, 31)) == {}
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    assert f.model_iv(row, EXP, None) == {}
+    row["u"] = 30000.0                                   # forward 17% off spot: broken
+    assert f.model_iv(row, EXP, dt.datetime(2026, 11, 6, 10)) == {}
+
+
+def test_iv_never_mixes_sources_between_rows(monkeypatch):
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    old = f.compact(f.parse_chain(_b76_payload(), EXP))            # NSE IV only
+    new = dict(f.compact(f.parse_chain(_b76_payload(), EXP)))
+    new.update(f.model_iv(new, EXP, dt.datetime(2026, 11, 6, 10)))
+    ks = f.window([k[0] for k in new["k"]], new["a"])
+    tab = f.ladder(new, old, ks, "iv")
+    assert tab["CE ΔIV"].isna().all()                    # 18 (model) - 14 (NSE) is not a change
+    assert f.headline(new, old, ks)["atm_iv0"] is None
+
+
+def test_smile_uses_out_of_the_money_side(monkeypatch):
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    row = f.compact(f.parse_chain(_b76_payload(skew=0.02), EXP))
+    row.update(f.model_iv(row, EXP, dt.datetime(2026, 11, 6, 10)))
+    sm = f.smile_points(row, [24800.0, 25000.0, 25200.0])
+    assert sm[24800.0] > sm[25000.0] > sm[25200.0]      # put skew comes through
+
+
+def test_close_snapshot_and_reconcile(tmpdir_fno, monkeypatch):
+    """Session rows go to the log; a chain stamped after 15:35 goes to the close file only;
+    reconcile scores the last session reading against it."""
+    clock = {"now": dt.datetime(2026, 11, 6, 15, 25)}
+    monkeypatch.setattr(f, "_now", lambda: clock["now"])
+    oi_live = {("CE", K): 1100.0 for K in range(24000, 26001, 50)}
+    doi_live = {("CE", K): 100.0 for K in range(24000, 26001, 50)}
+    f.poll_chain("NIFTY", EXP, _Client([payload(ts="06-Nov-2026 15:25:00", oi=oi_live,
+                                                doi=doi_live)]))
+    clock["now"] = dt.datetime(2026, 11, 6, 15, 41)
+    oi_off = {("CE", K): 980.0 for K in range(24000, 26001, 50)}       # NSE's correction
+    doi_off = {("CE", K): -20.0 for K in range(24000, 26001, 50)}      # sign flips
+    f.poll_chain("NIFTY", EXP, _Client([payload(ts="06-Nov-2026 15:40:00", oi=oi_off,
+                                                doi=doi_off)]))
+    assert len(f.chain_log("NIFTY", DAY, EXP.isoformat())) == 1
+    close = f.load_close("NIFTY", DAY)
+    assert close["chain"][EXP.isoformat()]["t"].endswith("15:40:00")
+    rec = f.reconcile_day("NIFTY", DAY)[0]
+    assert rec["sign"] == pytest.approx(50.0)           # calls all flipped, puts all agree
+    assert rec["bias_CE"] == pytest.approx((1100 / 980 - 1) * 100, abs=0.01)
+    assert rec["bias_PE"] == 0.0
+    clock["now"] = dt.datetime(2026, 11, 7, 9, 0)
+    assert f.reconcile() == 1 and f.reconcile() == 0     # once per day
+    s = f.reconcile_summary("NIFTY")
+    assert s["days"] == 1 and s["sign"] == pytest.approx(50.0)
+
+
+def test_heal_ignores_viewed_and_expired_chains(tmpdir_fno, monkeypatch):
+    """First version reset the NSE session every 2 minutes all day once any chain held in
+    memory went old (an expiry viewed once, yesterday's expired contract)."""
+    resets = []
+    monkeypatch.setattr(f, "_reset_client", lambda why: resets.append(why))
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 11, 0))
+    monkeypatch.setattr(f, "_HEAL", {"at": 0.0, "refresh_seen": 9e12})
+    s = f._st("NIFTY")
+    fresh = dt.datetime(2026, 11, 6, 10, 59, 30).isoformat()
+    s["chain"] = {"2026-11-09": {"f": fresh}, "2026-12-29": {"f": "2026-11-06T09:30:00"},
+                  "2026-11-05": {"f": "2026-11-05T15:30:00"}}
+    s["nearest"] = "2026-11-09"
+    s["changed_at"] = {"2026-11-09": __import__("time").time() - 30}
+    f._maybe_heal()
+    assert resets == []
+    # nearest expiry frozen (stamp ticking, numbers not) -> heal
+    s["changed_at"]["2026-11-09"] = __import__("time").time() - f.HEAL_AFTER - 5
+    f._maybe_heal()
+    assert len(resets) == 1 and "frozen" in resets[0]
+
+
+def test_cycle_prunes_expired_and_slows_on_holiday(tmpdir_fno, monkeypatch):
+    calls = []
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 10, 11, 0))   # a holiday
+    monkeypatch.setattr(f, "poll_expiries", lambda code, client=None: f._st(code).update(
+        expiries=[dt.date(2026, 11, 17), dt.date(2026, 11, 23)], exp_at=9e12,
+        exp_day=dt.date(2026, 11, 10)) or f._st(code)["expiries"])
+    monkeypatch.setattr(f, "poll_chain", lambda code, e, client=None: calls.append((code, e))
+                        or f._st(code)["chain_at"].__setitem__(e.isoformat(),
+                                                               __import__("time").time()))
+    monkeypatch.setattr(f, "poll_fut", lambda code, client=None: f._st(code).update(
+        fut_at=__import__("time").time()))
+    s = f._st("NIFTY")
+    s["chain"] = {"2026-11-09": {"t": "2026-11-09T15:40:00"},
+                  "2026-11-17": {"t": "2026-11-09T15:40:00"}}   # NSE still serving Monday
+    f._cycle()
+    assert "2026-11-09" not in s["chain"]                 # expired: out of memory
+    # the nearest chain is a day old after 09:20 -> polled every 5 min, not every minute
+    s["chain_at"]["2026-11-17"] = __import__("time").time() - 120
+    calls.clear()
+    f._cycle()
+    assert ("NIFTY", dt.date(2026, 11, 17)) not in calls
+
+
+def test_chain_log_dedupes_double_writer(tmpdir_fno):
+    p = f._path("chain", "NIFTY", DAY)
+    for t, x in (("2026-11-06T10:00:00", 1), ("2026-11-06T10:01:00", 2),
+                 ("2026-11-06T10:00:00", 3)):
+        f.im._append(p, {"t": t, "e": "2026-11-09", "x": x})
+    rows = f.chain_log("NIFTY", DAY, "2026-11-09")
+    assert [r["x"] for r in rows] == [3, 2]
+
+
+def test_rupee_lines_use_one_index_level():
+    """A pure index move with no position change must not move the ₹ lines."""
+    rows = _session(10, drift=50.0)                       # index +450 pts, OI fixed below
+    for r in rows:
+        for k in r["k"]:
+            k[1 + 3] = 100.0                              # CE doi constant
+    df = f.frame(rows)
+    ks = f.window([k[0] for k in rows[-1]["k"]], rows[0]["a"], 4)
+    ss = f.session_series(df, rows, ks, lot=65)
+    assert ss["calls"].dropna().nunique() == 1
+
+
+def test_no_fyers_calls():
+    import inspect
+    src = inspect.getsource(f)
+    assert "fyers" not in src.lower().replace("zero fyers", "").replace("fyers calls", "")
+
+
+# ── the page renders end to end (Streamlit AppTest, synthetic log) ─────────────────────
+def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    now = dt.datetime(2026, 11, 6, 9, 50)
+    monkeypatch.setattr(f, "_now", lambda: now)
+    monkeypatch.setattr(f, "ensure_poller", lambda: None)
+    monkeypatch.setattr(f, "_claim", lambda: False)
+    monkeypatch.setattr(f, "_lot", lambda *a: (65, "test"))
+    monkeypatch.setattr(f, "sessions_left", lambda d, e: 1)
+    rows = _session(30)
+    for r in rows:
+        f.im._append(f._path("chain", "NIFTY", DAY), r)
+    for r in _session(10, start=dt.datetime(2026, 11, 5, 9, 16)):
+        f.im._append(f._path("chain", "NIFTY", dt.date(2026, 11, 5)), r)
+    fut = {"t": "2026-11-06T09:49:00", "s": 25100.0,
+           "F": {"2026-11-23": [25150.0, 24900.0, 2e5, 5e3, 1e5]}}
+    f.im._append(f._path("fut", "NIFTY", DAY), fut)
+    f.im._write_json(tmpdir_fno / "latest_NIFTY.json", {
+        "expiries": ["2026-11-09", "2026-11-17", "2026-11-23"],
+        "chain": {"2026-11-09": rows[-1]}, "fut": fut})
+
+    def app():
+        import streamlit as st
+        from eqbtst import index_fno
+        index_fno.render_page(st)
+
+    at = AppTest.from_function(app, default_timeout=60).run()
+    assert not at.exception, at.exception
+    assert not [e for e in at.error], [e.value for e in at.error]
+    assert any("strikes — calls left" in s.value for s in at.subheader)
+    assert len(at.dataframe) >= 2
+    # every metric shown, switches work
+    at.segmented_control(key="if_mode_NIFTY").set_value("premium read").run()
+    assert not at.exception
+    at.segmented_control(key="if_metric_NIFTY").set_value("Volume per 5 min").run()
+    assert not at.exception
+    at.segmented_control(key="if_anchor_NIFTY").set_value("around first-reading ATM").run()
+    assert not at.exception
+    at.select_slider(key="if_nside_NIFTY").set_value(20).run()
+    assert not at.exception and not at.error
+    # past session
+    at.selectbox(key="if_day_NIFTY").set_value(dt.date(2026, 11, 5)).run()
+    assert not at.exception and not at.error

@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from eqbtst import (arb, config, data, fno, index_mgmt, ledger, live, mtf, paper, paper_hz,
+from eqbtst import (arb, config, data, fno, index_fno, index_mgmt, ledger, live, mtf, paper, paper_hz,
                     scalp, screen, sector_tilt)
 
 st.set_page_config(page_title="Equity BTST Board", layout="wide", page_icon="📊")
@@ -276,7 +276,7 @@ if last is None:
 # every session on this server shares, and Index Management makes no Fyers calls at all.
 LANES = {"btst": "BTST (overnight)", "intraday": "Intraday", "replay": "🎬 Replay (practice)",
          "arbitrage": "🧮 Arbitrage", "paper": "📝 Paper trade (R)",
-         "index": "🏛️ Index Management"}
+         "index": "🏛️ Index Management", "indexfno": "📊 Index F&O Management"}
 _LANE_OF = {v: k for k, v in LANES.items()}
 
 
@@ -303,6 +303,7 @@ st.sidebar.markdown(
     "<div style='font-size:0.8rem;opacity:0.75;margin:-0.4rem 0 0.6rem 0'>Open in a new tab: "
     + " · ".join(f"<a href='?lane={k}' target='_blank' rel='noopener'>{lbl}</a>"
                  for k, lbl in (("intraday", "Intraday"), ("index", "Index Mgmt"),
+                                ("indexfno", "Index F&O"),
                                 ("btst", "BTST"), ("replay", "Replay"),
                                 ("arbitrage", "Arbitrage"), ("paper", "Paper")))
     + "</div>", unsafe_allow_html=True)
@@ -313,6 +314,10 @@ try:
     index_mgmt.ensure_poller()
 except Exception:                                            # noqa: BLE001
     pass
+try:                                 # index option chains: same NSE feed, its own writer lock
+    index_fno.ensure_poller()
+except Exception:                                            # noqa: BLE001
+    pass
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
 if st.sidebar.button("↻ refresh"):
@@ -321,6 +326,7 @@ if st.sidebar.button("↻ refresh"):
     # reached it, so a stuck session stayed stuck through any number of clicks.
     try:
         index_mgmt.request_refresh()
+        index_fno.request_refresh()
     except Exception:                                        # noqa: BLE001
         pass
     live.clear_universe_cache()      # also drop the EOD universe cache (picks up a new sync)
@@ -1759,6 +1765,13 @@ if tf == "🏛️ Index Management":
     # data calls a day) and it works with a dead broker session. st.stop() keeps the live
     # boards from also drawing.
     index_mgmt.render_page(st)
+    st.stop()
+    raise SystemExit  # st.stop() is a no-op outside a script-run context (tests, tooling)
+
+if tf == "📊 Index F&O Management":
+    # NSE's index option chain, 17 strikes around the money. Same reasons as Index Management
+    # for sitting above the token gate: NSE website feed, zero Fyers calls.
+    index_fno.render_page(st)
     st.stop()
     raise SystemExit  # st.stop() is a no-op outside a script-run context (tests, tooling)
 

@@ -23,3 +23,6 @@ data/intraday5/
 
 # Index Management lane: intraday price/OI log + last NSE weights (rebuildable)
 data/index_mgmt/
+
+# Index F&O lane: intraday option-chain log, close snapshots, reconcile scores (rebuildable)
+data/index_fno/

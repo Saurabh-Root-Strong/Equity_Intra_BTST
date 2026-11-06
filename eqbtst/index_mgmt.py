@@ -5233,20 +5233,35 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
     for code in NSE_NAME:
         _st(code)
     ensure_poller()
+    # Index option chains (index_fno.py) ride on this job: same NSE feed, its own writer lock
+    # and log, so they are captured from 09:15 too. A failure there never stops this capture.
+    _fno = None
+    try:
+        from . import index_fno as _fno
+        _fno.compress_old_logs()
+        _fno.reconcile()                 # yesterday's live log vs NSE's corrected close
+        _fno.ensure_poller()
+    except Exception as exc:                                 # noqa: BLE001
+        _log_error("fno", f"index_fno not started: {type(exc).__name__}: {exc}")
+        _fno = None
     last = None
     # STEP ASIDE WHEN THE CODE CHANGES. This job runs all day; a fix made mid-session never
     # reached it (3 Nov 2026: the options read was added at 10:15 but the job started at
     # 09:28 kept logging without it all day). Exiting releases the lock: the dashboard
     # (restarted on the new code) takes over at once, or the next 10-minute run of the task.
+    _watched = [Path(__file__), Path(__file__).with_name("index_fno.py")]
+
+    def _mtimes():
+        return tuple(p.stat().st_mtime if p.exists() else None for p in _watched)
     try:
-        _code_mtime = Path(__file__).stat().st_mtime
+        _code_mtime = _mtimes()
     except OSError:
         _code_mtime = None
     try:
         while _now().time() < until and _now().weekday() < 5:
             time.sleep(30)
             try:
-                if _code_mtime and Path(__file__).stat().st_mtime != _code_mtime:
+                if _code_mtime and _mtimes() != _code_mtime:
                     print(f"[{_now():%H:%M:%S}] code changed - stepping aside for the new "
                           "version", flush=True)
                     break
@@ -5260,6 +5275,11 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
                 last = owner
     finally:
         setattr(sys, _GEN_ATTR, None)            # stops the poller thread
+        if _fno is not None:
+            try:
+                _fno.stop_poller()
+            except Exception:                                # noqa: BLE001
+                pass
         time.sleep(4)
         _release()
         if _awake:
