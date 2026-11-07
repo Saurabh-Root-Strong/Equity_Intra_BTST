@@ -1255,6 +1255,173 @@ def session_series(df: pd.DataFrame, rows: list, strikes: list, lot: int | None,
     return out.sort_index()
 
 
+# ── strike buckets: Best / Better / Good (user, 7 Nov 2026) ──────────────────────────────
+# The Index Management idea (Top 10 / Next 10 / Rest 30) applied to strikes, by DISTANCE FROM
+# THE MONEY on the ladder on screen: of the 16 strikes around ATM, the nearest 3 either side
+# are Best (with ATM itself), the next 2 either side Better, the outer 3 either side Good.
+# Steps are counted on the chosen strike gap (100 pts by default), so Best = ATM +-300 on
+# Nifty. Wider ladders put everything past step 5 in Good.
+BUCKETS = (("Best", 0, 3), ("Better", 4, 5), ("Good", 6, 10 ** 6))
+BUCKET_NAMES = tuple(b[0] for b in BUCKETS)
+BUCKET_COLOR = {"Best": "#f5b041", "Better": "#3a8dde", "Good": "#9aa4b2"}
+BUCKET_LEAN_BAND = 0.10  # calls vs puts added within 10% of each other = "balanced"
+
+
+AUTO_GAPS = (100, 200)   # round grids the 'auto' gap chooses from (200 x 8 stays inside the log)
+AUTO_SCAN = 30           # readings scanned from the open for a computable straddle
+
+
+def straddle_move(row: dict | None) -> float | None:
+    """ATM straddle on the 100-pt grid as % of the index, or None when either side has not
+    traded today (14% of Fin Nifty mornings at 09:20 in the archive)."""
+    if not row or not row.get("u"):
+        return None
+    ce, pe = row_sides(row)
+    a = pick_atm(grid(set(ce) & set(pe), 100), row["u"])
+    c, p = _px(ce.get(a)), _px(pe.get(a))
+    return (c + p) / row["u"] * 100 if c and p else None
+
+
+def auto_gap(rows: list, latest: dict | None = None) -> tuple:
+    """(gap, expected move %, why). 100 points — where Nifty / Fin / Midcap OI sits — unless 8
+    strikes of 100 do not reach the move the ATM straddle prices; then 200.
+
+    Measured on 87 sessions (Tradebot archive, 09:20): with 100 points the whole 17-strike
+    ladder sat INSIDE the priced move on Bank Nifty from 3 sessions to expiry (Good reached
+    0.5-1.0x the straddle's move, Best 0.2-0.4x), so its 'Good' bucket was not the wings. The
+    rule keeps 100 for Nifty, Fin and Midcap at every expiry and moves Bank Nifty to 200 only
+    there. Decided from the session's FIRST computable straddle, so the buckets never change
+    mid-session; 100 when none is computable."""
+    for r in (rows or [])[:AUTO_SCAN] or ([latest] if latest else []):
+        em = straddle_move(r)
+        if em:
+            u = r["u"]
+            for g in AUTO_GAPS:
+                if BAND * g / u * 100 >= em:
+                    return g, em, f"8 × {g} pts reaches the ±{em:.2f}% the straddle prices"
+            g = AUTO_GAPS[-1]
+            return g, em, f"widest allowed; the straddle prices ±{em:.2f}%"
+    return AUTO_GAPS[0], None, "no straddle computable yet (ATM untraded) — 100 by default"
+
+
+def bucket_map(strikes: list, center) -> dict:
+    """{K: bucket} by steps from `center` (the ladder's middle strike). Membership is fixed for
+    the session by the ladder, like the strike lines: a wall moving from Good to Best as the
+    index drifts would otherwise move a bucket's line with no position changing."""
+    ks = sorted(strikes)
+    if not ks:
+        return {}
+    c = center if center in ks else pick_atm(ks, center if center is not None else ks[len(ks) // 2])
+    i = ks.index(c)
+    out = {}
+    for j, K in enumerate(ks):
+        d = abs(j - i)
+        out[K] = next(name for name, lo, hi in BUCKETS if lo <= d <= hi)
+    return out
+
+
+def _lean(calls_add, puts_add) -> str:
+    """Which side added more contracts today. Words, not arrows: index option writers
+    dominate, so 'put side heavier' is usually read as support, but Tradebot's tests found
+    no edge in any of it (walls follow price; crossovers mildly contrarian)."""
+    if calls_add is None or puts_add is None or (not calls_add and not puts_add):
+        return "—"
+    big = max(abs(calls_add), abs(puts_add))
+    if big and abs(calls_add - puts_add) <= BUCKET_LEAN_BAND * big:
+        return "⚪ balanced"
+    return "🟢 put side heavier" if puts_add > calls_add else "🔴 call side heavier"
+
+
+def _ranges(ks: list, center) -> str:
+    """'24,000–24,100 · 24,900–25,000 (4)': a bucket away from the money is two runs of
+    strikes, one below and one above it; one 'low–high' would claim the strikes between."""
+    lo = [k for k in ks if center is not None and k < center]
+    hi = [k for k in ks if center is None or k >= center]
+    part = lambda xs: (f"{xs[0]:,.0f}" if len(xs) == 1 else f"{xs[0]:,.0f}–{xs[-1]:,.0f}")  # noqa: E731
+    runs = [part(x) for x in (lo, hi) if x]
+    if len(runs) == 2 and lo[-1] < center <= hi[0] and (center in ks):
+        runs = [part(sorted(ks))]                  # one unbroken run through the money
+    return " · ".join(runs) + f" ({len(ks)})"
+
+
+def bucket_table(latest: dict, first: dict | None, bmap: dict, lot: int | None) -> pd.DataFrame:
+    """One row per bucket: OI, change today and since the first reading, PCR, volume, ₹."""
+    ce, pe = row_sides(latest)
+    best = sorted(k for k, b in bmap.items() if b == "Best")
+    center_k = best[len(best) // 2] if best else None
+    ce0, pe0 = row_sides(first) if first else ({}, {})
+    # the FIRST reading's index level, as bucket_series / session_series use: with the live
+    # level the table's ₹ and the line's last point disagreed by the day's index move
+    # (5 Nov Nifty Best -78,435 vs -77,744 Cr)
+    u = (first or {}).get("u") or latest.get("u")
+    rows = []
+    for name in BUCKET_NAMES:
+        ks = sorted(k for k, b in bmap.items() if b == name)
+        if not ks:
+            continue
+        def tot(d, f, keys=ks):
+            vals = [(d.get(k) or {}).get(f) for k in keys]
+            vals = [v for v in vals if v is not None]
+            return float(sum(vals)) if vals else None
+        coi, poi = tot(ce, "oi"), tot(pe, "oi")
+        cd, pd_ = tot(ce, "doi"), tot(pe, "doi")
+        c0, p0 = tot(ce0, "oi"), tot(pe0, "oi")
+        net_cr = ((cd - pd_) * lot * u / 1e7) if lot and u and cd is not None and pd_ is not None \
+            else None
+        rows.append({
+            "Bucket": name, "Strikes": _ranges(ks, center_k),
+            "Call OI": coi, "Put OI": poi,
+            "PCR": (poi / coi) if coi else None,
+            "PCR yday": ((poi - pd_) / (coi - cd)) if coi and cd is not None and pd_ is not None
+            and coi - cd else None,
+            "Call ΔOI": cd, "Put ΔOI": pd_,
+            "Call ΔOI since first": (coi - c0) if first and coi is not None and c0 is not None else None,
+            "Put ΔOI since first": (poi - p0) if first and poi is not None and p0 is not None else None,
+            "Call volume": tot(ce, "vol"), "Put volume": tot(pe, "vol"),
+            "Calls − puts ₹ Cr": net_cr,
+            "Today": _lean(cd, pd_)})
+    df = pd.DataFrame(rows)
+    for c in df.columns:
+        if c not in ("Bucket", "Strikes", "Today"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    return df
+
+
+def bucket_series(df: pd.DataFrame, bmap: dict, lot: int | None,
+                  base: str = "yday") -> pd.DataFrame:
+    """Long frame per reading x bucket: calls / puts OI change (₹ Cr at the first reading's
+    index level, or contracts without a lot), calls - puts, PCR, and call / put OI. A reading
+    counts for a bucket only when 90% of its strikes are in it (as session_series)."""
+    if df.empty or not bmap:
+        return pd.DataFrame()
+    w = df[df["K"].isin(list(bmap))].copy()
+    if w.empty:
+        return pd.DataFrame()
+    w["bucket"] = w["K"].map(bmap)
+    if base == "first":
+        w = w.sort_values("t")
+        w["chg_"] = w["oi"] - w.groupby(["side", "K"])["oi"].transform("first")
+    else:
+        w["chg_"] = w["doi"]
+    spot = df.groupby("t")["u"].first().dropna()
+    mult = (lot * spot.iloc[0] / 1e7) if lot and len(spot) else 1.0
+    size = pd.Series(bmap).value_counts()
+    g = w.groupby(["t", "bucket", "side"]).agg(n=("K", "nunique"), chg=("chg_", "sum"),
+                                                oi=("oi", "sum")).unstack("side")
+    out = pd.DataFrame(index=g.index)
+    for side, nm in (("CE", "calls"), ("PE", "puts")):
+        if ("chg", side) not in g:
+            return pd.DataFrame()
+        need = SERIES_QUORUM * pd.Series([size[b] for b in g.index.get_level_values("bucket")],
+                                         index=g.index)
+        ok = g[("n", side)] >= need
+        out[nm] = (g[("chg", side)] * mult).where(ok)
+        out[f"{nm} OI"] = g[("oi", side)].where(ok)
+    out["calls − puts"] = out["calls"] - out["puts"]
+    out["PCR"] = out["puts OI"] / out["calls OI"]
+    return out.reset_index()
+
+
 METRICS = {
     "OI change since yesterday": ("doi", "contracts", "+,.0f"),
     "Open interest": ("oi", "contracts", ",.0f"),
@@ -1488,7 +1655,7 @@ def _ladder_view(st, tab: pd.DataFrame, latest: dict, mode: str) -> None:
     cols_pe = [c.replace("CE", "PE") for c in reversed(cols_ce)]
     view = tab.copy()
     view["Strike"] = [f"★ {k:,.0f}" if a else f"{k:,.0f}" for k, a in zip(view["Strike"], view["atm"])]
-    view = view[cols_ce + ["Strike"] + cols_pe]
+    view = view[cols_ce + ["Strike"] + (["Bucket"] if "Bucket" in view else []) + cols_pe]
 
     def _row_style(r):
         atm = str(r["Strike"]).startswith("★")
@@ -1514,7 +1681,8 @@ def _ladder_view(st, tab: pd.DataFrame, latest: dict, mode: str) -> None:
                     f"{side} Chg %": "{:+.1f}", f"{side} LTP": "{:,.2f}"})
     sty = sty.format(fmt, na_rep="—")
     cc = st.column_config
-    cfg = {"Strike": cc.TextColumn("Strike", help=TIP["Strike"])}
+    cfg = {"Strike": cc.TextColumn("Strike", help=TIP["Strike"]),
+           "Bucket": cc.TextColumn("Bucket", help=TIP_BUCKET["Bucket"])}
     for side in ("CE", "PE"):
         nm = "Call" if side == "CE" else "Put"
         for c, tip in (("read", "read"), ("ΔOI", "ΔOI"), ("OI", "OI"),
@@ -1526,6 +1694,150 @@ def _ladder_view(st, tab: pd.DataFrame, latest: dict, mode: str) -> None:
     st.caption(f"Read: **{'IV read' if mode == 'iv' else 'premium read'}**. Bold amber OI = "
                f"largest open interest in these {len(tab)} strikes on that side (the 'wall' — walls "
                "follow price in Tradebot's tests; context, not a level to trade).")
+
+
+TIP_BUCKET = {
+    "Bucket": "Strikes grouped by distance from the money on the ladder above: Best = ATM "
+              "(At The Money) and 3 strikes either side, Better = the next 2 either side, "
+              "Good = the outer 3 either side. Example on Nifty with ATM 25,000 and a 100-point "
+              "gap: Best 24,700-25,300, Better 24,500-24,600 and 25,400-25,500, Good the rest.",
+    "Strikes": "Lowest–highest strike in the bucket (how many strikes).",
+    "Call OI": "Call open interest summed over the bucket's strikes, contracts.",
+    "Put OI": "Put open interest summed over the bucket's strikes, contracts.",
+    "PCR": "PCR (Put-Call Ratio) = put OI ÷ call OI in this bucket now. Example: 1.40 = 40% "
+           "more puts than calls open here.",
+    "PCR yday": "The same ratio at yesterday's close (OI − today's change), same strikes. On a "
+                "big-move day these strikes sat somewhere else relative to the index yesterday: "
+                "5 Nov 2026, Nifty +2.3%, today's Best strikes (24,200-24,800) were far above "
+                "the market at the 4 Nov close, few puts open there — PCR 0.03 then, 0.85 now.",
+    "Call ΔOI": "Calls opened (+) or closed (−) in this bucket today vs yesterday's close, "
+                "contracts.",
+    "Put ΔOI": "Puts opened (+) or closed (−) in this bucket today, contracts.",
+    "Call ΔOI since first": "Calls opened or closed since today's first logged reading.",
+    "Put ΔOI since first": "Puts opened or closed since today's first logged reading.",
+    "Call volume": "Call contracts traded today in this bucket.",
+    "Put volume": "Put contracts traded today in this bucket.",
+    "Calls − puts ₹ Cr": "Calls added minus puts added today, as ₹ crore of exposure "
+                         "(contracts × lot × index level). Positive = call side added more.",
+    "Today": "Which side added more contracts today (within 10% = balanced). Put side "
+             "heavier is usually read as support because index writers dominate — but it is a "
+             "MIRROR of the move, not a forecast: on 87 sessions the bucket PCR rose with the "
+             "index in the same 15-30 minutes and said nothing about the next.",
+}
+
+
+def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.DataFrame,
+                    strikes: list, center, lot: int | None, move_pct=None) -> dict:
+    """Best / Better / Good: table + PCR through the session + calls vs puts per bucket."""
+    import altair as alt
+    bmap = bucket_map(strikes, center)
+    st.subheader("Strike buckets — Best / Better / Good")
+    sizes = {n: sum(1 for b in bmap.values() if b == n) for n in BUCKET_NAMES}
+    st.caption(f"Grouped by distance from the money on the ladder above (centre {center:,.0f}): "
+               f"**Best** = centre ± 3 strikes ({sizes['Best']}), **Better** = the next 2 either "
+               f"side ({sizes['Better']}), **Good** = the outer strikes ({sizes['Good']}). The "
+               "groups stay fixed for the session so a line moves only when positions move.")
+    # What a bucket MEANS differs by index and expiry: +-3 strikes of 100 is +-0.5% on Bank
+    # Nifty but +-2.1% on Midcap Select (5 Nov 2026). Said against the move the ATM straddle
+    # prices to expiry, so 'Good' is never mistaken for 'the tails'.
+    spot = latest.get("u")
+    if spot and center:
+        cov = []
+        for n in BUCKET_NAMES:
+            ks_n = [k for k, b in bmap.items() if b == n]
+            if ks_n:
+                reach = max(abs(k - center) for k in ks_n) / spot * 100
+                cov.append(f"{n} ±{reach:.1f}%"
+                           + (f" ({reach / move_pct:.1f}× the straddle's move)" if move_pct else ""))
+        if cov:
+            st.caption("How far each bucket reaches from the centre: " + " · ".join(cov)
+                       + (f". The ATM straddle prices about ±{move_pct:.2f}% to expiry — a "
+                          "bucket under 1× sits inside the move the market expects."
+                          if move_pct else "."))
+    bt = bucket_table(latest, first, bmap, lot)
+    if bt.empty:
+        st.info("No strikes to group.")
+        return bmap
+    cc = st.column_config
+    cfg = {c: cc.Column(c, help=TIP_BUCKET[c]) for c in bt.columns if c in TIP_BUCKET}
+    for c in ("Call OI", "Put OI", "Call volume", "Put volume"):
+        cfg[c] = cc.NumberColumn(c, format="%,.0f", help=TIP_BUCKET[c])
+    for c in ("Call ΔOI", "Put ΔOI", "Call ΔOI since first", "Put ΔOI since first"):
+        cfg[c] = cc.NumberColumn(c, format="%+,.0f", help=TIP_BUCKET[c])
+    cfg["PCR"] = cc.NumberColumn("PCR", format="%.2f", help=TIP_BUCKET["PCR"])
+    cfg["PCR yday"] = cc.NumberColumn("PCR yday", format="%.2f", help=TIP_BUCKET["PCR yday"])
+    cfg["Calls − puts ₹ Cr"] = cc.NumberColumn("Calls − puts ₹ Cr", format="%+,.0f",
+                                               help=TIP_BUCKET["Calls − puts ₹ Cr"])
+    st.dataframe(bt, column_config=cfg, hide_index=True, width="stretch")
+
+    b1, b2 = st.columns([2, 1])
+    bbase = b1.segmented_control(
+        "Count from", ["since yesterday's close", "since this morning's first reading"],
+        default="since yesterday's close", key=f"if_bbase_{code}") or "since yesterday's close"
+    bs = bucket_series(df, bmap, lot, "first" if bbase.startswith("since this") else "yday")
+    if bs.empty:
+        st.caption("Bucket lines appear once a few readings are logged.")
+        return bmap
+    unit = "₹ Cr" if lot else "contracts"
+    st.caption("**PCR (Put-Call Ratio) through the session, by bucket** — put OI ÷ call OI. Up = "
+               "puts building faster than calls in that bucket. **It follows the index; it does "
+               "not lead it.** Tested on 87 sessions of Tradebot's chain archive (22 Jun – 5 Nov "
+               "2026, 4 indices, buckets fixed from 09:20): in the SAME 15/30-minute block the "
+               "Best bucket's PCR rises with the index (rank correlation Nifty +0.36/+0.59, Bank "
+               "Nifty +0.40/+0.57); in the NEXT block nothing (pooled t −0.7 to +0.9; 'puts "
+               "built' was followed by a rise 45-54% of the time against a 48-51% base). A "
+               "rising PCR is what a rally looks like, not a reason to expect one.")
+    _lines(st, bs.pivot(index="t", columns="bucket", values="PCR")
+           .reindex(columns=[b for b in BUCKET_NAMES if b in set(bs["bucket"])]),
+           "put ÷ call OI", BUCKET_COLOR, height=220, fmt=".2f")
+    metric = b2.segmented_control("Show", ["OI change", "Open interest", "Volume per 5 min"],
+                                  default="OI change", key=f"if_bmetric_{code}") or "OI change"
+    if metric == "Volume per 5 min":
+        v = strike_panels(df, strikes, "Volume per 5 min")
+        v["bucket"] = v["K"].map(bmap)
+        long = (v.dropna(subset=["v"]).groupby(["t", "bucket", "side"])["v"].sum()
+                .reset_index())
+        ylab, fmt = "contracts / 5 min", ",.0f"
+    else:
+        cols = ("calls", "puts") if metric == "OI change" else ("calls OI", "puts OI")
+        long = bs.melt(id_vars=["t", "bucket"], value_vars=list(cols), var_name="side",
+                       value_name="v")
+        long["side"] = long["side"].map({cols[0]: "CE", cols[1]: "PE"})
+        ylab = f"OI change, {unit}" if metric == "OI change" else "open interest, contracts"
+        fmt = "+,.0f" if metric == "OI change" else ",.0f"
+    long = long.dropna(subset=["v"])
+    if long.empty:
+        st.caption("Not enough logged readings yet.")
+        return bmap
+    long["g"] = long["bucket"] + "·" + long["side"]
+    long = im._with_segments(long, "t", "g")
+    base = alt.Chart(long)
+    mark = base.mark_bar() if metric.startswith("Volume") else base.mark_line(strokeWidth=2)
+    enc = dict(
+        x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", tickCount=6)),
+        y=alt.Y("v:Q", title=ylab, scale=alt.Scale(zero=metric != "Open interest"),
+                axis=alt.Axis(format="~s")),
+        color=alt.Color("side:N", title=None,
+                        scale=alt.Scale(domain=["CE", "PE"], range=[CE_COLOR, PE_COLOR]),
+                        legend=alt.Legend(orient="bottom", labelExpr=(
+                            "datum.label == 'CE' ? 'Calls (CE)' : 'Puts (PE)'"))),
+        tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"), "bucket:N", "side:N",
+                 alt.Tooltip("v:Q", title=ylab, format=fmt)])
+    ch = mark.encode(**enc)
+    ch = ch.encode(xOffset="side:N") if metric.startswith("Volume") else ch.encode(detail="line:N")
+    ch = (ch.properties(width=330, height=200)
+          .facet(column=alt.Column("bucket:N", sort=list(BUCKET_NAMES), title=None,
+                                   header=alt.Header(labelFontSize=13, labelFontWeight="bold")))
+          .resolve_scale(y="independent"))
+    st.caption(f"**Calls vs puts by bucket** — {metric.lower()}"
+               + (f", {bbase}" if metric == "OI change" else "") + ". Each panel has its own scale.")
+    st.altair_chart(ch)
+    if metric == "OI change":
+        st.caption(f"**Calls − puts by bucket** ({unit}, ↑ call side added more)")
+        _lines(st, bs.pivot(index="t", columns="bucket", values="calls − puts")
+               .reindex(columns=[b for b in BUCKET_NAMES if b in set(bs["bucket"])]),
+               f"calls − puts, {unit}", BUCKET_COLOR, height=220, zero=True)
+    return bmap
 
 
 def _lines(st, wide: pd.DataFrame, ylab: str, colors: dict | None = None, height=240,
@@ -1785,19 +2097,23 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     g1, g2 = st.columns([1.3, 2.3])
     lce, lpe = row_sides(latest)
     lstep = listed_step(set(lce) & set(lpe), latest.get("a"))
-    gaps = ["listed"] + [s for s in (50, 100) if not lstep or s > lstep]
-    dflt = GRID_DEFAULT.get(code) if GRID_DEFAULT.get(code) in gaps else "listed"
+    gaps = ["auto", "listed"] + [s for s in (50, 100, 200) if not lstep or s > lstep]
+    agap, aem, awhy = auto_gap(rows, latest)
     step = g1.segmented_control(
-        "Strike gap", gaps, default=dflt, key=f"if_step_{code}",
-        format_func=lambda s: (f"listed ({lstep:g})" if lstep else "listed") if s == "listed"
-        else f"{s:g} pts",
-        help="Which strikes make the ladder. Positions sit on the round hundreds: on 130 "
-             "sessions 100-point strikes held 70% of Nifty's OI on half the strikes (median "
-             "OI per strike 3.7M vs 1.2M on the 50s in between), 81% on Fin Nifty, 80% on "
-             "Midcap Select (its 25s are thin). 'listed' = every strike NSE lists. Every "
-             "total on the page (PCR, calls vs puts, heatmap) covers the strikes shown.")
-    step = step if step in gaps else dflt
-    step = None if step == "listed" else step
+        "Strike gap", gaps, default="auto", key=f"if_step_{code}",
+        format_func=lambda s: f"auto ({agap} pts)" if s == "auto" else
+        (f"listed ({lstep:g})" if lstep else "listed") if s == "listed" else f"{s:g} pts",
+        help="Which strikes make the ladder and its buckets. AUTO (default) = 100 points — "
+             "positions sit on the round hundreds: on 130 sessions 100-point strikes held 70% "
+             "of Nifty's OI on half the strikes (3.7M vs 1.2M per strike on the 50s between), "
+             "81% on Fin Nifty, 80% on Midcap — unless 8 strikes of 100 do not reach the move "
+             "the ATM straddle prices; then 200. On 87 archived sessions that switches only "
+             "Bank Nifty from 3 sessions to expiry, where a 100-point ladder sat entirely "
+             "inside the priced move (its 'Good' bucket reached 0.5-1.0x it). Chosen once from "
+             f"the session's first straddle, so the buckets never change mid-session. Now: "
+             f"{awhy}.")
+    step = step if step in gaps else "auto"
+    step = agap if step == "auto" else None if step == "listed" else step
     n_side = g2.select_slider(
         "Strikes each side of ATM", options=[4, 6, 8, 10, 12, 15, 20], value=BAND,
         key=f"if_nside_{code}",
@@ -1873,6 +2189,8 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
                    "official figure.")
     st.subheader(f"The {len(strikes)} strikes — calls left, puts right")
     tab = ladder(latest, first, strikes, mode, atm_now, ivbase)
+    center = grid_atm(ref, step)
+    tab["Bucket"] = tab["Strike"].map(bucket_map(strikes, center))
     _ladder_view(st, tab, latest, mode)
     rs = reconcile_summary(code)
     if rs and rs.get("sign") is not None:
@@ -1889,6 +2207,7 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
                    "appears here once a full day is logged.")
 
     df = frame(rows)
+    _bucket_section(st, code, latest, first, df, strikes, center, lot, h.get("move_pct"))
     st.subheader(f"Calls vs puts in these {len(strikes)} strikes through the session")
     base = st.segmented_control(
         "Count from", ["since yesterday's close", "since this morning's first reading"],

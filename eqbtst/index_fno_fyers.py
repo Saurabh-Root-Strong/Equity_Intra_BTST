@@ -90,7 +90,9 @@ def convert_day(day: dt.date, src: Path = TRADEBOT_LIVE) -> dict:
             x = g[g["t"] == t]
             ce, pe = {}, {}
             for r in x.itertuples():
-                v = (r.ltp if r.ltp > 0 else None, r.ltpch, r.oi / lot, r.oich / lot,
+                # oich is measured against Fyers' rounded 09:14 figure (not a whole lot):
+                # rounding to whole contracts costs < 1 contract per strike
+                v = (r.ltp if r.ltp > 0 else None, r.ltpch, r.oi / lot, float(round(r.oich / lot)),
                      r.volume / lot, r.iv if r.iv > 0 else None, None, None)
                 (ce if r.side == "CE" else pe)[float(r.strike)] = v
             both = sorted(set(ce) & set(pe))

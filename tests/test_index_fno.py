@@ -733,9 +733,15 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
     assert not at.exception
     at.select_slider(key="if_nside_NIFTY").set_value(20).run()
     assert not at.exception and not at.error
-    for gap in ("listed", 50, 100):
+    for gap in ("listed", 50, 100, 200, "auto"):
         at.segmented_control(key="if_step_NIFTY").set_value(gap).run()
         assert not at.exception and not at.error, gap
+    assert any("Best / Better / Good" in x.value for x in at.subheader)
+    for m in ("Open interest", "Volume per 5 min", "OI change"):
+        at.segmented_control(key="if_bmetric_NIFTY").set_value(m).run()
+        assert not at.exception and not at.error, m
+    at.segmented_control(key="if_bbase_NIFTY").set_value("since this morning's first reading").run()
+    assert not at.exception and not at.error
     # past session
     at.selectbox(key="if_day_NIFTY").set_value(dt.date(2026, 11, 5)).run()
     assert not at.exception and not at.error
@@ -756,3 +762,83 @@ def test_no_real_poller_from_tests_or_a_bare_import():
         encoding="utf-8")
     i = src.index("if st.runtime.exists():")
     assert i < src.index("index_mgmt.ensure_poller()") and i < src.index("index_fno.ensure_poller()")
+
+
+# ── strike buckets Best / Better / Good (user, 7 Nov 2026) ─────────────────────────────
+def test_bucket_map_6_4_6_around_atm():
+    ks = [float(k) for k in range(24200, 25801, 100)]          # 17 strikes, centre 25,000
+    b = f.bucket_map(ks, 25000.0)
+    best = sorted(k for k, v in b.items() if v == "Best")
+    better = sorted(k for k, v in b.items() if v == "Better")
+    good = sorted(k for k, v in b.items() if v == "Good")
+    assert best == [float(k) for k in range(24700, 25301, 100)]  # ATM + 3 either side
+    assert better == [24500.0, 24600.0, 25400.0, 25500.0]
+    assert good == [24200.0, 24300.0, 24400.0, 25600.0, 25700.0, 25800.0]
+    # narrower ladder: no Good; wider: everything past step 5 is Good
+    assert set(f.bucket_map(ks[4:13], 25000.0).values()) == {"Best", "Better"}
+    wide = [float(k) for k in range(23000, 27001, 100)]
+    assert f.bucket_map(wide, 25000.0)[23000.0] == "Good"
+    assert f.bucket_map([], 25000.0) == {}
+
+
+def test_bucket_table_and_series_add_up():
+    rows = _session(20)
+    df = f.frame(rows)
+    last = rows[-1]
+    ks = f.window(f.grid([k[0] for k in last["k"]], 100), f.grid_atm(last, 100), 8)
+    bmap = f.bucket_map(ks, f.grid_atm(last, 100))
+    bt = f.bucket_table(last, rows[0], bmap, 65)
+    ce, pe = f.row_sides(last)
+    assert bt["Call OI"].sum() == pytest.approx(sum(ce[k]["oi"] for k in ks))
+    assert bt["Put ΔOI"].sum() == pytest.approx(sum(pe[k]["doi"] for k in ks))
+    best = bt.set_index("Bucket").loc["Best"]
+    assert best["PCR"] == pytest.approx(best["Put OI"] / best["Call OI"])
+    assert list(bt["Bucket"]) == ["Best", "Better", "Good"]
+    # the bucket lines add up to the all-strikes line at every reading
+    bs = f.bucket_series(df, bmap, 65)
+    whole = f.session_series(df, rows, ks, 65)
+    tot = bs.groupby("t")[["calls", "puts"]].sum()
+    assert tot["calls"].to_numpy() == pytest.approx(whole["calls"].to_numpy())
+    assert tot["puts"].to_numpy() == pytest.approx(whole["puts"].to_numpy())
+
+
+def test_lean_words():
+    assert f._lean(100, 300) == "🟢 put side heavier"
+    assert f._lean(300, 100) == "🔴 call side heavier"
+    assert f._lean(100, 105) == "⚪ balanced"
+    assert f._lean(None, 5) == "—" and f._lean(0, 0) == "—"
+
+
+def test_bucket_table_rupees_equal_the_lines_last_point():
+    """Audit 7 Nov: the table used the live index level, the lines the first reading's, so on
+    5 Nov Nifty Best said -78,435 Cr in the table and -77,744 Cr at the line's end."""
+    rows = _session(20, drift=40.0)                       # the index moves +760 pts
+    df = f.frame(rows)
+    last = rows[-1]
+    ks = f.window(f.grid([k[0] for k in last["k"]], 100), f.grid_atm(last, 100), 8)
+    bmap = f.bucket_map(ks, f.grid_atm(last, 100))
+    bt = f.bucket_table(last, rows[0], bmap, 65).set_index("Bucket")
+    bs = f.bucket_series(df, bmap, 65)
+    end = bs[bs["t"] == bs["t"].max()].set_index("bucket")["calls − puts"]
+    for b in end.index:
+        assert bt.loc[b, "Calls − puts ₹ Cr"] == pytest.approx(end[b])
+
+
+def test_auto_gap_reaches_the_priced_move():
+    """100 unless 8 x 100 falls short of the ATM straddle's move; then 200. Decided from the
+    first COMPUTABLE straddle; 100 when none is."""
+    def row(u, straddle, traded=True):
+        k = []
+        for K in range(int(u) - 2000, int(u) + 2001, 100):
+            px = straddle / 2 if K == round(u / 100) * 100 else 10.0
+            vol = 5.0 if traded else 0.0
+            k.append([float(K), px, 0, 100, 1, vol, 15, None, None, px, 0, 100, 1, vol, 15, None, None])
+        return {"t": "2026-11-05T09:20:00", "u": u, "a": round(u / 100) * 100, "k": k}
+    assert f.auto_gap([row(25000.0, 250.0)])[0] == 100                 # Nifty: ±1.0%
+    assert f.auto_gap([row(58000.0, 1450.0)])[0] == 200                # Bank monthly: ±2.5%
+    assert f.auto_gap([row(58000.0, 600.0)])[0] == 100                 # Bank near expiry
+    assert f.auto_gap([row(58000.0, 9000.0)])[0] == 200                # beyond: widest allowed
+    assert f.auto_gap([row(58000.0, 1450.0, traded=False)]) [0] == 100  # untraded: default
+    g, em, _ = f.auto_gap([row(58000.0, 1450.0, False), row(58000.0, 1450.0)])
+    assert g == 200 and em == pytest.approx(2.5)                       # first computable
+    assert f.auto_gap([], None)[0] == 100
