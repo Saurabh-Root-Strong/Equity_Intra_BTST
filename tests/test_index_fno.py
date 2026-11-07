@@ -739,3 +739,20 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
     # past session
     at.selectbox(key="if_day_NIFTY").set_value(dt.date(2026, 11, 5)).run()
     assert not at.exception and not at.error
+
+
+def test_no_real_poller_from_tests_or_a_bare_import():
+    """7 Nov 2026: test_core imports eqbtst.dashboard for a helper, and that import started
+    BOTH real pollers -- NSE calls from a test run, the live writer locks taken from the
+    running board, and a sweep thread that made test_index_mgmt flaky."""
+    import pathlib
+    import threading
+    before = {t.name for t in threading.enumerate()}
+    f.ensure_poller()
+    f.im.ensure_poller()
+    started = {t.name for t in threading.enumerate()} - before
+    assert not {"eqbtst-index-fno", "eqbtst-index-mgmt"} & started
+    src = (pathlib.Path(__file__).parent.parent / "eqbtst" / "dashboard.py").read_text(
+        encoding="utf-8")
+    i = src.index("if st.runtime.exists():")
+    assert i < src.index("index_mgmt.ensure_poller()") and i < src.index("index_fno.ensure_poller()")

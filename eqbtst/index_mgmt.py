@@ -2913,6 +2913,8 @@ def _init_heal() -> None:
 def ensure_poller() -> None:
     """Start the single background poller. A Streamlit hot-reload re-imports this module;
     the generation stamp on `sys` makes the previous thread exit instead of doubling up."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return                           # never poll NSE or take the live lock from a test
     with _LOCK:
         t = getattr(sys, "_eqbtst_index_mgmt_thread", None)
         if t is not None and t.is_alive() and getattr(t, "_owner", None) is _S:

@@ -817,6 +817,8 @@ def _loop(gen: float) -> None:
 
 def ensure_poller() -> None:
     """Start the single background capture thread (idempotent; a hot-reload replaces it)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return                           # never poll NSE or take the live lock from a test
     with _LOCK:
         t = getattr(sys, "_eqbtst_index_fno_thread", None)
         if t is not None and t.is_alive() and getattr(t, "_owner", None) is _S:

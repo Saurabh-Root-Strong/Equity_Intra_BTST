@@ -310,14 +310,19 @@ st.sidebar.markdown(
 # Index Management capture starts with the board, not with the page: in market hours it logs
 # all four indices from NSE (zero Fyers calls) so the session trend exists from the open even
 # if that lane is never clicked. Returns at once when already running; never raises.
-try:
-    index_mgmt.ensure_poller()
-except Exception:                                            # noqa: BLE001
-    pass
-try:                                 # index option chains: same NSE feed, its own writer lock
-    index_fno.ensure_poller()
-except Exception:                                            # noqa: BLE001
-    pass
+# Only inside a real Streamlit run: tests import this module for its helpers (test_core does
+# `from eqbtst import dashboard`), and an import used to start BOTH pollers for real -- NSE calls
+# from a test run, the live writer locks taken from the running board, and a sweep thread
+# racing test_index_mgmt (7 Nov 2026).
+if st.runtime.exists():
+    try:
+        index_mgmt.ensure_poller()
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:                             # index option chains: same NSE feed, its own writer lock
+        index_fno.ensure_poller()
+    except Exception:                                        # noqa: BLE001
+        pass
 date = st.sidebar.date_input("As-of close", value=last.date(),
                              max_value=last.date())
 if st.sidebar.button("↻ refresh"):
