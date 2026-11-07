@@ -80,6 +80,15 @@ VIEW_TTL = 600.0
 STALE_AFTER = 240.0
 HEAL_AFTER = 300.0
 MIN_STRIKES = 2 * BAND + 1
+# STRIKE GAP. NSE lists Nifty / Fin Nifty every 50 points and Midcap Select every 25 near the
+# money, but positions sit on the round hundreds. Measured on 130 sessions (May-Nov 2026,
+# nearest expiry, strikes within 4% of the future, bhavcopy): 100-point strikes held 70% of
+# Nifty OI on half the strikes (median OI per strike 3.71M vs 1.23M on the 50s in between),
+# 81% on Fin Nifty (5,745 vs 1,380), 80% on Midcap (226k vs 16k — the 50s hold 90%). Bank
+# Nifty is listed every 100 already. So the page shows a 100-point grid by default; the
+# listed grid is one click away.
+GRID_DEFAULT = {"NIFTY": 100, "BANKNIFTY": 100, "FINNIFTY": 100, "MIDCPNIFTY": 100}
+LOG_GRID, LOG_GRID_N = 100, 20   # also log every 100-pt strike within 20 steps of ATM
 # Used ONLY when no bhavcopy row can prove the lot (a brand-new expiry with no other expiry
 # proven today); the page then says "assumed". Nov 2026 values.
 LOT_FALLBACK = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120}
@@ -208,10 +217,36 @@ def window(strikes, atm: float, n: int = BAND) -> list:
     return ks[max(0, i - n): i + n + 1]
 
 
+def on_grid(k: float, step: float | None) -> bool:
+    return not step or abs(k / step - round(k / step)) < 1e-9
+
+
+def grid(strikes, step: float | None) -> list:
+    """The listed strikes on a `step`-point grid (all of them when step is None, or when the
+    grid would leave fewer than 3 — never an empty ladder)."""
+    ks = sorted(strikes)
+    g = [k for k in ks if on_grid(k, step)]
+    return g if step and len(g) >= 3 else ks
+
+
+def listed_step(strikes, atm) -> float | None:
+    """NSE's strike spacing at the money (Nifty 50, Bank Nifty 100, Midcap 25)."""
+    ks = sorted(strikes)
+    if atm not in ks or len(ks) < 2:
+        return None
+    i = ks.index(atm)
+    gaps = [b - a for a, b in zip(ks[max(0, i - 3):i + 3], ks[max(0, i - 3) + 1:i + 4])]
+    return float(min(gaps)) if gaps else None
+
+
 def compact(chain: dict, keep: int = KEEP) -> dict:
-    """A chain as one log row: ATM and `keep` strikes either side, both sides inline."""
+    """A chain as one log row, both sides inline: ATM and `keep` LISTED strikes either side,
+    plus every 100-point strike within LOG_GRID_N steps (so a 100-point ladder up to 20 a side
+    has its history even where NSE lists every 25 or 50)."""
     atm = pick_atm(chain["strikes"], chain["spot"])
-    ks = window(chain["strikes"], atm, keep)
+    reach = (LOG_GRID_N + 1) * LOG_GRID
+    ks = sorted(set(window(chain["strikes"], atm, keep))
+                | {k for k in chain["strikes"] if on_grid(k, LOG_GRID) and abs(k - atm) <= reach})
     none = [None] * NF
     return {"t": im._iso(chain["ts"]), "f": im._iso(chain["fetched"]),
             "e": chain["expiry"].isoformat(), "u": chain["spot"], "a": atm,
@@ -222,6 +257,7 @@ def compact(chain: dict, keep: int = KEEP) -> dict:
 
 PARITY_NEAR = 3          # strikes either side of ATM whose call - put sets the forward
 MID_MAX_SPREAD = 0.05    # use the bid/ask mid when the spread is within 5% of it (or 2 ticks)
+ITM_IV_GAP = 5.0         # vol points: an ITM-side IV further than this from the OTM side is stale
 
 
 def _px(d: dict | None):
@@ -231,6 +267,11 @@ def _px(d: dict | None):
     b, a, l = d.get("bid"), d.get("ask"), d.get("ltp")
     if b and a and a >= b and (a - b) <= max(0.10, MID_MAX_SPREAD * (a + b) / 2):
         return (a + b) / 2
+    # A last price only counts once the contract has TRADED TODAY. 5 Nov 2026 (a +4% gap),
+    # Fin Nifty 26100 call at 09:15: volume 0, 'last' Rs 1,345 with the index at 26,140 —
+    # a price from an earlier session; its IV read 67% until the first trade at 09:28 (14%).
+    if (d.get("vol") or 0) <= 0:
+        return None
     return l
 
 
@@ -277,6 +318,17 @@ def model_iv(row: dict, expiry: dt.date, t: dt.datetime | None) -> dict:
     n = len(K)
     ivc = im.implied_vol(C, np.full(n, F), K, np.full(n, T), np.ones(n, bool)) * 100
     ivp = im.implied_vol(P, np.full(n, F), K, np.full(n, T), np.zeros(n, bool)) * 100
+    # The IN-THE-MONEY side trades rarely and its last price goes stale (5 Nov 2026: Fin Nifty
+    # 27100 put traded once all day, IV 26.8 vs ~14 across the chain; Bank Nifty 57600 put
+    # read 30.9 at the open while in the money). Parity says call and put IV at one strike
+    # are equal, so the ITM side is kept only when the OTM side exists and agrees within
+    # ITM_IV_GAP; the OTM side (the liquid one, and the smile's) is always kept.
+    itm_call = K < F
+    otm = np.where(itm_call, ivp, ivc)
+    itm = np.where(itm_call, ivc, ivp)
+    ok = np.isfinite(otm) & np.isfinite(itm) & (np.abs(itm - otm) <= ITM_IV_GAP)
+    ivc = np.where(itm_call & ~ok, np.nan, ivc)
+    ivp = np.where(~itm_call & ~ok, np.nan, ivp)
     rd = lambda x: None if not np.isfinite(x) else round(float(x), 2)  # noqa: E731
     return {"F": round(F, 2), "v": [[k, rd(c), rd(p)] for k, c, p in zip(allk, ivc, ivp)]}
 
@@ -440,7 +492,9 @@ def poll_chain(code: str, expiry: dt.date, client=None) -> bool:
     row = compact(ch)
     ts = ch["ts"] or ch["fetched"]
     try:
-        row.update(model_iv(row, expiry, ts))
+        # {"v": []} when the model found no forward: the row still counts as MODEL-sourced,
+        # so its IV is blank rather than silently NSE's (stale at a gap open)
+        row.update(model_iv(row, expiry, ts) or {"v": []})
     except Exception as exc:                                 # noqa: BLE001
         _log_error("iv", f"{code} {key}: {type(exc).__name__}: {exc}")
     fp = _fp(row)
@@ -911,7 +965,7 @@ def frame(rows: list) -> pd.DataFrame:
             continue
         u, a = r.get("u"), r.get("a")
         mv = {float(x[0]): (x[1], x[2]) for x in r.get("v") or [] if len(x) >= 3}
-        has = bool(mv)
+        has = "v" in r
         for k in r.get("k") or []:
             if len(k) < 1 + 2 * NF:
                 continue
@@ -936,7 +990,7 @@ def row_sides(row: dict) -> tuple:
     when both rows share the source (see iv_source)."""
     ce, pe = {}, {}
     mv = {float(x[0]): (x[1], x[2]) for x in row.get("v") or [] if len(x) >= 3}
-    has = bool(mv)
+    has = "v" in row
     for k in row.get("k") or []:
         if len(k) < 1 + 2 * NF:
             continue
@@ -953,7 +1007,40 @@ def row_sides(row: dict) -> tuple:
 
 
 def iv_source(row: dict | None) -> str:
-    return "model" if row and row.get("v") else "nse"
+    return "model" if row and "v" in row else "nse"
+
+
+BASE_SCAN = 150          # readings scanned for each strike's first valid IV (~75-150 min)
+
+
+def baseline_iv(rows: list, strikes=None, step: float | None = None) -> dict:
+    """{"CE": {K: iv}, "PE": {K: iv}, "atm": iv} — each strike's FIRST reading of the day that
+    has an IV, not simply the day's first reading. At a gap open the first readings carry no
+    IV on illiquid strikes (no trade yet: 5 Nov 2026, Fin Nifty ATM untraded until 09:28), so
+    'change since the first reading' would be blank all day. Model and NSE-sourced rows are
+    never mixed: only rows of the same source as the LAST row count."""
+    out = {"CE": {}, "PE": {}, "atm": None}
+    if not rows:
+        return out
+    src = iv_source(rows[-1])
+    want = set(strikes) if strikes is not None else None
+    for r in rows[:BASE_SCAN]:
+        if iv_source(r) != src:
+            continue
+        ce, pe = row_sides(r)
+        for side, d in (("CE", ce), ("PE", pe)):
+            for K, x in d.items():
+                if x.get("IV") and K not in out[side] and (want is None or K in want):
+                    out[side][K] = x["IV"]
+        if out["atm"] is None:
+            a = grid_atm(r, step)
+            ivs = [x for x in ((ce.get(a) or {}).get("IV"), (pe.get(a) or {}).get("IV")) if x]
+            if ivs:
+                out["atm"] = float(np.mean(ivs))
+        if want is not None and out["atm"] is not None and all(
+                K in out["CE"] and K in out["PE"] for K in want):
+            break
+    return out
 
 
 def premium_read(side: str, chg, doi) -> str | None:
@@ -994,12 +1081,20 @@ def lean(side: str, word: str | None) -> str:
     return "🟢" if word in _BULL["PE"] else "🔴"
 
 
-def ladder(latest: dict, first: dict | None, strikes: list, mode: str = "iv") -> pd.DataFrame:
-    """The 17-strike table: calls left, strike, puts right."""
+def ladder(latest: dict, first: dict | None, strikes: list, mode: str = "iv",
+           atm=None, base: dict | None = None) -> pd.DataFrame:
+    """The 17-strike table: calls left, strike, puts right. Numeric columns are float (a
+    missing value is NaN, never None — None printed as the word 'None' on the page).
+    `base` = baseline_iv(): each strike's first valid IV; without it, the first row's."""
     ce, pe = row_sides(latest)
     ce0, pe0 = row_sides(first) if first else ({}, {})
     same_src = first is not None and iv_source(first) == iv_source(latest)
-    atm = latest.get("a")
+    ivb = base
+    if ivb is None and same_src:
+        ivb = {"CE": {k: v["IV"] for k, v in ce0.items() if v.get("IV")},
+               "PE": {k: v["IV"] for k, v in pe0.items() if v.get("IV")}}
+    ivb = ivb or {"CE": {}, "PE": {}}
+    atm = latest.get("a") if atm is None else atm
     out = []
     for K in strikes:
         rec = {"Strike": K, "atm": K == atm}
@@ -1008,13 +1103,14 @@ def ladder(latest: dict, first: dict | None, strikes: list, mode: str = "iv") ->
             b = base.get(K) or {}
             ltp, chg = d.get("ltp"), d.get("chg")
             prev = (ltp - chg) if ltp is not None and chg is not None else None
-            div = (d["IV"] - b["IV"]) if same_src and d.get("IV") and b.get("IV") else None
+            b_iv = ivb[side].get(K)
+            div = (d["IV"] - b_iv) if d.get("IV") and b_iv else None
             d_oi = (d["oi"] - b["oi"]) if d.get("oi") is not None and b.get("oi") is not None \
                 else None
             if mode == "iv":
                 w = iv_read(d_oi, div, d.get("oi"))
-            else:
-                w = premium_read(side, chg, d.get("doi"))
+            else:                    # no trade today = the premium change is not today's
+                w = premium_read(side, chg, d.get("doi")) if (d.get("vol") or 0) > 0 else None
             rec.update({
                 f"{side} read": (f"{lean(side, w)} {w}" if w else "—"),
                 f"{side} ΔOI": d.get("doi"), f"{side} OI": d.get("oi"),
@@ -1023,7 +1119,11 @@ def ladder(latest: dict, first: dict | None, strikes: list, mode: str = "iv") ->
                 f"{side} ΔIV": div, f"{side} LTP": ltp,
                 f"{side} Chg %": (chg / prev * 100) if prev and prev > 0 else None})
         out.append(rec)
-    return pd.DataFrame(out)
+    df = pd.DataFrame(out)
+    for c in df.columns:
+        if c not in ("Strike", "atm") and not c.endswith("read"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    return df
 
 
 def walls(latest: dict, strikes: list | None = None) -> dict:
@@ -1036,10 +1136,21 @@ def walls(latest: dict, strikes: list | None = None) -> dict:
                 ce_add=top(ce, "doi"), pe_add=top(pe, "doi"))
 
 
-def headline(latest: dict, first: dict | None, strikes: list) -> dict:
-    """Header numbers for the selected expiry."""
+def grid_atm(row: dict | None, step: float | None):
+    """ATM on the chosen strike grid: the grid strike nearest the index, from strikes that
+    have both a call and a put in this row. step None = NSE's listed ATM (row['a'])."""
+    if not row:
+        return None
+    if not step:
+        return row.get("a")
+    ce, pe = row_sides(row)
+    return pick_atm(grid(set(ce) & set(pe), step), row.get("u"))
+
+
+def headline(latest: dict, first: dict | None, strikes: list, step: float | None = None) -> dict:
+    """Header numbers for the selected expiry (ATM on the chosen strike grid)."""
     ce, pe = row_sides(latest)
-    atm, u = latest.get("a"), latest.get("u")
+    atm, u = grid_atm(latest, step), latest.get("u")
     c, p = ce.get(atm) or {}, pe.get(atm) or {}
     cp, pp = _px(c), _px(p)
     straddle = (cp + pp) if cp and pp else None
@@ -1050,7 +1161,7 @@ def headline(latest: dict, first: dict | None, strikes: list) -> dict:
     atm_iv0 = None
     if first and iv_source(first) == iv_source(latest):
         c0, p0 = row_sides(first)
-        a0 = first.get("a")
+        a0 = grid_atm(first, step)
         iv0 = [x for x in ((c0.get(a0) or {}).get("IV"), (p0.get(a0) or {}).get("IV")) if x]
         atm_iv0 = float(np.mean(iv0)) if iv0 else None
     band_ce = sum((ce.get(k) or {}).get("oi") or 0 for k in strikes)
@@ -1075,7 +1186,7 @@ SERIES_QUORUM = 0.9      # share of the window's strikes a reading needs to be p
 
 
 def session_series(df: pd.DataFrame, rows: list, strikes: list, lot: int | None,
-                   base: str = "yday") -> pd.DataFrame:
+                   base: str = "yday", step: float | None = None) -> pd.DataFrame:
     """Per reading, over the SAME strikes all session (the window on screen), so a line moves
     only when positions move — not when the ATM drifts and different strikes enter the sum.
 
@@ -1115,8 +1226,19 @@ def session_series(df: pd.DataFrame, rows: list, strikes: list, lot: int | None,
     out["pcr_all"] = [((tc[t][2] / tc[t][0]) if t in tc and tc[t][0] and tc[t][2] is not None
                        else np.nan) for t in out.index]
     out["max pain"] = [meta[t].get("mp") if t in meta else np.nan for t in out.index]
-    # ATM straddle and ATM IV at EACH reading's own ATM (what a desk calls "the ATM")
-    a = df[df["K"] == df["a"]]
+    # ATM straddle and ATM IV at EACH reading's own ATM (what a desk calls "the ATM"), on the
+    # chosen strike grid
+    if step:
+        G = np.array(sorted({k for k in df["K"].unique() if on_grid(k, step)}), float)
+        if len(G):
+            uu = df["u"].to_numpy(float)
+            idx = np.abs(G[None, :] - uu[:, None]).argmin(axis=1)
+            ga = G[idx]
+            a = df[df["K"].to_numpy(float) == ga]
+        else:
+            a = df[df["K"] == df["a"]]
+    else:
+        a = df[df["K"] == df["a"]]
     a = a.assign(px=[(bb + aa) / 2 if (bb and aa and aa >= bb and
                                         (aa - bb) <= max(0.10, MID_MAX_SPREAD * (aa + bb) / 2))
                      else l for bb, aa, l in zip(a["bid"].fillna(0), a["ask"].fillna(0),
@@ -1319,8 +1441,9 @@ best mildly contrarian. Use it to see who is positioned where, not which way the
 """
 
 TIP = {
-    "Strike": "Strike price. ★ marks the ATM (At The Money) strike — the listed strike "
-              "nearest the index right now. Example: Nifty 24,938 → ATM 24,950.",
+    "Strike": "Strike price. ★ marks the ATM (At The Money) strike — the strike on the chosen "
+              "strike gap nearest the index right now. Example: Nifty 24,938 → ATM 24,900 on "
+              "the 100-point gap, 24,950 on NSE's listed 50-point gap.",
     "read": "One-word reading of this strike (see 'Read' switch above the table). Example: "
             "a put with 'writers adding' = more puts sold at a cheaper IV since the morning "
             "— someone is willing to be long the index below that strike. 🟢 bullish reading "
@@ -1494,7 +1617,8 @@ def _heatmap(st, blk: pd.DataFrame, strikes: list, atm, minutes: int):
     st.altair_chart(ch)
 
 
-def _profile(st, latest: dict, strikes: list):
+def _profile(st, latest: dict, strikes: list, atm=None):
+    atm = latest.get("a") if atm is None else atm
     import altair as alt
     ce, pe = row_sides(latest)
     recs = []
@@ -1509,8 +1633,8 @@ def _profile(st, latest: dict, strikes: list):
     if not recs:
         return
     df = pd.DataFrame(recs)
-    df["strike"] = [f"{k:,.0f}" + (" ★" if k == latest.get("a") else "") for k in df["K"]]
-    order = [f"{k:,.0f}" + (" ★" if k == latest.get("a") else "") for k in
+    df["strike"] = [f"{k:,.0f}" + (" ★" if k == atm else "") for k in df["K"]]
+    order = [f"{k:,.0f}" + (" ★" if k == atm else "") for k in
              sorted(strikes, reverse=True)]
     ch = (alt.Chart(df).mark_bar()
           .encode(y=alt.Y("strike:N", sort=order, title=None),
@@ -1543,14 +1667,15 @@ def smile_points(row: dict | None, strikes: list) -> dict:
     return out
 
 
-def _smile(st, latest: dict, first: dict | None, strikes: list):
-    recs = []
-    pairs = [("now", latest)]
-    if first is not None and iv_source(first) == iv_source(latest):
-        pairs.append(("first reading", first))
-    for lbl, row in pairs:
-        for K, v in smile_points(row, strikes).items():
-            recs.append(dict(K=K, series=lbl, v=v))
+def _smile(st, latest: dict, first: dict | None, strikes: list, atm=None, base=None):
+    recs = [dict(K=K, series="now", v=v) for K, v in smile_points(latest, strikes).items()]
+    if base is not None:             # each strike's first valid IV today, OTM side
+        F = latest.get("F") or latest.get("u")
+        for K in strikes:
+            otm, itm = ("PE", "CE") if F and K < F else ("CE", "PE")
+            v = base[otm].get(K) or base[itm].get(K)
+            if v:
+                recs.append(dict(K=K, series="first reading", v=v))
     if not recs:
         st.caption("No IV for these strikes.")
         return
@@ -1571,8 +1696,9 @@ def _smile(st, latest: dict, first: dict | None, strikes: list):
                   tooltip=["series:N", alt.Tooltip("K:Q", format=",.0f"),
                            alt.Tooltip("v:Q", title="IV %", format=".2f")])
           .properties(height=260))
-    if latest.get("a"):
-        ch = ch + alt.Chart(pd.DataFrame({"x": [latest["a"]]})).mark_rule(
+    atm = latest.get("a") if atm is None else atm
+    if atm:
+        ch = ch + alt.Chart(pd.DataFrame({"x": [atm]})).mark_rule(
             color="#f5b041", strokeDash=[2, 2]).encode(x="x:Q")
     st.altair_chart(ch, width="stretch")
 
@@ -1630,6 +1756,14 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     fut_rows = fut_log(code, day)
     fut = (lat.get("fut") if live else None) or (fut_rows[-1] if fut_rows else None)
     _freshness(st, latest, fut, rows, live)
+    if rows and rows[0].get("src") == "fyers":
+        st.warning(
+            "🧪 **Test data — Tradebot's Fyers capture, not NSE's feed.** Imported with "
+            "`python -m eqbtst.index_fno_fyers` so the page can be tried on a real session "
+            f"({rows[0]['t'][11:16]}–{rows[-1]['t'][11:16]}). Differences: 51 strikes per "
+            "reading (max pain and whole-chain PCR cover those only), no bid/ask (IV from last "
+            "prices), no index futures, gaps where the VM missed readings. Remove with "
+            "`python -m eqbtst.index_fno_fyers remove`. Live capture is unaffected.")
     if not rows:
         st.caption("Nothing logged for this session yet (the log runs 09:15-15:30 on trading "
                    "days). The table shows NSE's latest chain; the 'since first reading' "
@@ -1646,21 +1780,45 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
         help="IV read: OI change vs IV change since the first reading. Premium read: premium "
              "change vs OI change since yesterday — what most sites print.") or "IV read"
     mode = "iv" if mode == "IV read" else "premium"
-    n_side = st.select_slider(
+    g1, g2 = st.columns([1.3, 2.3])
+    lce, lpe = row_sides(latest)
+    lstep = listed_step(set(lce) & set(lpe), latest.get("a"))
+    gaps = ["listed"] + [s for s in (50, 100) if not lstep or s > lstep]
+    dflt = GRID_DEFAULT.get(code) if GRID_DEFAULT.get(code) in gaps else "listed"
+    step = g1.segmented_control(
+        "Strike gap", gaps, default=dflt, key=f"if_step_{code}",
+        format_func=lambda s: (f"listed ({lstep:g})" if lstep else "listed") if s == "listed"
+        else f"{s:g} pts",
+        help="Which strikes make the ladder. Positions sit on the round hundreds: on 130 "
+             "sessions 100-point strikes held 70% of Nifty's OI on half the strikes (median "
+             "OI per strike 3.7M vs 1.2M on the 50s in between), 81% on Fin Nifty, 80% on "
+             "Midcap Select (its 25s are thin). 'listed' = every strike NSE lists. Every "
+             "total on the page (PCR, calls vs puts, heatmap) covers the strikes shown.")
+    step = step if step in gaps else dflt
+    step = None if step == "listed" else step
+    n_side = g2.select_slider(
         "Strikes each side of ATM", options=[4, 6, 8, 10, 12, 15, 20], value=BAND,
         key=f"if_nside_{code}",
-        help=f"Default {BAND} (17 strikes). {KEEP} either side are logged, so a wider window "
-             "has full history too. Midcap Select lists 25-point strikes: 8 either side is "
-             "only about ±1.4%, narrower than its straddle prices.")
+        help=f"Default {BAND} (17 strikes). The log holds {KEEP} listed strikes and every "
+             f"100-point strike within {LOG_GRID_N} steps either side, so a wide ladder has "
+             "its history too.")
     ref = first if (anchor.startswith("around first") and first) else latest
-    all_ks = sorted({float(k[0]) for k in (ref.get("k") or [])})
-    strikes = window(all_ks, ref.get("a"), n_side)
+    rce, rpe = row_sides(ref)
+    all_ks = grid(set(rce) & set(rpe), step)
+    strikes = window(all_ks, grid_atm(ref, step), n_side)
+    atm_now = grid_atm(latest, step)
     lot, lot_how = _lot(code, expiry, latest, day)
     with c3:
         st.caption(f"Lot **{lot or '—'}** ({lot_how or 'unknown'}). ₹ figures = contracts × "
                    "lot × index level (exposure, not premium).")
 
-    h = headline(latest, first, strikes)
+    h = headline(latest, first, strikes, step)
+    # IV baselines: each strike's first VALID IV today (a gap open leaves the first readings
+    # without one), only when the log and the latest read share an IV source
+    ivbase = (baseline_iv(rows, strikes, step)
+              if rows and iv_source(rows[-1]) == iv_source(latest) else None)
+    if ivbase is not None:
+        h["atm_iv0"] = ivbase["atm"]
     m = st.columns(7)
     m[0].metric(f"{DISPLAY[code]}", _fmt_n(h["spot"], "{:,.2f}"),
                 help="Index level in the same NSE response as the chain.")
@@ -1712,7 +1870,7 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
                    "does not have that problem. Open interest after 15:40 is NSE's corrected, "
                    "official figure.")
     st.subheader(f"The {len(strikes)} strikes — calls left, puts right")
-    tab = ladder(latest, first, strikes, mode)
+    tab = ladder(latest, first, strikes, mode, atm_now, ivbase)
     _ladder_view(st, tab, latest, mode)
     rs = reconcile_summary(code)
     if rs and rs.get("sign") is not None:
@@ -1733,7 +1891,8 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     base = st.segmented_control(
         "Count from", ["since yesterday's close", "since this morning's first reading"],
         default="since yesterday's close", key=f"if_base_{code}") or "since yesterday's close"
-    ss = session_series(df, rows, strikes, lot, "first" if base.startswith("since this") else "yday")
+    ss = session_series(df, rows, strikes, lot, "first" if base.startswith("since this") else "yday",
+                        step)
     if not ss.empty:
         unit = "₹ Cr" if lot else "contracts"
         _lines(st, ss[["spot"]].rename(columns={"spot": DISPLAY[code]}), "index", height=150,
@@ -1759,25 +1918,25 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     shared = k2.toggle("Same scale on every strike", value=True, key=f"if_shared_{code}",
                        help="On: panels compare with each other. Off: each panel zooms to its "
                             "own range (small strikes become readable, sizes no longer compare).")
-    _panels_chart(st, strike_panels(df, strikes, metric), strikes, latest.get("a"), metric,
+    _panels_chart(st, strike_panels(df, strikes, metric), strikes, atm_now, metric,
                   shared)
 
     st.subheader("Where positions were opened and closed — by block")
     mins = st.segmented_control("Block", [5, 15, 30], default=15, key=f"if_blk_{code}",
                                 format_func=lambda x: f"{x} min") or 15
-    _heatmap(st, oi_blocks(df, strikes, mins), strikes, latest.get("a"), mins)
+    _heatmap(st, oi_blocks(df, strikes, mins), strikes, atm_now, mins)
     st.caption("Each cell = contracts opened (blue) or closed (red) at that strike in that "
                "block. The first block counts from yesterday's close, so the opening rush is "
                "in it; each row sums to the strike's change at the last reading.")
 
     st.subheader("Open interest now")
-    _profile(st, latest, strikes)
+    _profile(st, latest, strikes, atm_now)
 
     st.subheader("Volatility")
     v1, v2 = st.columns(2)
     with v1:
         st.caption("IV across strikes — now vs the first reading (dashed)")
-        _smile(st, latest, first, strikes)
+        _smile(st, latest, first, strikes, atm_now, ivbase)
     with v2:
         if not ss.empty:
             st.caption("ATM IV and ATM straddle through the session")

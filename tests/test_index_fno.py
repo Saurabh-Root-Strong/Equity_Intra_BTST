@@ -127,9 +127,14 @@ def test_max_pain_known_answer():
 
 
 def test_compact_roundtrip():
-    ch = f.parse_chain(payload(), EXP)
+    ch = f.parse_chain(payload(lo=20000, hi=30000), EXP)
     row = f.compact(ch, keep=5)
-    assert row["a"] == 25050.0 and len(row["k"]) == 11
+    ks = [k[0] for k in row["k"]]
+    assert row["a"] == 25050.0
+    # 5 listed either side + every 100-pt strike within 21 steps (2,100 pts) of ATM
+    assert set(f.window(ch["strikes"], 25050.0, 5)) <= set(ks)
+    assert {float(k) for k in range(23000, 27101, 100)} <= set(ks)
+    assert 22900.0 not in ks and 24975.0 not in ks and 23050.0 not in ks
     ce, pe = f.row_sides(row)
     assert set(ce) == set(pe) and ce[25050.0]["oi"] == 1000.0
     json.dumps(row)                                      # serialisable
@@ -558,10 +563,134 @@ def test_rupee_lines_use_one_index_level():
     assert ss["calls"].dropna().nunique() == 1
 
 
+# ── strike gap (user, 6 Nov: Nifty OI sits on the hundreds) ─────────────────────────────
+def test_grid_and_listed_step():
+    ks = [float(k) for k in range(24000, 26001, 50)]
+    g = f.grid(ks, 100)
+    assert g[:3] == [24000.0, 24100.0, 24200.0] and len(g) == 21
+    assert f.grid(ks, None) == ks
+    assert f.grid([24050.0, 24150.0], 100) == [24050.0, 24150.0]     # never an empty ladder
+    assert f.listed_step(ks, 25000.0) == 50.0
+    mid = [float(k) for k in range(13500, 14501, 25)]
+    assert f.listed_step(mid, 14000.0) == 25.0
+    assert f.on_grid(25000.0, 100) and not f.on_grid(25050.0, 100) and f.on_grid(1.0, None)
+
+
+def test_ladder_and_headline_on_100_grid(monkeypatch):
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    row = f.compact(f.parse_chain(_b76_payload(spot=25030.0, F=25030.0), EXP))
+    row.update(f.model_iv(row, EXP, dt.datetime(2026, 11, 6, 10)))
+    ce, pe = f.row_sides(row)
+    assert row["a"] == 25050.0                            # NSE's listed ATM
+    atm = f.grid_atm(row, 100)
+    assert atm == 25000.0                                 # 30 from 25,000 vs 70 from 25,100
+    ks = f.window(f.grid(set(ce) & set(pe), 100), atm, 8)
+    assert ks[0] == 24200.0 and ks[-1] == 25800.0 and len(ks) == 17
+    assert all(k % 100 == 0 for k in ks)
+    tab = f.ladder(row, None, ks, "iv", atm)
+    assert tab.loc[tab["atm"], "Strike"].tolist() == [25000.0]
+    assert tab["CE ΔIV"].dtype == float                   # NaN, never the word 'None'
+    h = f.headline(row, None, ks, 100)
+    assert h["atm"] == 25000.0
+    assert h["straddle"] == pytest.approx(f._px(ce[25000.0]) + f._px(pe[25000.0]))
+
+
+def test_session_series_straddle_on_grid():
+    rows = _session(5)                                    # spot 25000..25020
+    df = f.frame(rows)
+    ks = f.window(f.grid([k[0] for k in rows[-1]["k"]], 100), 25000.0, 4)
+    ss = f.session_series(df, rows, ks, lot=65, step=100)
+    # payload premium = intrinsic + 50 (mid of a tight book): ATM 25,000 at every reading
+    exp = [100.0 + (25000 + 5 * i - 25000) for i in range(5)]
+    assert ss["straddle"].tolist() == pytest.approx(exp)
+
+
+# ── test-data findings (Fyers 5-6 Nov import): stale prices at a gap open ──────────────
+def test_untraded_contract_has_no_price():
+    assert f._px({"ltp": 1345.5, "vol": 0.0}) is None            # 5 Nov Fin 26100 CE 09:15
+    assert f._px({"ltp": 335.3, "vol": 66.0}) == 335.3
+    assert f._px({"ltp": 9.0, "vol": 0.0, "bid": 99.0, "ask": 101.0}) == 100.0  # tight book
+
+
+def test_model_row_without_forward_is_blank_not_nse(monkeypatch):
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    row = f.compact(f.parse_chain(_b76_payload(), EXP))
+    for k in row["k"]:
+        k[1 + 4] = 0.0                                   # no call traded, no book
+        k[1 + 6] = k[1 + 7] = None
+    m = f.model_iv(row, EXP, dt.datetime(2026, 11, 6, 9, 15))
+    assert m == {}
+    row.update(m or {"v": []})
+    ce, pe = f.row_sides(row)
+    assert f.iv_source(row) == "model"
+    assert all(v["IV"] is None for v in ce.values())     # never NSE's 14.0 instead
+
+
+def test_itm_side_iv_dropped_when_it_disagrees(monkeypatch):
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    j = _b76_payload(F=25000.0)
+    for r in j["records"]["data"]:
+        if r["strikePrice"] == 25300:                    # ITM put, stale: priced 40 rupees rich
+            r["PE"]["lastPrice"] += 150
+            r["PE"]["buyPrice1"] = r["PE"]["sellPrice1"] = 0
+    row = f.compact(f.parse_chain(j, EXP))
+    row.update(f.model_iv(row, EXP, dt.datetime(2026, 11, 6, 10)))
+    ce, pe = f.row_sides(row)
+    assert pe[25300.0]["IV"] is None and ce[25300.0]["IV"] == pytest.approx(18.0, abs=0.2)
+    assert pe[24700.0]["IV"] == pytest.approx(18.0, abs=0.2)     # OTM side always kept
+    assert ce[24700.0]["IV"] == pytest.approx(18.0, abs=0.2)     # consistent ITM kept
+
+
+def test_baseline_is_each_strikes_first_valid_iv():
+    def r(t, ivs):
+        k = [[K, 10, 1, 100, 1, 5, None, None, None, 10, 1, 100, 1, 5, None, None, None]
+             for K in (24900.0, 25000.0, 25100.0)]
+        return {"t": t, "u": 25000.0, "a": 25000.0, "k": k,
+                "v": [[K, ivs.get(K), ivs.get(K)] for K in (24900.0, 25000.0, 25100.0)]}
+    rows = [r("2026-11-05T09:15:00", {}), r("2026-11-05T09:20:00", {25000.0: 14.0}),
+            r("2026-11-05T09:28:00", {24900.0: 15.0, 25000.0: 13.0, 25100.0: 12.5})]
+    b = f.baseline_iv(rows, [24900.0, 25000.0, 25100.0])
+    assert b["CE"] == {25000.0: 14.0, 24900.0: 15.0, 25100.0: 12.5} and b["atm"] == 14.0
+    tab = f.ladder(rows[-1], rows[0], [24900.0, 25000.0, 25100.0], "iv", 25000.0, b)
+    assert tab.loc[tab.Strike == 25000.0, "CE ΔIV"].iloc[0] == pytest.approx(-1.0)
+
+
+def test_fyers_import_converts_units_and_tags(tmp_path, monkeypatch):
+    from eqbtst import index_fno_fyers as fy
+    monkeypatch.setattr(f, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(f, "_READ", {})
+    monkeypatch.setattr(f.im, "_trading_years", lambda t, e: 5 / 252)
+    monkeypatch.setattr(fy, "_nearest_expiry", lambda code, day: EXP)
+    monkeypatch.setattr(fy, "_official", lambda code, day, e: pd.DataFrame(
+        columns=["k", "s", "oi", "doi"]))
+    recs, cds = [], []
+    for i, ts in enumerate(pd.to_datetime(["2026-11-06 03:44:10", "2026-11-06 03:46:00",
+                                           "2026-11-06 03:47:00"], utc=True)):
+        for K in range(24000, 26001, 50):
+            for side in ("CE", "PE"):
+                recs.append(dict(ts=ts, symbol="NSE:NIFTY50-INDEX", strike=K, side=side,
+                                 ltp=100.0 + i, ltpch=1.0, oi=65 * (1000 + i), oich=65 * i,
+                                 volume=65 * (10 + i), delta=0.5, iv=15.0, expiry=0))
+        cds.append(dict(ts=ts, symbol="NSE:NIFTY50-INDEX", resolution="1sec", close=25010.0))
+    src = tmp_path / "src"
+    src.mkdir()
+    pd.DataFrame(recs).to_parquet(src / "2026-11-06_chain_snapshots.parquet")
+    pd.DataFrame(cds).to_parquet(src / "2026-11-06_candles.parquet")
+    res = fy.convert_day(dt.date(2026, 11, 6), src)
+    rows = res["rows"]["NIFTY"]
+    assert [r["t"][11:19] for r in rows] == ["09:16:00", "09:17:00"]   # 09:14 dropped, IST
+    ce, _ = f.row_sides(rows[0])
+    assert ce[25000.0]["oi"] == 1001 and ce[25000.0]["doi"] == 1 and ce[25000.0]["vol"] == 11
+    assert all(r["src"] == "fyers" and "v" in r for r in rows)
+    assert res["report"]["NIFTY"]["not_whole_lots"] == 0
+
+
 def test_no_fyers_calls():
     import inspect
     src = inspect.getsource(f)
-    assert "fyers" not in src.lower().replace("zero fyers", "").replace("fyers calls", "")
+    import re
+    # the page may SAY "Fyers" (the test-data banner); it must never import or call it
+    assert not re.search(r"import\s+.*\b(fyers\w*|live)\b|from\s+\.\s+import\s+.*\blive\b|fyers_apiv3", src)
 
 
 # ── the page renders end to end (Streamlit AppTest, synthetic log) ─────────────────────
@@ -604,6 +733,9 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
     assert not at.exception
     at.select_slider(key="if_nside_NIFTY").set_value(20).run()
     assert not at.exception and not at.error
+    for gap in ("listed", 50, 100):
+        at.segmented_control(key="if_step_NIFTY").set_value(gap).run()
+        assert not at.exception and not at.error, gap
     # past session
     at.selectbox(key="if_day_NIFTY").set_value(dt.date(2026, 11, 5)).run()
     assert not at.exception and not at.error
