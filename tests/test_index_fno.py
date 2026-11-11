@@ -1174,3 +1174,28 @@ def test_day_check_removes_slide_and_chain_move():
     own, rel = chk["by"][("CE", 25000.0)]
     assert rel == pytest.approx(1.2, abs=1e-6)                      # only the bump is left
     assert abs(chk["by"][("CE", 25300.0)][1]) < 1e-6
+
+
+def test_close_base_only_previous_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "load_close", lambda code, d: (
+        {"chain": {"2026-11-17": {"u": 1.0, "v": [[1, 2, 3]]}}} if d == dt.date(2026, 11, 6)
+        else {}))
+    monkeypatch.setattr(f, "prev_session", lambda code, d: dt.date(2026, 11, 9))
+    # the newest snapshot is from 6 Nov but the previous session was 9 Nov: no base
+    assert f.close_base("NIFTY", dt.date(2026, 11, 11), "2026-11-17") is None
+    monkeypatch.setattr(f, "prev_session", lambda code, d: dt.date(2026, 11, 6))
+    assert f.close_base("NIFTY", dt.date(2026, 11, 11), "2026-11-17") is not None
+
+
+def test_day_check_uses_forward_when_both_rows_have_it():
+    def row(S, F, shift=0.0):
+        k = []
+        for K in range(24600, 25501, 100):
+            iv = 20 - 0.002 * (K - F) + shift
+            leg = [100.0, 1.0, 1000.0, 10.0, 50_000.0, iv, 99.0, 101.0]
+            k.append([float(K), *leg, *leg])
+        return {"t": "2026-11-11T10:00:00", "u": float(S), "F": float(F), "a": 25000.0,
+                "e": "2026-11-17", "k": k}
+    # spot moved +60 but the forward +100: the smile slid with the FORWARD, nothing else
+    chk = f.day_check(pd.DataFrame(), row(25060, 25100), row(25000, 25000))
+    assert max(abs(v[0]) for v in chk["by"].values()) < 1e-6

@@ -1737,14 +1737,43 @@ CHURN_FRESH = 0.02        # |OI change| under 2% of the day's volume = churn, la
 CHAIN_MONEYNESS = 0.05    # strikes within ±5% of the index set the chain-wide IV move
 
 
+_PREV_SESSION: dict = {}
+
+
+def prev_session(code: str, day: dt.date) -> dt.date | None:
+    """The last trading session before `day` per DCM's index archive (None if unknown)."""
+    if (code, day) in _PREV_SESSION:
+        return _PREV_SESSION[(code, day)]
+    try:
+        from . import data
+        with data._connect() as c:
+            r = c.execute("select max(trade_date) from index_data where trade_date < ? and "
+                          "index_name = ?", [day, DCM_INDEX_NAME[code]]).fetchone()
+        v = r[0] if r and r[0] else None
+    except Exception:                                        # noqa: BLE001
+        return None                                          # locked archive: ask again later
+    _PREV_SESSION[(code, day)] = v
+    return v
+
+
 def close_base(code: str, day: dt.date, expiry: str) -> dict | None:
-    """The previous session's close snapshot of THIS expiry (with our model IV), searched up
-    to 7 days back so a weekend or holiday is skipped (10 Nov 2026 was shut)."""
+    """The PREVIOUS SESSION's close snapshot of this expiry (with our model IV), else None.
+
+    Only that one session: the premium label counts from yesterday's close, so a base two
+    sessions old (laptop off at yesterday's close, or yesterday's snapshot without IV) would
+    compare different stretches of time. Weekends and holidays are skipped by looking back
+    up to 7 days for the newest snapshot (10 Nov 2026 was shut); when DCM knows the previous
+    session and the snapshot is not from it, there is no base."""
     for back in range(1, 8):
-        c = load_close(code, day - dt.timedelta(days=back))
-        r = (c.get("chain") or {}).get(expiry) if c else None
-        if r and r.get("v"):
-            return r
+        d = day - dt.timedelta(days=back)
+        c = load_close(code, d)
+        if not c:
+            continue
+        ps = prev_session(code, day)
+        if ps is not None and ps != d:
+            return None
+        r = (c.get("chain") or {}).get(expiry)
+        return r if r and r.get("v") else None
     return None
 
 
@@ -1779,6 +1808,12 @@ def day_check(df: pd.DataFrame, latest: dict, base_row: dict | None) -> dict:
     u1 = latest.get("u")
     if not u1:
         return out
+    # the index move that slides a strike along the smile is the move of the FORWARD the IVs
+    # were solved on. Yesterday's close row carries NSE's closing index (a 15:00-15:30
+    # average) next to last-trade premiums: spot said +236 since the 9 Nov close, the
+    # options' forward +279 (11 Nov 2026, Nifty; Bank +1,156 vs +1,238)
+    use_f = bool(base_row and base_row.get("F") and latest.get("F"))
+    x1 = latest["F"] if use_f else u1
     ce1, pe1 = row_sides(latest)
     sl1 = _smile_slope(latest)
     base = {}
@@ -1788,7 +1823,8 @@ def day_check(df: pd.DataFrame, latest: dict, base_row: dict | None) -> dict:
         for side, d in (("CE", ce0), ("PE", pe0)):
             for K, x in d.items():
                 if x.get("IV"):
-                    base[(side, K)] = (x["IV"], base_row["u"], sl0.get(K))
+                    base[(side, K)] = (x["IV"], base_row["F"] if use_f else base_row["u"],
+                                       sl0.get(K))
         out["base"] = "close"
     elif not df.empty:
         f0 = df.dropna(subset=["IV", "u"]).sort_values("t").groupby(["side", "K"]).first()
@@ -1804,7 +1840,7 @@ def day_check(df: pd.DataFrame, latest: dict, base_row: dict | None) -> dict:
             s1, s0 = sl1.get(K), b[2]
             sl = np.nanmean([v for v in (s1, s0) if v is not None]) if (s1 is not None or
                                                                           s0 is not None) else 0.0
-            own[(side, K)] = x["IV"] - b[0] + sl * (u1 - b[1])
+            own[(side, K)] = x["IV"] - b[0] + sl * (x1 - b[1])
     near = [v for (side, K), v in own.items() if abs(K / u1 - 1) <= CHAIN_MONEYNESS]
     if near:
         out["common"] = float(np.median(near))
@@ -2423,8 +2459,12 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                        else "about flat")
                     + ". Each strike is judged AGAINST that: ✅ when its own IV move agrees "
                     "with the premium label, ⚠️ when it points the other way, ≈ when the premium "
-                    "label is just the index move. A consistency check on end-of-day numbers, "
-                    "not a sight of the actual trades (NSE's chain does not show who hit whom).")
+                    "label is just the index move. **One IV per strike:** put-call parity ties a "
+                    "strike's call and put to the same volatility, so IV says vol was bought or "
+                    "sold AT that strike, not through which side — it is pinned on the side whose "
+                    "OI grew (11 Nov Bank Nifty 60,600: call +1.0, put +1.1). A consistency check "
+                    "on the day's numbers, not a sight of the trades (NSE's chain does not show "
+                    "who hit whom).")
         st.caption("**Calls:** long build-up / short covering = 🟢 bullish, short build-up "
                    "(call writing) / long unwinding = 🔴 bearish. **Puts:** the mirror — put "
                    "writing (short build-up) and put long unwinding are 🟢, put buying (long "
@@ -2448,21 +2488,33 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                                  np.where(stt["lean"] < 0, "pushes the index DOWN",
                                           "no clear effect"))
         stt["blk"] = pd.to_datetime(stt["block"]).dt.strftime("%H:%M")
-        blocks = sorted(stt["blk"].unique())
+        # EVERY block between the first and the last, so a capture gap (laptop asleep) shows
+        # as empty columns — an ordinal axis otherwise closes it up silently, and the block
+        # after it, which absorbs the whole gap's change, looks like one ordinary block
+        b_ts = pd.to_datetime(stt["block"])
+        blocks = [x.strftime("%H:%M") for x in
+                  pd.date_range(b_ts.min(), b_ts.max(), freq=f"{mins}min")]
         n = len(blocks)
         # what fits in a cell on a laptop-wide page: full words up to ~26 columns (15-min
         # blocks for a whole day), short codes up to ~80 (5-min), colour only beyond
         stt["cell"] = (stt["word"] if n <= 26 else
                        stt["word"].map(SHORT_WORD).fillna("") if n <= 80 else "")
         st.markdown(f"**Who did what, block by block** — {pick}, {span} blocks from 09:15")
-        x_enc = alt.X("blk:O", title=None, sort=blocks,
+        x_enc = alt.X("blk:O", title=None, sort=blocks, scale=alt.Scale(domain=blocks),
                       axis=alt.Axis(labelAngle=0, labelFontSize=9, labelOverlap=True))
         Y_W = 70                                       # same label gutter on all three charts
         u = df.groupby("t")["u"].first().dropna()
         ub = u.groupby(block_start(pd.Series(u.index), mins).values).last()
         mv = ub.diff()
         if len(ub):
-            mv.iloc[0] = ub.iloc[0] - u.iloc[0]
+            # the cells' first block counts OI and premium from yesterday's close, so the
+            # gap is in it: the index bar must count from there too, or a gap-up morning
+            # shows green cells over a flat bar
+            try:
+                pc0 = prev_close(code, dt.date.fromisoformat(str(latest.get("t", ""))[:10]))
+            except ValueError:
+                pc0 = None
+            mv.iloc[0] = ub.iloc[0] - (pc0 or latest.get("o") or u.iloc[0])
         idx = pd.DataFrame({"blk": pd.to_datetime(ub.index).strftime("%H:%M"), "pts": mv.values})
         idx = idx[idx["blk"].isin(blocks)]
         idx["dir"] = np.where(idx["pts"] >= 0, "index up", "index down")
