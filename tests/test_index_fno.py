@@ -740,6 +740,12 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
     assert not at.exception
     at.segmented_control(key="if_bmetric_NIFTY").set_value("Volume per 5 min").run()
     assert not at.exception
+    at.segmented_control(key="if_dby_NIFTY").set_value("IV").run()
+    assert not at.exception
+    at.segmented_control(key="if_dblk_NIFTY").set_value(60).run()
+    assert not at.exception
+    at.segmented_control(key="if_dblk_NIFTY").set_value(5).run()
+    assert not at.exception
     at.segmented_control(key="if_anchor2_NIFTY").set_value("live ATM").run()
     assert not at.exception
     at.select_slider(key="if_nside_NIFTY").set_value(20).run()
@@ -1024,3 +1030,147 @@ def test_index_domain_is_the_days_own_range():
     lo, hi = f.index_domain(pd.Series([25000.0] * 3, index=t[:3]))
     assert hi - lo == pytest.approx(25000 * 0.001 * 1.16)     # flat day still has room
     assert f.index_domain(pd.Series(dtype=float)) is None
+
+
+def test_build_state_four_quadrants_and_side_lean():
+    bs = f.build_state
+    assert bs("CE", 500, 10, 10_000) == ("Long build-up", 1)
+    assert bs("CE", 500, -10, 10_000) == ("Short build-up", -1)       # call writing = bearish
+    assert bs("CE", -500, 10, 10_000) == ("Short covering", 1)
+    assert bs("CE", -500, -10, 10_000) == ("Long unwinding", -1)
+    assert bs("PE", 500, 10, 10_000) == ("Long build-up", -1)         # put buying = bearish
+    assert bs("PE", 500, -10, 10_000) == ("Short build-up", 1)        # put writing = bullish
+    assert bs("PE", -500, 10, 10_000) == ("Short covering", -1)
+    assert bs("PE", -500, -10, 10_000) == ("Long unwinding", 1)
+    assert bs("CE", 100, 10, 10_000) == ("Quiet", 0)                  # 1% < 2% floor
+    assert bs("CE", 500, 0.3, 10_000, "IV") == ("Unclear", 0)          # IV move under band
+    assert bs("CE", 500, None, 10_000) == (None, 0)
+    assert bs("CE", 500, float("nan"), 10_000) == (None, 0)
+
+
+def test_strike_states_blocks_sum_to_days_change():
+    rows = _session(40)
+    df = f.frame(rows)
+    st_ = f.strike_states(df, [25000.0], 15)
+    pe = st_[st_["side"] == "PE"]
+    assert len(pe) == 3 and pe["d_oi"].sum() == pytest.approx(100 + 100 * 39)
+    assert set(pe["state"]) <= set(f.STATE_CODE)
+    bb = f.bull_bear(st_)
+    assert list(bb.columns) == ["block", "bull", "bear", "net"] and len(bb) == 3
+    assert (bb["net"] == bb["bull"] - bb["bear"]).all()
+
+
+def test_drill_table_rows_high_to_low_with_markers():
+    rows = _session(10)
+    df = f.frame(rows)
+    ks = [24900.0, 25000.0, 25100.0]
+    tab = f.drill_table(rows[-1], df, ks, 25000.0, "premium", 25010.0)
+    assert list(tab["Strike"]) == ["25,100", "25,000 ★ ◀ index", "24,900"]
+    for c in ("Call state", "Put state", "Strike says", "Calls − puts ΔOI", "Put Δ premium"):
+        assert c in tab.columns
+    tiv = f.drill_table(rows[-1], df, ks, 25000.0, "IV", 25010.0)
+    assert "Put Δ IV" in tiv.columns
+    r = tiv[tiv["Strike"].str.startswith("25,000")].iloc[0]
+    assert r["Put Δ IV"] == pytest.approx(-0.9)                    # 16.0 -> 15.1
+
+
+def test_strike_says_same_state_both_sides():
+    assert f._strike_says(-1, 1, "Short build-up", "Short build-up").startswith(
+        "⚪ writers on both sides")
+    assert f._strike_says(1, -1, "Long build-up", "Long build-up").startswith("⚪ buyers")
+    assert f._strike_says(1, 1, "Long build-up", "Short build-up") == "🟢 bullish (both sides)"
+    assert f._strike_says(-1, 0, "Short build-up", "Quiet") == "🔴 leaning bearish"
+    assert f._strike_says(0, 0, "Quiet", "Quiet") == "⚪ quiet"
+
+
+def _smile_df(spots, extra=None):
+    """Sticky-moneyness smile IV_K = 20 - 0.002 (K - S): an index move alone re-prices every
+    strike along the smile with nobody trading. `extra` = {(t_index, K): vol pts added}."""
+    recs = []
+    for i, S in enumerate(spots):
+        t = pd.Timestamp("2026-11-09 09:20") + pd.Timedelta(minutes=i)
+        for K in (24800.0, 24900.0, 25000.0, 25100.0, 25200.0):
+            iv = 20 - 0.002 * (K - S) + (extra or {}).get((i, K), 0.0)
+            for side in ("CE", "PE"):
+                recs.append(dict(t=t, u=S, a=25000.0, K=K, side=side, ltp=100.0, chg=1.0,
+                                 oi=10_000.0 + 500 * i, doi=500.0 * (i + 1),
+                                 vol=1000.0 * (i + 1), iv=iv, bid=99.0, ask=101.0, IV=iv))
+    return pd.DataFrame(recs)
+
+
+def test_iv_pressure_removes_the_slide_along_the_smile():
+    df = _smile_df([25000, 25050, 25100])                  # index +100, no one trades vol
+    raw = df[(df.K == 25000) & (df.side == "CE")]["IV"]
+    assert raw.iloc[-1] - raw.iloc[0] == pytest.approx(0.2)   # raw IV says 'buyers'
+    p = f.iv_pressure(df).dropna()
+    assert p.abs().max() == pytest.approx(0.0, abs=1e-9)   # pressure: nothing
+    df2 = _smile_df([25000, 25050, 25100], {(2, 25000.0): 0.6})
+    p2 = f.iv_pressure(df2)
+    assert p2.loc[(pd.Timestamp("2026-11-09 09:22"), 25000.0, "CE")] > 0.5
+
+
+def test_strike_states_iv_uses_pressure_and_reports_volume():
+    df = _smile_df([25000, 25050, 25100])
+    st_ = f.strike_states(df, [25000.0], 15, "IV")
+    r = st_[st_["side"] == "CE"].iloc[0]
+    assert r["state"] == "Unclear"                          # slide alone is not buying
+    assert r["vol"] == 3000.0 and r["fresh"] == pytest.approx(r["d_oi"] / 3000.0)
+    tab = f.drill_table({"t": "x", "k": []}, df, [25000.0], 25000.0, "IV", 25100.0)
+    assert "Call volume" in tab.columns and "Call fresh %" in tab.columns
+
+
+def test_day_flow_adds_up_who_did_it():
+    st_ = pd.DataFrame([
+        dict(block=1, K=25000.0, side="CE", d_oi=500.0, state="Long build-up", lean=1),
+        dict(block=2, K=25000.0, side="CE", d_oi=-200.0, state="Long unwinding", lean=-1),
+        dict(block=3, K=25000.0, side="CE", d_oi=300.0, state="Long build-up", lean=1),
+        dict(block=1, K=25000.0, side="PE", d_oi=400.0, state="Short build-up", lean=1),
+        dict(block=2, K=25000.0, side="PE", d_oi=50.0, state="Quiet", lean=0)])
+    g = f.day_flow(st_).set_index(["side", "word"])
+    assert g.loc[("CE", "Buyers in"), "v"] == 800 and g.loc[("CE", "Buyers out"), "v"] == 200
+    assert g.loc[("CE", "Buyers out"), "signed"] == -200
+    assert g.loc[("PE", "Writers in"), "signed"] == 400                # put writing = up
+    assert ("PE", "·") not in g.index                                  # quiet left out
+
+
+def test_prev_close_reads_index_mgmt_same_day(tmp_path, monkeypatch):
+    monkeypatch.setattr(f.im, "DATA_DIR", tmp_path)
+    (tmp_path / "latest_NIFTY.json").write_text(json.dumps({"cash": {
+        "ts": "2026-11-11T12:24:33", "index": {"last": 25330.05, "prev": 25044.65}}}),
+        encoding="utf-8")
+    assert f.prev_close("NIFTY", dt.date(2026, 11, 11)) == 25044.65
+
+
+def test_check_label_rules():
+    cl = f.check_label
+    V = 100_000
+    assert cl("Long build-up", 5_000, V, 0.9, False)[0].startswith("✅")         # paid up
+    assert cl("Long build-up", 5_000, V, -0.9, False)[1] == "Short build-up"    # IV says writing
+    assert cl("Short build-up", 5_000, V, -0.9, False)[0].startswith("✅")
+    assert cl("Short covering", -5_000, V, 0.9, False)[0].startswith("✅")
+    assert cl("Long unwinding", -5_000, V, 0.9, False)[1] == "Short covering"
+    assert cl("Long build-up", 5_000, V, 0.2, False)[0] == "≈ index move only"
+    assert cl("Long build-up", 5_000, V, 0.9, False, band=1.5)[0].startswith("≈ inside")
+    assert cl("Long build-up", 1_000, V, 0.9, False)[0].startswith("≈ churn")   # 1% of volume
+    assert cl("Long build-up", 500, 2_000, 0.9, False)[0].startswith("— too thin")
+    assert cl("Long build-up", 5_000, V, 0.9, True)[0].startswith("— not checked")
+    assert cl("Long build-up", 5_000, V, None, False)[0] == "— no IV to check"
+    assert cl("Quiet", 5_000, V, 0.9, False) == ("—", None)
+
+
+def test_day_check_removes_slide_and_chain_move():
+    # sticky-moneyness smile, index +100 and the WHOLE surface 1 pt cheaper; one strike paid up
+    def row(S, shift, bump=None):
+        k = []
+        for K in range(24600, 25501, 100):
+            iv = 20 - 0.002 * (K - S) + shift + ((bump or {}).get(K, 0.0))
+            ce = [100.0, 1.0, 1000.0, 10.0, 50_000.0, iv, 99.0, 101.0]
+            pe = [100.0, -1.0, 1000.0, 10.0, 50_000.0, iv, 99.0, 101.0]
+            k.append([float(K), *ce, *pe])
+        return {"t": "2026-11-11T10:00:00", "u": float(S), "a": 25000.0, "e": "2026-11-17", "k": k}
+    base, now = row(25000, 0.0), row(25100, -1.0, {25000: 1.2})
+    chk = f.day_check(pd.DataFrame(), now, base)
+    assert chk["base"] == "close" and chk["common"] == pytest.approx(-1.0, abs=1e-6)
+    own, rel = chk["by"][("CE", 25000.0)]
+    assert rel == pytest.approx(1.2, abs=1e-6)                      # only the bump is left
+    assert abs(chk["by"][("CE", 25300.0)][1]) < 1e-6

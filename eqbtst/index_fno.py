@@ -475,6 +475,43 @@ def _dcm_open(code: str, day: dt.date) -> float | None:
     return v
 
 
+_PREV: dict = {}
+
+
+def prev_close(code: str, day: dt.date) -> float | None:
+    """The index's previous session close — the base NSE and every broker use for '+/− today'.
+    Index Management's same-day NSE read first (NSE's own previousClose, 11 Nov 2026: 25,044.65),
+    then DCM's end-of-day row for `day`, then DCM's last close before `day` (a holiday in
+    between is skipped by construction: 10 Nov 2026 was shut)."""
+    try:
+        j = json.loads((im.DATA_DIR / f"latest_{code}.json").read_text(encoding="utf-8"))
+        c = j.get("cash") or {}
+        t = dt.datetime.fromisoformat(c["ts"]) if c.get("ts") else None
+        pv = (c.get("index") or {}).get("prev")
+        if t and t.date() == day and pv and pv > 0:
+            return float(pv)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    key = (code, day)
+    if key in _PREV:
+        return _PREV[key]
+    v = None
+    try:
+        from . import data
+        with data._connect() as c:
+            r = c.execute("select prev_close from index_data where trade_date = ? and "
+                          "index_name = ?", [day, DCM_INDEX_NAME[code]]).fetchone()
+            if not (r and r[0]):
+                r = c.execute("select close_val from index_data where trade_date < ? and "
+                              "index_name = ? order by trade_date desc limit 1",
+                              [day, DCM_INDEX_NAME[code]]).fetchone()
+        v = float(r[0]) if r and r[0] else None
+    except Exception:                                        # noqa: BLE001
+        return None                                          # locked archive: ask again later
+    _PREV[key] = v
+    return v
+
+
 def day_open(code: str, day: dt.date, rows: list) -> tuple:
     """(opening level, source text) — the 09:15 point the page fixes the ladder and buckets
     on. NSE's official open first (stored in the log rows by the writer, or DCM's end-of-day
@@ -1532,6 +1569,374 @@ def bucket_table(latest: dict, first: dict | None, bmap: dict, lot: int | None) 
     return df
 
 
+# ── bucket drill-down: what each strike's calls and puts are doing ─────────────────────
+_BULL_STATES = {"CE": ("Long build-up", "Short covering"),
+                "PE": ("Short build-up", "Long unwinding")}
+STATE_NAME = {"long build": "Long build-up", "writing": "Short build-up",
+              "short covering": "Short covering", "long unwind": "Long unwinding"}
+_IV_WORD = {"buyers adding": "long build", "writers adding": "writing",
+            "writers covering": "short covering", "buyers exiting": "long unwind"}
+SHORT_WORD = {"Buyers in": "B+", "Writers in": "W+", "Writers out": "W−", "Buyers out": "B−",
+              "·": "·", "?": "?"}
+PLAIN_STATE = {"Long build-up": "Buyers in", "Short build-up": "Writers in",
+               "Short covering": "Writers out", "Long unwinding": "Buyers out",
+               "Quiet": "·", "Unclear": "?"}
+STATE_CODE = {"Long build-up": "LB", "Short build-up": "SB", "Short covering": "SC",
+              "Long unwinding": "LU", "Quiet": "·", "Unclear": "?"}
+BLOCK_FLOOR = 0.005      # in a block, an OI change under 0.5% of the strike's OI = quiet
+BLOCK_IV_BAND = 0.25     # in a block, a skew-adjusted IV move under this = unclear (vol points)
+DRILL_BY = ("premium", "IV")
+
+
+def iv_pressure(df: pd.DataFrame) -> pd.Series:
+    """Per log row: the strike's IV change since its previous reading, with the part the index
+    move explains taken out (vol points). Index -> {(t, K, side): value}.
+
+    A fixed strike's IV moves when the index moves even if nobody trades it: the strike slides
+    along the smile (index down -> the strike is now relatively higher -> lower IV for a
+    downward-sloping smile). Sticky-moneyness: dIV_expected = -slope * dS, slope = dIV/dK of
+    the same reading's smile (mean of call and put IV per strike, central differences across
+    every logged strike). What is left is pressure: buyers paying up (+) or writers selling
+    vol (-). MEASURED (Tradebot archive Jun-Nov 2026, non-expiry days, Best bucket, 15-min
+    blocks): it REVERSES next block (rank -0.09 Nifty .. -0.27 Midcap, t -5.7 .. -25), so a
+    single block's value is mostly last-trade bounce, not flow. The 9 Nov 'persists on Nifty'
+    reading was an expiry-day artefact (whole surface drifting up) and is retracted."""
+    if df.empty or "IV" not in df:
+        return pd.Series(dtype=float)
+    sm = df.groupby(["t", "K"])["IV"].mean().dropna().reset_index().sort_values(["t", "K"])
+    parts = []
+    for t, g in sm.groupby("t"):
+        if len(g) >= 3:
+            parts.append(pd.DataFrame({"t": t, "K": g["K"].values,
+                                       "slope": np.gradient(g["IV"].values, g["K"].values)}))
+    w = df[["t", "K", "side", "IV", "u"]].copy()
+    w = w.merge(pd.concat(parts) if parts else pd.DataFrame(columns=["t", "K", "slope"]),
+                on=["t", "K"], how="left").sort_values(["side", "K", "t"])
+    grp = w.groupby(["side", "K"])
+    w["p"] = grp["IV"].diff() + grp["slope"].shift() * grp["u"].diff()
+    return w.set_index(["t", "K", "side"])["p"]
+
+
+def build_state(side: str, d_oi, d_x, oi_now, by: str = "premium",
+                floor: float = OI_FLOOR, band: float = IV_BAND) -> tuple:
+    """(state, lean) for one strike and side over one stretch of time.
+
+    by='premium' - the sites' reading: OI change x premium change.
+        OI up + premium up = Long build-up      OI up + premium down = Short build-up
+        OI down + premium up = Short covering   OI down + premium down = Long unwinding
+    by='IV' - the same four, with the option's IV change in place of its premium. A
+        premium mostly moves with the index (delta) and decays with time (theta, steepest on
+        expiry day), so the premium reading largely restates where the index went; IV is what
+        is left once both are taken out — paid up = buyers, cheapened = writers.
+    lean: +1 bullish for the index, -1 bearish, 0 none. Calls: long build-up / short
+    covering = bullish. Puts: the mirror (put writing = bullish, put buying = bearish)."""
+    vals = (d_oi, d_x, oi_now)
+    if any(v is None for v in vals) or any(isinstance(v, float) and np.isnan(v) for v in vals):
+        return None, 0
+    if not oi_now or abs(d_oi) < floor * max(float(oi_now), 1.0):
+        return "Quiet", 0
+    if (by == "IV" and abs(d_x) < band) or d_x == 0:
+        return "Unclear", 0
+    key = (("long build" if d_x > 0 else "writing") if d_oi > 0
+           else ("short covering" if d_x > 0 else "long unwind"))
+    return STATE_NAME[key], (1 if key in _BULL[side] else -1)
+
+
+def strike_states(df: pd.DataFrame, strikes: list, minutes: int = 15,
+                  by: str = "premium") -> pd.DataFrame:
+    """Per strike, side and block: OI change, premium change, IV change and the state.
+
+    Each block runs from the previous block's last reading to its own last reading. The
+    first block runs from YESTERDAY's close for OI (OI - change) and premium (last - change),
+    so the opening rush is in it; IV has no close of yesterday, so its first block starts at
+    the first reading. Blocks of OI change sum exactly to the day's change."""
+    cols = ["block", "t", "K", "side", "oi", "d_oi", "d_px", "d_iv", "vol", "fresh",
+            "state", "lean"]
+    w = df[df["K"].isin(strikes)].dropna(subset=["oi"]).sort_values("t")
+    if w.empty:
+        return pd.DataFrame(columns=cols)
+    # the smile fit runs per reading: only when IV is the judge (premium mode stays cheap)
+    press = iv_pressure(df) if by == "IV" else pd.Series(dtype=float)
+    first_blk = None
+    out = []
+    for (side, K), g in w.groupby(["side", "K"]):
+        g = g.reset_index(drop=True)
+        g["block"] = block_start(g["t"], minutes).values
+        g["ivp"] = press.reindex(list(zip(g["t"], g["K"], g["side"]))).values \
+            if len(press) else np.nan
+        dv = g["vol"].diff()
+        dv[dv < 0] = np.nan
+        if first_blk is None:
+            first_blk = g["t"].iloc[0].normalize() + pd.Timedelta(
+                hours=SESSION_OPEN.hour, minutes=SESSION_OPEN.minute)
+        # NSE volume is cumulative from 09:15: the first reading's count belongs to the
+        # first block only when that reading is inside the session's first block
+        dv.iloc[0] = g["vol"].iloc[0] if g["block"].iloc[0] == first_blk else np.nan
+        g["dv"] = dv
+        bvol = g.groupby("block")["dv"].sum(min_count=1)
+        bivp = g.groupby("block")["ivp"].sum(min_count=1)
+        last = g.groupby("block").tail(1).set_index("block")
+        oi0 = g["oi"].iloc[0] - (g["doi"].iloc[0] if pd.notna(g["doi"].iloc[0]) else 0.0)
+        c0 = g["chg"].iloc[0]
+        px0 = g["ltp"].iloc[0] - c0 if pd.notna(c0) and pd.notna(g["ltp"].iloc[0]) else np.nan
+        d_oi = last["oi"].diff()
+        d_oi.iloc[0] = last["oi"].iloc[0] - oi0
+        d_px = last["ltp"].diff()
+        d_px.iloc[0] = last["ltp"].iloc[0] - px0
+        for b in last.index:
+            div = bivp.get(b, np.nan)                      # skew-adjusted IV change
+            dx = div if by == "IV" else d_px[b]
+            stt, ln = build_state(side, d_oi[b], dx, last["oi"][b], by, BLOCK_FLOOR,
+                                  BLOCK_IV_BAND)
+            v = bvol.get(b, np.nan)
+            fr = (d_oi[b] / v) if pd.notna(v) and v > 0 and pd.notna(d_oi[b]) else np.nan
+            out.append((b, last["t"][b], K, side, last["oi"][b], d_oi[b], d_px[b], div,
+                        v, fr, stt, ln))
+    return pd.DataFrame(out, columns=cols)
+
+
+def bull_bear(states: pd.DataFrame) -> pd.DataFrame:
+    """Per block: contracts on the bullish side minus contracts on the bearish side, each
+    strike-side weighted by the size of its OI change. A Quiet / Unclear cell counts zero."""
+    if states.empty:
+        return pd.DataFrame(columns=["block", "bull", "bear", "net"])
+    s = states.assign(w=states["d_oi"].abs().fillna(0.0))
+    g = s.groupby("block").apply(
+        lambda x: pd.Series({"bull": float(x.loc[x["lean"] > 0, "w"].sum()),
+                             "bear": float(x.loc[x["lean"] < 0, "w"].sum())}),
+        include_groups=False).reset_index()
+    g["net"] = g["bull"] - g["bear"]
+    return g
+
+
+WHO_COLORS = {"Buyers in": "#2e86de", "Buyers out": "#9cc8f0",
+              "Writers in": "#e67e22", "Writers out": "#f5c89a"}
+
+
+def day_flow(states: pd.DataFrame) -> pd.DataFrame:
+    """Per strike, side and who: contracts (absolute OI change) added up over the blocks.
+    'signed' = + for contracts that help the index up, − for those that push it down.
+    Quiet / unclear blocks are left out (nobody can be named for them)."""
+    s = states[states["state"].isin(STATE_NAME.values())].copy()
+    if s.empty:
+        return pd.DataFrame(columns=["K", "side", "word", "v", "signed", "effect", "rank"])
+    s["word"] = s["state"].map(PLAIN_STATE)
+    s["v"] = s["d_oi"].abs()
+    s["signed"] = s["v"] * s["lean"]
+    g = s.groupby(["K", "side", "word"]).agg(v=("v", "sum"), signed=("signed", "sum")).reset_index()
+    g["effect"] = np.where(g["signed"] > 0, "helps UP", "pushes DOWN")
+    g["rank"] = g["word"].map({w: i for i, w in enumerate(WHO_COLORS)})
+    return g
+
+
+CHECK_BAND = 0.5          # vol pts: a strike's IV move vs the chain's under this = can't tell
+CHECK_NOISE_X = 3.0       # ... and never under 3x the strike's own reading-to-reading wobble
+CHECK_MIN_VOL = 10_000    # contracts today: thinner strikes' IV is quote noise (Fin Nifty 11 Nov
+                          # 2026: 46-1,667 contracts, IV vs chain zig-zagging +0.7/+1.3/-0.75/+1.5)
+CHURN_FRESH = 0.02        # |OI change| under 2% of the day's volume = churn, label is weak
+CHAIN_MONEYNESS = 0.05    # strikes within ±5% of the index set the chain-wide IV move
+
+
+def close_base(code: str, day: dt.date, expiry: str) -> dict | None:
+    """The previous session's close snapshot of THIS expiry (with our model IV), searched up
+    to 7 days back so a weekend or holiday is skipped (10 Nov 2026 was shut)."""
+    for back in range(1, 8):
+        c = load_close(code, day - dt.timedelta(days=back))
+        r = (c.get("chain") or {}).get(expiry) if c else None
+        if r and r.get("v"):
+            return r
+    return None
+
+
+def _smile_slope(row: dict) -> dict:
+    """{K: dIV/dK} from one reading's smile (mean of call and put IV per strike)."""
+    ce, pe = row_sides(row)
+    iv = {}
+    for K in set(ce) | set(pe):
+        vals = [x for x in ((ce.get(K) or {}).get("IV"), (pe.get(K) or {}).get("IV")) if x]
+        if vals:
+            iv[K] = float(np.mean(vals))
+    ks = sorted(iv)
+    if len(ks) < 3:
+        return {}
+    return dict(zip(ks, np.gradient([iv[k] for k in ks], ks)))
+
+
+def day_check(df: pd.DataFrame, latest: dict, base_row: dict | None) -> dict:
+    """Per strike and side: the day's IV move with the index's effect taken out, and the
+    same measured against the rest of the chain.
+
+      own = IV now - IV at the base + slope x (index now - index at the base)
+            (the slope term removes the strike's slide along the smile: sticky-moneyness)
+      rel = own - median(own) over strikes within ±5% of the index
+            (the chain-wide move — index IV usually falls in a rally and rises in a fall —
+            is the market's, not this strike's: without it a +1% day stamps 'writers' on
+            every strike)
+    Base = yesterday's close snapshot of this expiry when there is one, else each strike's
+    first reading today with an IV. Returns {"by": {(side, K): (own, rel)}, "common": x,
+    "base": "close" | "first"}."""
+    out = {"by": {}, "common": None, "base": None}
+    u1 = latest.get("u")
+    if not u1:
+        return out
+    ce1, pe1 = row_sides(latest)
+    sl1 = _smile_slope(latest)
+    base = {}
+    if base_row and base_row.get("u"):
+        ce0, pe0 = row_sides(base_row)
+        sl0 = _smile_slope(base_row)
+        for side, d in (("CE", ce0), ("PE", pe0)):
+            for K, x in d.items():
+                if x.get("IV"):
+                    base[(side, K)] = (x["IV"], base_row["u"], sl0.get(K))
+        out["base"] = "close"
+    elif not df.empty:
+        f0 = df.dropna(subset=["IV", "u"]).sort_values("t").groupby(["side", "K"]).first()
+        for (side, K), r in f0.iterrows():
+            base[(side, K)] = (r["IV"], r["u"], None)
+        out["base"] = "first"
+    own = {}
+    for side, d in (("CE", ce1), ("PE", pe1)):
+        for K, x in d.items():
+            b = base.get((side, K))
+            if not b or not x.get("IV"):
+                continue
+            s1, s0 = sl1.get(K), b[2]
+            sl = np.nanmean([v for v in (s1, s0) if v is not None]) if (s1 is not None or
+                                                                          s0 is not None) else 0.0
+            own[(side, K)] = x["IV"] - b[0] + sl * (u1 - b[1])
+    near = [v for (side, K), v in own.items() if abs(K / u1 - 1) <= CHAIN_MONEYNESS]
+    if near:
+        out["common"] = float(np.median(near))
+        out["by"] = {k: (v, v - out["common"]) for k, v in own.items()}
+    # each strike's own noise: how much its IV wobbles from one reading to the next (robust
+    # spread of the per-reading pressure). A thin strike (Fin Nifty wings: day moves of 2-26
+    # pts that were noise, 5-11 Nov 2026) must move 3x its wobble before anything is called.
+    out["band"] = {}
+    if not df.empty:
+        pr = iv_pressure(df)
+        if len(pr):
+            pr = pr.dropna().reset_index()
+            for (side, K), g in pr.groupby(["side", "K"]):
+                x = g["p"].to_numpy()
+                if len(x) >= 10:
+                    mad = 1.4826 * float(np.median(np.abs(x - np.median(x))))
+                    out["band"][(side, K)] = max(CHECK_BAND, CHECK_NOISE_X * mad)
+    return out
+
+
+def check_label(state: str | None, doi, vol, rel, expiry_day: bool,
+                band: float = CHECK_BAND) -> tuple:
+    """(verdict text, state the IV evidence supports or None) for one strike-side's
+    premium-based label.
+
+    OI up: buyers paying up lift the strike's IV against the chain, writers selling press it.
+    OI down: shorts buying back lift it (covering), longs selling out press it (unwinding)."""
+    if state not in STATE_NAME.values():
+        return "—", None
+    if expiry_day:
+        return "— not checked (expiry day)", None
+    if rel is None or (isinstance(rel, float) and np.isnan(rel)):
+        return "— no IV to check", None
+    if not vol or vol < CHECK_MIN_VOL:
+        return f"— too thin to check ({(vol or 0):,.0f} traded)", None
+    if doi is not None and abs(doi) < CHURN_FRESH * vol:
+        return f"≈ churn ({abs(doi) / vol:.1%} of volume)", None
+    opening = state in ("Long build-up", "Short build-up")
+    if abs(rel) < band:
+        return ("≈ index move only" if band <= CHECK_BAND + 1e-9
+                else f"≈ inside this strike's noise (±{band:.1f})"), None
+    iv_state = (("Long build-up" if rel > 0 else "Short build-up") if opening
+                else ("Short covering" if rel > 0 else "Long unwinding"))
+    if iv_state == state:
+        return f"✅ confirmed (IV {rel:+.1f} vs chain)", iv_state
+    return f"⚠️ IV says {PLAIN_STATE[iv_state]} ({rel:+.1f})", iv_state
+
+
+def _strike_says(lc: int, lp: int, sc: str | None = None, sp: str | None = None) -> str:
+    """One verdict per strike from its call and put states. Same state on BOTH sides is its
+    own read, not 'mixed': writers on both sides = a straddle being sold (a range expected;
+    9 Nov 2026 expiry day: every Best strike), buyers on both sides = a move expected."""
+    if sc and sc == sp:
+        both = {"Short build-up": "⚪ writers on both sides (range expected)",
+                "Long build-up": "⚪ buyers on both sides (move expected)",
+                "Short covering": "⚪ writers exiting both sides",
+                "Long unwinding": "⚪ buyers exiting both sides"}
+        if sc in both:
+            return both[sc]
+    t = lc + lp
+    if t >= 2:
+        return "🟢 bullish (both sides)"
+    if t <= -2:
+        return "🔴 bearish (both sides)"
+    if t == 1:
+        return "🟢 leaning bullish"
+    if t == -1:
+        return "🔴 leaning bearish"
+    return "⚪ mixed" if lc or lp else "⚪ quiet"
+
+
+def drill_table(latest: dict, df: pd.DataFrame, ks: list, center, by: str = "premium",
+                spot=None, check: dict | None = None, expiry_day: bool = False) -> pd.DataFrame:
+    """One row per strike of the bucket (high to low): today's call and put state, judged
+    since yesterday's close (premium) or since each strike's first IV of the day (IV)."""
+    ce, pe = row_sides(latest)
+    cum_iv = {}
+    if by == "IV" and not df.empty:
+        pr = iv_pressure(df)
+        if len(pr):
+            pr = pr.reset_index()
+            pr = pr[pr["K"].isin(ks)]
+            cum_iv = pr.groupby(["side", "K"])["p"].sum(min_count=1).to_dict()
+    near = min(ks, key=lambda k: (abs(k - spot), k)) if spot and ks else None
+    rows = []
+    for K in sorted(ks, reverse=True):
+        rec = {"Strike": f"{K:,.0f}" + (" ★" if K == center else "")
+               + (" ◀ index" if K == near else "")}
+        leans, states, cleans, cstates = [], [], [], []
+        for side, d, nm in (("CE", ce, "Call"), ("PE", pe, "Put")):
+            x = d.get(K) or {}
+            oi, doi = x.get("oi"), x.get("doi")
+            if by == "IV":
+                dx = cum_iv.get((side, K))
+                dx = None if dx is None or (isinstance(dx, float) and np.isnan(dx)) else dx
+            else:
+                dx = x.get("chg")
+            stt, ln = build_state(side, doi, dx, oi, by)
+            leans.append(ln)
+            states.append(stt)
+            rec[f"{nm} OI"] = oi
+            rec[f"{nm} ΔOI"] = doi
+            rec[f"{nm} {'Δ premium' if by != 'IV' else 'Δ IV'}"] = dx
+            vol = x.get("vol")
+            rec[f"{nm} volume"] = vol
+            rec[f"{nm} fresh %"] = (100.0 * doi / vol) if vol and doi is not None else None
+            word = PLAIN_STATE[stt] if stt in STATE_NAME.values() else stt
+            rec[f"{nm} state"] = ("—" if stt is None else
+                                  ("🟢 " if ln > 0 else "🔴 " if ln < 0 else "⚪ ") + word)
+            if check is not None:
+                rel = (check.get("by", {}).get((side, K)) or (None, None))[1]
+                verdict, ivs = check_label(stt, doi, vol, rel, expiry_day,
+                                           check.get("band", {}).get((side, K), CHECK_BAND))
+                rec[f"{nm} IV vs chain"] = rel
+                rec[f"{nm} check"] = verdict
+                cst = stt if verdict.startswith("✅") else ivs if verdict.startswith("⚠") else None
+                cstates.append(cst)
+                cleans.append(0 if cst is None else (1 if cst in _BULL_STATES[side] else -1))
+        c, p_ = rec["Call ΔOI"], rec["Put ΔOI"]
+        rec["Calls − puts ΔOI"] = (c - p_) if c is not None and p_ is not None else None
+        rec["Strike says"] = _strike_says(*leans, *states)
+        if check is not None:
+            v = _strike_says(*cleans, *cstates)
+            rec["Strike says (checked)"] = "⚪ nothing confirmed" if v == "⚪ quiet" else v
+        rows.append(rec)
+    out = pd.DataFrame(rows)
+    for c in out.columns:
+        if c != "Strike" and not c.endswith(("state", "says", "check", "(checked)")):
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
+    return out
+
+
 def bucket_series(df: pd.DataFrame, bmap: dict, lot: int | None,
                   base: str = "yday") -> pd.DataFrame:
     """Long frame per reading x bucket: calls / puts OI change (₹ Cr at the first reading's
@@ -1906,6 +2311,359 @@ TIP_BUCKET = {
 }
 
 
+DRILL_COLORS = {"bullish · new positions": "#1f9d55", "bullish · exits": "#8fd8a8",
+                "bearish · new positions": "#d64545", "bearish · exits": "#f2a7a7",
+                "quiet / unclear": "#3a3f47"}
+
+
+def _drill_cat(state, lean) -> str:
+    if not lean:
+        return "quiet / unclear"
+    new = state in ("Long build-up", "Short build-up")
+    return f"{'bullish' if lean > 0 else 'bearish'} · {'new positions' if new else 'exits'}"
+
+
+def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap: dict,
+                  center, clicked: bool) -> None:
+    """The strikes of one bucket, one by one: today's state per call and put, the state block
+    by block through the session, each strike's call vs put OI change, and the bucket's
+    bullish-minus-bearish contracts per block."""
+    import altair as alt
+    ks = sorted(k for k, b in bmap.items() if b == pick)
+    if not ks:
+        return
+    with st.container(border=True):
+        st.markdown(f"#### 🔎 {pick} — {len(ks)} strikes, one by one"
+                    + ("" if clicked else " · :gray[click a row in the table to open Better or Good]"))
+        c1, c2 = st.columns([1, 1])
+        by = c1.segmented_control(
+            "Judge by", list(DRILL_BY), default="premium", key=f"if_dby_{code}",
+            format_func=lambda x: ("premium (as sites do)" if x == "premium"
+                                   else "IV pressure (experimental)"),
+            help="Premium: OI change x premium change - the usual long build-up / short "
+                 "build-up / short covering / long unwinding. It mostly restates the index "
+                 "move (a call's premium rises when the index rises) and time decay. IV "
+                 "pressure: the strike's IV change with the index-move slide along the smile "
+                 "taken out — buyers paying up lift it, writers selling vol press it. OI up + "
+                 "IV pressure up = buying; OI up + IV pressure down = writing.") or "premium"
+        mins = c2.segmented_control("Time block", list(BLOCKS), default=15,
+                                    key=f"if_dblk_{code}",
+                                    format_func=lambda x: "1 hr" if x == 60 else f"{x} min") or 15
+        if by == "IV" and str(latest.get("e", ""))[:10] == str(latest.get("t", ""))[:10]:
+            # 9 Nov 2026 (Nifty weekly expiry): with hours left IV jumps on any tick — the
+            # 25,400 call showed +200 vol points of 'pressure' by 15:29. Not a read.
+            st.warning("**Expiry day of this contract** — with hours to go its IV jumps on "
+                       "every tick (9 Nov: +200 vol points on one strike), so IV pressure is "
+                       "not read today. Showing the premium reading instead.")
+            by = "premium"
+        expiry_day = str(latest.get("e", ""))[:10] == str(latest.get("t", ""))[:10]
+        chk = None
+        if by == "premium":
+            try:
+                dday = dt.date.fromisoformat(str(latest.get("t", ""))[:10])
+                chk = day_check(df, latest, close_base(code, dday, str(latest.get("e", ""))[:10]))
+            except ValueError:
+                chk = None
+        tab = drill_table(latest, df, ks, center, by, latest.get("u"), chk, expiry_day)
+        dx = "Δ premium" if by != "IV" else "Δ IV"
+        cc = st.column_config
+        cfg = {}
+        for nm in ("Call", "Put"):
+            cfg[f"{nm} OI"] = cc.NumberColumn(f"{nm} OI", format="%,.0f")
+            cfg[f"{nm} ΔOI"] = cc.NumberColumn(f"{nm} ΔOI", format="%+,.0f",
+                                               help="Contracts added (+) or cut (−) since "
+                                                    "yesterday's close.")
+            cfg[f"{nm} {dx}"] = cc.NumberColumn(
+                f"{nm} {dx}", format="%+,.2f",
+                help=("Premium change since yesterday's close (₹)." if by != "IV" else
+                      "IV pressure since the first reading: the strike's IV change minus "
+                      "what the index move alone explains (slide along the smile). Vol "
+                      f"points; under {IV_BAND} = unclear."))
+            cfg[f"{nm} volume"] = cc.NumberColumn(f"{nm} volume", format="%,.0f",
+                                                  help="Contracts traded today.")
+            cfg[f"{nm} fresh %"] = cc.NumberColumn(
+                f"{nm} fresh %", format="%+.1f%%",
+                help="OI change ÷ volume. Near ±100% = nearly every trade opened (+) or "
+                     "closed (−) a position: positional money. Near 0% = heavy trading that "
+                     "left positions unchanged: intraday churn, the state means little.")
+        cfg["Calls − puts ΔOI"] = cc.NumberColumn("Calls − puts ΔOI", format="%+,.0f")
+        for nm in ("Call", "Put"):
+            cfg[f"{nm} IV vs chain"] = cc.NumberColumn(
+                f"{nm} IV vs chain", format="%+.1f",
+                help="This strike's IV move today minus the whole chain's (vol points), with "
+                     "the index move's effect taken out. + = paid up here more than elsewhere "
+                     "(buyers), − = sold here more than elsewhere (writers).")
+            cfg[f"{nm} check"] = cc.TextColumn(
+                f"{nm} check",
+                help="Does the IV agree with the premium label? ✅ confirmed · ⚠️ IV points the "
+                     f"other way · ≈ IV moved under {CHECK_BAND} pts vs the chain (the premium "
+                     "move is just the index) · churn = OI change under "
+                     f"{CHURN_FRESH:.0%} of the volume.")
+        cfg["Strike says (checked)"] = cc.TextColumn(
+            "Strike says (checked)",
+            help="The verdict again, counting only sides whose label the IV confirmed (or "
+                 "using the IV's reading where it disagreed). Index-move-only sides count zero.")
+        if chk is not None and not tab.empty:
+            # most decision-useful first: strike, verdicts, then the numbers
+            lead = [c for c in ("Strike", "Call state", "Call check", "Put state", "Put check",
+                                "Strike says", "Strike says (checked)") if c in tab.columns]
+            tab = tab[lead + [c for c in tab.columns if c not in lead]]
+        st.dataframe(tab, column_config=cfg, hide_index=True, width="stretch")
+        if chk is not None:
+            if expiry_day:
+                st.caption("Expiry day of this contract: IV is not used for the check today.")
+            elif chk.get("common") is not None:
+                cm = chk["common"]
+                st.caption(
+                    f"**The check** — IV since {'yesterday’s close' if chk['base'] == 'close' else 'the first reading today'}"
+                    f", index effect removed. Whole chain (strikes within ±5%): **{cm:+.1f} vol "
+                    "pts** — "
+                    + ("options got cheaper everywhere (sellers in charge market-wide)" if cm < -CHECK_BAND
+                       else "options got dearer everywhere (buyers in charge market-wide)" if cm > CHECK_BAND
+                       else "about flat")
+                    + ". Each strike is judged AGAINST that: ✅ when its own IV move agrees "
+                    "with the premium label, ⚠️ when it points the other way, ≈ when the premium "
+                    "label is just the index move. A consistency check on end-of-day numbers, "
+                    "not a sight of the actual trades (NSE's chain does not show who hit whom).")
+        st.caption("**Calls:** long build-up / short covering = 🟢 bullish, short build-up "
+                   "(call writing) / long unwinding = 🔴 bearish. **Puts:** the mirror — put "
+                   "writing (short build-up) and put long unwinding are 🟢, put buying (long "
+                   "build-up) and put short covering are 🔴. An OI change under "
+                   f"{OI_FLOOR:.0%} of the strike's OI = quiet. ★ = the morning's centre strike, "
+                   "◀ index = strike nearest the index now.")
+
+        stt = strike_states(df, ks, mins, by)
+        if stt.empty:
+            st.caption("The block picture appears once a few readings are logged.")
+            return
+        stt["word"] = stt["state"].map(PLAIN_STATE).fillna("")
+        stt["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in stt["K"]]
+        order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(ks, reverse=True)]
+        stt["panel"] = stt["side"].map({"CE": "CALLS", "PE": "PUTS"})
+        span = "1 hr" if mins == 60 else f"{mins} min"
+
+        # 1) BLOCK BY BLOCK — the main view: index move on top, then calls, then puts, each
+        # the full page width so the cells are wide enough for words
+        stt["effect"] = np.where(stt["lean"] > 0, "helps the index UP",
+                                 np.where(stt["lean"] < 0, "pushes the index DOWN",
+                                          "no clear effect"))
+        stt["blk"] = pd.to_datetime(stt["block"]).dt.strftime("%H:%M")
+        blocks = sorted(stt["blk"].unique())
+        n = len(blocks)
+        # what fits in a cell on a laptop-wide page: full words up to ~26 columns (15-min
+        # blocks for a whole day), short codes up to ~80 (5-min), colour only beyond
+        stt["cell"] = (stt["word"] if n <= 26 else
+                       stt["word"].map(SHORT_WORD).fillna("") if n <= 80 else "")
+        st.markdown(f"**Who did what, block by block** — {pick}, {span} blocks from 09:15")
+        x_enc = alt.X("blk:O", title=None, sort=blocks,
+                      axis=alt.Axis(labelAngle=0, labelFontSize=9, labelOverlap=True))
+        Y_W = 70                                       # same label gutter on all three charts
+        u = df.groupby("t")["u"].first().dropna()
+        ub = u.groupby(block_start(pd.Series(u.index), mins).values).last()
+        mv = ub.diff()
+        if len(ub):
+            mv.iloc[0] = ub.iloc[0] - u.iloc[0]
+        idx = pd.DataFrame({"blk": pd.to_datetime(ub.index).strftime("%H:%M"), "pts": mv.values})
+        idx = idx[idx["blk"].isin(blocks)]
+        idx["dir"] = np.where(idx["pts"] >= 0, "index up", "index down")
+        # titles and legend live OUTSIDE the charts: Streamlit fits a chart's title + legend
+        # inside its height, which crushed the index bars to nothing and the put rows to half
+        # height (11 Nov 2026)
+        st.markdown("**INDEX** — points moved in each block")
+        st.altair_chart(
+            alt.Chart(idx).mark_bar().encode(
+                x=x_enc.axis(None),
+                y=alt.Y("pts:Q", title="index pts",
+                        axis=alt.Axis(format="+,.0f", minExtent=Y_W, maxExtent=Y_W,
+                                      tickCount=3)),
+                color=alt.Color("dir:N", legend=None,
+                                scale=alt.Scale(domain=["index up", "index down"],
+                                                range=["#1f9d55", "#d64545"])),
+                tooltip=[alt.Tooltip("blk:N", title="block from"),
+                         alt.Tooltip("pts:Q", title="index move", format="+,.1f")])
+            .properties(height=120), width="stretch")
+        for side, title in (("CE", "CALLS"), ("PE", "PUTS")):
+            d = stt[stt["side"] == side]
+            if side == "PE" and latest.get("u"):
+                # the index level between the two grids: calls above it, puts below
+                o, now_u = latest.get("o"), latest["u"]
+                try:
+                    pc = prev_close(code, dt.date.fromisoformat(str(latest.get("t", ""))[:10]))
+                except ValueError:
+                    pc = None
+                st.metric(DISPLAY.get(code, code), f"{now_u:,.2f}",
+                          (f"{now_u - pc:+,.2f} ({(now_u / pc - 1) * 100:+.2f}%)" if pc else None),
+                          help=f"NSE's index level at {str(latest.get('t', ''))[11:19]}"
+                               + (f". Change vs the previous close {pc:,.2f} (as NSE and "
+                                  "brokers show it)" if pc else "")
+                               + (f" · {now_u - o:+,.2f} ({(now_u / o - 1) * 100:+.2f}%) from "
+                                  f"the 09:15 open {o:,.2f}" if o else ""))
+            st.markdown(f"**{title}**")
+            base = alt.Chart(d).encode(
+                x=x_enc, y=alt.Y("strike:N", sort=order, title=None,
+                                 axis=alt.Axis(labelFontSize=12, labelFontWeight="bold",
+                                               labelOverlap=False,
+                                               minExtent=Y_W, maxExtent=Y_W)))
+            rect = base.mark_rect(stroke="#0e1117", strokeWidth=1).encode(
+                color=alt.Color("effect:N", title=None,
+                                scale=alt.Scale(domain=["helps the index UP",
+                                                        "pushes the index DOWN",
+                                                        "no clear effect"],
+                                                range=["#1f9d55", "#d64545", "#3a3f47"]),
+                                legend=None),
+                tooltip=[alt.Tooltip("blk:N", title="block from"),
+                         alt.Tooltip("strike:N"), alt.Tooltip("word:N", title="who"),
+                         alt.Tooltip("d_oi:Q", title="OI change (contracts)", format="+,.0f"),
+                         alt.Tooltip("d_px:Q", title="premium change ₹", format="+,.2f"),
+                         alt.Tooltip("d_iv:Q", title="IV pressure (pts)", format="+,.2f"),
+                         alt.Tooltip("vol:Q", title="volume", format=",.0f"),
+                         alt.Tooltip("fresh:Q", title="fresh (OI change ÷ volume)",
+                                     format="+.1%")])
+            txt = base.mark_text(fontSize=12 if n <= 26 else 11, fontWeight="bold",
+                                 color="#ffffff").encode(text="cell:N")
+            st.altair_chart((rect + txt).properties(height=40 * len(ks)), width="stretch")
+        st.markdown(":green-background[ helps the index UP ] &nbsp; "
+                    ":red-background[ pushes the index DOWN ] &nbsp; "
+                    ":gray-background[ no clear effect ]")
+        st.caption(
+            "**Buyers in** = new longs (they paid) · **Writers in** = new shorts (they sold the "
+            "option) · **Writers out** = shorts buying back · **Buyers out** = longs selling."
+            + (" At 5-min blocks: **B+** buyers in · **W+** writers in · **W−** writers out · "
+               "**B−** buyers out." if 26 < n <= 80 else "")
+            + " **Green = helps the index up** (calls: buyers in, writers out; puts: writers "
+            "in, buyers out). '·' = quiet, '?' = unclear. Hover a cell for the numbers. A "
+            "column that turns the index bar's colour on both sides is mostly the candle "
+            "showing through.")
+
+        # 2) the day added up, per strike
+        with st.expander(f"Day total per strike — who did what, added up ({pick})"):
+            # 1) THE DAY IN ONE PICTURE: per strike and side, today's contracts split by who did it
+            flow = day_flow(stt)
+            if not flow.empty:
+                flow["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in flow["K"]]
+                flow["panel"] = flow["side"].map({"CE": "CALLS", "PE": "PUTS"})
+                net = (flow.groupby(["panel", "strike"])
+                       .agg(total=("v", "sum"), net=("signed", "sum")).reset_index())
+                net["lab"] = [("🟢 " if n > 0 else "🔴 " if n < 0 else "⚪ ") + f"net {n:+,.0f}"
+                              for n in net["net"]]
+                # one data frame for every layer (Altair facets need it): the label rides on the
+                # first row of each strike-side
+                flow = flow.merge(net, on=["panel", "strike"], how="left")
+                flow["first"] = ~flow.duplicated(["panel", "strike"])
+                y_enc = alt.Y("strike:N", sort=order, title=None,
+                              axis=alt.Axis(labelFontSize=11, labelFontWeight="bold"))
+                bars = (alt.Chart().mark_bar().encode(
+                    y=y_enc, x=alt.X("v:Q", title="contracts", stack="zero",
+                                     axis=alt.Axis(format="~s")),
+                    color=alt.Color("word:N", title=None,
+                                    scale=alt.Scale(domain=list(WHO_COLORS),
+                                                    range=list(WHO_COLORS.values())),
+                                    legend=alt.Legend(orient="bottom")),
+                    order=alt.Order("rank:Q"),
+                    tooltip=[alt.Tooltip("panel:N", title="side"), alt.Tooltip("strike:N"),
+                             alt.Tooltip("word:N", title="who"),
+                             alt.Tooltip("v:Q", title="contracts", format=",.0f"),
+                             alt.Tooltip("effect:N", title="for the index")]))
+                labels = (alt.Chart().mark_text(align="left", dx=4, fontSize=10, color="#d0d4da")
+                          .transform_filter("datum.first")
+                          .encode(y=y_enc, x="total:Q", text="lab:N"))
+                ch = (alt.layer(bars, labels, data=flow).properties(height=34 * len(ks), width=430)
+                      .facet(column=alt.Column("panel:N", title=None, sort=["CALLS", "PUTS"],
+                                               header=alt.Header(labelFontSize=13,
+                                                                 labelFontWeight="bold"))))
+                st.altair_chart(ch)
+                st.caption(
+                    "Each bar = the contracts that changed hands into or out of positions at that "
+                    "strike today, split by who: **Buyers in** (new longs) · **Writers in** (new "
+                    "shorts — they sold the option) · **Writers out** (shorts buying back) · "
+                    "**Buyers out** (longs selling). **Net** = contracts that help the index UP minus "
+                    "those that push it DOWN — calls: buyers in + writers out are up; puts: the "
+                    "mirror, writers in + buyers out are up.")
+
+
+        bb = bull_bear(stt)
+        if not bb.empty:
+            bb["blk"] = pd.to_datetime(bb["block"]).dt.strftime("%H:%M")
+            long = pd.concat([
+                bb.assign(kind="bullish contracts", v=bb["bull"]),
+                bb.assign(kind="bearish contracts", v=-bb["bear"])])
+            last = bb.iloc[-1]
+            st.markdown(f"**Tug of war in {pick}: bullish vs bearish contracts per block**")
+            bars = (alt.Chart(long).mark_bar(opacity=0.85).encode(
+                x=x_enc, y=alt.Y("v:Q", title="contracts", axis=alt.Axis(format="~s")),
+                color=alt.Color("kind:N", title=None,
+                                scale=alt.Scale(domain=["bullish contracts", "bearish contracts"],
+                                                range=["#1f9d55", "#d64545"]),
+                                legend=alt.Legend(orient="bottom")),
+                tooltip=[alt.Tooltip("blk:N", title="block from"),
+                         alt.Tooltip("bull:Q", title="bullish contracts", format=",.0f"),
+                         alt.Tooltip("bear:Q", title="bearish contracts", format=",.0f"),
+                         alt.Tooltip("net:Q", title="net (bullish − bearish)", format="+,.0f")]))
+            net = (alt.Chart(bb).mark_tick(color="#ffffff", thickness=3, size=28)
+                   .encode(x=x_enc, y="net:Q",
+                           tooltip=[alt.Tooltip("net:Q", title="net", format="+,.0f")]))
+            zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888").encode(y="y:Q")
+            st.altair_chart((bars + zero + net).properties(height=200), width="stretch")
+            st.caption(
+                "Every strike's OI change in the block, sorted by what it does to the index: "
+                "**green up** = call buyers in, call writers out, put writers in, put buyers out; "
+                "**red down** = call writers in, call buyers out, put buyers in, put writers "
+                f"out. White tick = the difference. Last block ({last['blk']}): "
+                f"{last['bull']:,.0f} bullish vs {last['bear']:,.0f} bearish contracts → "
+                + ("**bulls ahead**." if last["net"] > 0 else "**bears ahead**."
+                   if last["net"] < 0 else "even."))
+
+        st.markdown("**Each strike — calls vs puts OI change since yesterday**")
+        _panels_chart(st, strike_panels(df, ks, "OI change since yesterday", mins), ks,
+                      center, "OI change since yesterday", False, mins)
+        net = strike_panels(df, ks, "OI change since yesterday", mins)
+        if not net.empty:
+            net = (net.pivot_table(index=["t", "K"], columns="side", values="v")
+                   .reindex(columns=["CE", "PE"]))
+            net = (net["CE"] - net["PE"]).rename("v").reset_index().dropna()
+            net["side"] = "CE"                                    # one line per panel
+            st.markdown("**Each strike — calls − puts OI change** (above 0 = more calls added)")
+            _net_panels(st, net, ks, center, mins)
+        st.caption(
+            "⚠️ **Buying or writing — what this data can and cannot tell.** **Premium:** on 9 "
+            "Nov 2026 the colour matched the SAME block's index move 91% (Nifty) / 97% (Bank) "
+            "— it re-describes the candle. **IV pressure** was tested on Tradebot's archive "
+            "(Jun–Nov 2026, 55-86 non-expiry days per index, Best bucket, 15-min blocks): a "
+            "block's IV pressure is followed by the OPPOSITE in the next block (rank −0.09 "
+            "Nifty, −0.15 Bank, −0.25 Fin, −0.27 Midcap; t −5.7 to −25) — real buying or writing "
+            "would carry on, so most of a block's IV move is measurement noise (last-trade "
+            "bounce). Read only large, repeated moves. **Trade side** (last price at the ask vs "
+            "the bid) was also tested and dropped: no persistence, no agreement with IV. Who "
+            "really bought or wrote needs trade-by-trade data, which NSE's chain does not "
+            "give. The bucket's bullish − bearish net did NOT forecast the next block on any "
+            "index (t −1.4 to +1.5). **Fresh %** (OI change ÷ volume) is the solid number: "
+            "only 7-24% of a block's volume becomes positions — the rest is intraday churn. "
+            "Description of positioning, not a signal.")
+
+
+def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
+    import altair as alt
+    long = long.copy()
+    long["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in long["K"]]
+    order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(strikes, reverse=True)]
+    long["sign"] = np.where(long["v"] >= 0, "calls heavier", "puts heavier")
+    area = (alt.Chart(long).mark_bar(opacity=0.85)
+            .encode(x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9,
+                                                             tickCount=4)),
+                    y=alt.Y("v:Q", title=None, axis=alt.Axis(labelFontSize=9, format="~s")),
+                    color=alt.condition("datum.v >= 0", alt.value(CE_COLOR), alt.value(PE_COLOR)),
+                    tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"),
+                             alt.Tooltip("K:Q", title="strike", format=",.0f"),
+                             alt.Tooltip("v:Q", title="calls − puts", format="+,.0f")]))
+    zero = alt.Chart().mark_rule(color="#888").encode(y=alt.datum(0))
+    ch = (alt.layer(area, zero, data=long).properties(width=230, height=110)
+          .facet(facet=alt.Facet("strike:N", sort=order, title=None,
+                                 header=alt.Header(labelFontSize=11, labelFontWeight="bold")),
+                 columns=4)
+          .resolve_scale(y="independent"))
+    st.altair_chart(ch)
+
+
 def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.DataFrame,
                     strikes: list, center, lot: int | None, move_pct=None) -> dict:
     """Best / Better / Good: table + PCR through the session + calls vs puts per bucket."""
@@ -1951,7 +2709,14 @@ def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.Data
     cfg["PCR yday"] = cc.NumberColumn("PCR yday", format="%.2f", help=TIP_BUCKET["PCR yday"])
     cfg["Calls − puts ₹ Cr"] = cc.NumberColumn("Calls − puts ₹ Cr", format="%+,.0f",
                                                help=TIP_BUCKET["Calls − puts ₹ Cr"])
-    st.dataframe(bt, column_config=cfg, hide_index=True, width="stretch")
+    ev = st.dataframe(bt, column_config=cfg, hide_index=True, width="stretch",
+                      on_select="rerun", selection_mode="single-row", key=f"if_btab_{code}")
+    try:
+        sel = list(ev.selection.rows)
+    except Exception:                                        # noqa: BLE001 - no selection API
+        sel = []
+    pick = str(bt["Bucket"].iloc[sel[0]]) if sel and sel[0] < len(bt) else "Best"
+    _bucket_drill(st, code, pick, latest, df, bmap, center, bool(sel))
 
     b1, b2 = st.columns([2, 1])
     bbase = b1.segmented_control(
