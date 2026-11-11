@@ -78,6 +78,12 @@ def convert_day(day: dt.date, src: Path = TRADEBOT_LIVE) -> dict:
         expiry = _nearest_expiry(code, day)
         spot = cd[cd["symbol"] == sym].sort_values("t")[["t", "close"]]
         snaps = sorted(g["t"].unique())
+        # the day's OPEN, as the live writer stores it: NSE's official index open (DCM's
+        # end-of-day file), else the 09:15 one-minute candle's open
+        o, os_ = f._dcm_open(code, day), "nse-eod"
+        if not o:
+            c915 = spot[spot["t"] >= pd.Timestamp(f"{day} 09:15")]
+            o, os_ = (float(c915["close"].iloc[0]), "candle") if len(c915) else (None, None)
         rows, last_fp = [], None
         for t in snaps:
             t = pd.Timestamp(t).to_pydatetime()
@@ -103,7 +109,9 @@ def convert_day(day: dt.date, src: Path = TRADEBOT_LIVE) -> dict:
             chain = dict(ts=t, spot=u, expiry=expiry, ce=ce, pe=pe, strikes=both, tot=tot,
                          mp=f.max_pain({k: v[2] for k, v in ce.items()},
                                        {k: v[2] for k, v in pe.items()}), fetched=t)
-            row = f.compact(chain)
+            row = f.compact(chain, anchor=o)
+            if o:
+                row["o"], row["os"] = o, os_
             row.update(f.model_iv(row, expiry, t) or {"v": []})
             fp = f._fp(row)
             if fp == last_fp:

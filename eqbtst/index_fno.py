@@ -239,14 +239,18 @@ def listed_step(strikes, atm) -> float | None:
     return float(min(gaps)) if gaps else None
 
 
-def compact(chain: dict, keep: int = KEEP) -> dict:
+def compact(chain: dict, keep: int = KEEP, anchor: float | None = None) -> dict:
     """A chain as one log row, both sides inline: ATM and `keep` LISTED strikes either side,
-    plus every 100-point strike within LOG_GRID_N steps (so a 100-point ladder up to 20 a side
-    has its history even where NSE lists every 25 or 50)."""
+    plus every 100-point strike within LOG_GRID_N steps of the ATM AND of the day's opening
+    level `anchor` — the page's ladder is fixed at the 09:15 open, so its far strikes must
+    stay in the log however far the index runs from there (Bank Nifty on a 200 gap reaches
+    1,600 points from the open; a 1% move used to push that edge out of the log)."""
     atm = pick_atm(chain["strikes"], chain["spot"])
     reach = (LOG_GRID_N + 1) * LOG_GRID
+    centres = [atm] + ([anchor] if anchor else [])
     ks = sorted(set(window(chain["strikes"], atm, keep))
-                | {k for k in chain["strikes"] if on_grid(k, LOG_GRID) and abs(k - atm) <= reach})
+                | {k for k in chain["strikes"] if on_grid(k, LOG_GRID)
+                   and any(abs(k - c) <= reach for c in centres)})
     none = [None] * NF
     return {"t": im._iso(chain["ts"]), "f": im._iso(chain["fetched"]),
             "e": chain["expiry"].isoformat(), "u": chain["spot"], "a": atm,
@@ -448,6 +452,59 @@ def _last_logged(path: Path, expiry: str | None = None) -> dict | None:
     return last
 
 
+DCM_INDEX_NAME = {"NIFTY": "Nifty 50", "BANKNIFTY": "Nifty Bank",
+                  "FINNIFTY": "Nifty Financial Services", "MIDCPNIFTY": "Nifty Midcap Select"}
+_DCM_OPEN: dict = {}
+
+
+def _dcm_open(code: str, day: dt.date) -> float | None:
+    """DCM's end-of-day official index open (index_data), for finished days."""
+    key = (code, day)
+    if key in _DCM_OPEN:
+        return _DCM_OPEN[key]
+    v = None
+    try:
+        from . import data
+        with data._connect() as c:
+            r = c.execute("select open_val from index_data where trade_date = ? and index_name = ?",
+                          [day, DCM_INDEX_NAME[code]]).fetchone()
+        v = float(r[0]) if r and r[0] else None
+    except Exception:                                        # noqa: BLE001
+        return None                                          # locked archive: ask again later
+    _DCM_OPEN[key] = v
+    return v
+
+
+def day_open(code: str, day: dt.date, rows: list) -> tuple:
+    """(opening level, source text) — the 09:15 point the page fixes the ladder and buckets
+    on. NSE's official open first (stored in the log rows by the writer, or DCM's end-of-day
+    file for a finished day, or Index Management's same-day read); the first logged reading
+    only when it is from the open itself (by 09:20); otherwise unknown — never a late
+    reading passed off as the open (capture has started at 09:56 and 11:00 on past days)."""
+    for r in reversed(rows or []):
+        if r.get("o") and r.get("os") in ("nse", "nse-eod"):
+            return float(r["o"]), "NSE official open"
+    v = _dcm_open(code, day)
+    if v:
+        return v, "NSE official open (end-of-day file)"
+    v = None
+    try:
+        j = json.loads((im.DATA_DIR / f"latest_{code}.json").read_text(encoding="utf-8"))
+        c = j.get("cash") or {}
+        t = dt.datetime.fromisoformat(c["ts"]) if c.get("ts") else None
+        o = (c.get("index") or {}).get("open")
+        if t and t.date() == day and t.time() >= OPEN_FROM and o and o > 0:
+            v = float(o)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if v:
+        return v, "NSE official open"
+    if rows and rows[0].get("u") and rows[0]["t"][11:16] <= "09:20":
+        return float(rows[0]["u"]), f"first reading {rows[0]['t'][11:19]} (official open not read)"
+    return None, ("capture started " + rows[0]["t"][11:16] + " — opening level unknown"
+                  if rows else "no reading from the open")
+
+
 def captured_expiries(expiries: list, today: dt.date) -> list:
     """Nearest, next, and the nearest MONTHLY expiry (for Nifty the weekly is nearest, so
     that is three; for Bank / Fin / Midcap, monthly-only since Nov 2024, it is two)."""
@@ -478,6 +535,49 @@ def poll_expiries(code: str, client=None) -> list:
     return s["expiries"]
 
 
+OPEN_FROM = dt.time(9, 16)    # NSE's index 'open' is settled by then (the 09:15 print)
+OPEN_RETRY = 60.0
+
+
+def nse_open(code: str, day: dt.date, client=None) -> float | None:
+    """NSE's OFFICIAL index open for `day` (the 09:15 print from the pre-open auction).
+    Zero calls when Index Management's writer already holds a same-day read; otherwise one
+    call to NSE's index feed. None before 09:16 or when the read is not today's."""
+    try:
+        j = json.loads((im.DATA_DIR / f"latest_{code}.json").read_text(encoding="utf-8"))
+        c = j.get("cash") or {}
+        t = dt.datetime.fromisoformat(c["ts"]) if c.get("ts") else None
+        o = (c.get("index") or {}).get("open")
+        if t and t.date() == day and t.time() >= OPEN_FROM and o and o > 0:
+            return float(o)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        c = im.fetch_cash(code, client or _client())
+        t, o = c.get("ts"), (c.get("index") or {}).get("open")
+        if t and t.date() == day and t.time() >= OPEN_FROM and o and o > 0:
+            return float(o)
+    except Exception as exc:                                 # noqa: BLE001
+        _log_error("open", f"{code}: {exc}")
+    return None
+
+
+def _day_open_writer(code: str, now: dt.datetime) -> float | None:
+    s = _st(code)
+    o = s.get("open") or {}
+    if o.get("day") == now.date():
+        return o.get("o")
+    if not in_session(now) or now.time() < OPEN_FROM:
+        return None
+    if time.time() - s.get("open_tried", 0.0) < OPEN_RETRY:
+        return None
+    s["open_tried"] = time.time()
+    v = nse_open(code, now.date())
+    if v:
+        s["open"] = {"day": now.date(), "o": v}
+    return v
+
+
 def poll_chain(code: str, expiry: dt.date, client=None) -> bool:
     s = _st(code)
     key = expiry.isoformat()
@@ -487,10 +587,18 @@ def poll_chain(code: str, expiry: dt.date, client=None) -> bool:
         ch = parse_chain(j, expiry)
     except Exception as exc:                                 # noqa: BLE001
         s["err"] = f"chain {key}: {exc}"
-        _log_error("chain", f"{code} {key}: {exc}")
+        # once per expiry per hour: a far expiry NSE serves nearly empty (Fin Nifty Dec on
+        # 9 Nov 2026: one two-sided strike) failed every 3 minutes and buried real errors
+        last = s.setdefault("err_logged", {}).get(key, 0.0)
+        if time.time() - last >= 3600:
+            s["err_logged"][key] = time.time()
+            _log_error("chain", f"{code} {key}: {exc}")
         return False
-    row = compact(ch)
     ts = ch["ts"] or ch["fetched"]
+    day_open = _day_open_writer(code, _now()) if ts.date() == _now().date() else None
+    row = compact(ch, anchor=day_open)
+    if day_open:
+        row["o"], row["os"] = day_open, "nse"
     try:
         # {"v": []} when the model found no forward: the row still counts as MODEL-sourced,
         # so its IV is blank rather than silently NSE's (stale at a gap open)
@@ -1344,6 +1452,40 @@ def _ranges(ks: list, center) -> str:
     return " · ".join(runs) + f" ({len(ks)})"
 
 
+def spot_vs_buckets(spot, bmap: dict) -> dict:
+    """{bucket: 'where the index is from this bucket'} for the table's index column.
+
+    The buckets are fixed at the 09:15 open; the index is not. Exactly one bucket is 'here' —
+    the one holding the ladder strike NEAREST the index (so the half-way point between two
+    buckets is never claimed by both). The others say how far the index must travel to reach
+    their nearest strike. Past the outermost strike by more than half a step, no bucket holds
+    it and Good says so: the morning ladder no longer covers the money."""
+    ks = sorted(bmap)
+    if not ks or spot is None or not np.isfinite(spot):
+        return {b: "—" for b in set(bmap.values())}
+    steps = np.diff(ks)
+    half = (float(steps[steps > 0].min()) if (steps > 0).any() else 0.0) / 2
+    near = min(ks, key=lambda k: (abs(k - spot), k))
+    off = spot < ks[0] - half or spot > ks[-1] + half
+    here = None if off else bmap[near]
+    out = {}
+    for name in BUCKET_NAMES:
+        mine = [k for k in ks if bmap[k] == name]
+        if not mine:
+            continue
+        if name == here:
+            out[name] = "◀ index here"
+            continue
+        k = min(mine, key=lambda x: (abs(x - spot), x))
+        d = k - spot
+        txt = f"{abs(d):,.0f} pts {'up' if d > 0 else 'down'} to {k:,.0f} ({abs(d) / spot * 100:.1f}%)"
+        if off and name == "Good":
+            txt = (f"⚠ index past the ladder — {abs(d):,.0f} pts "
+                   f"{'above' if d < 0 else 'below'} {k:,.0f}")
+        out[name] = txt
+    return out
+
+
 def bucket_table(latest: dict, first: dict | None, bmap: dict, lot: int | None) -> pd.DataFrame:
     """One row per bucket: OI, change today and since the first reading, PCR, volume, ₹."""
     ce, pe = row_sides(latest)
@@ -1354,6 +1496,8 @@ def bucket_table(latest: dict, first: dict | None, bmap: dict, lot: int | None) 
     # level the table's ₹ and the line's last point disagreed by the day's index move
     # (5 Nov Nifty Best -78,435 vs -77,744 Cr)
     u = (first or {}).get("u") or latest.get("u")
+    where = spot_vs_buckets(latest.get("u"), bmap)
+    now_u = latest.get("u")
     rows = []
     for name in BUCKET_NAMES:
         ks = sorted(k for k, b in bmap.items() if b == name)
@@ -1370,6 +1514,7 @@ def bucket_table(latest: dict, first: dict | None, bmap: dict, lot: int | None) 
             else None
         rows.append({
             "Bucket": name, "Strikes": _ranges(ks, center_k),
+            "Index now": (f"{now_u:,.2f} · {where.get(name, '—')}" if now_u else "—"),
             "Call OI": coi, "Put OI": poi,
             "PCR": (poi / coi) if coi else None,
             "PCR yday": ((poi - pd_) / (coi - cd)) if coi and cd is not None and pd_ is not None
@@ -1382,7 +1527,7 @@ def bucket_table(latest: dict, first: dict | None, bmap: dict, lot: int | None) 
             "Today": _lean(cd, pd_)})
     df = pd.DataFrame(rows)
     for c in df.columns:
-        if c not in ("Bucket", "Strikes", "Today"):
+        if c not in ("Bucket", "Strikes", "Index now", "Today"):
             df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
     return df
 
@@ -1425,19 +1570,40 @@ def bucket_series(df: pd.DataFrame, bmap: dict, lot: int | None,
 METRICS = {
     "OI change since yesterday": ("doi", "contracts", "+,.0f"),
     "Open interest": ("oi", "contracts", ",.0f"),
-    "Volume per 5 min": ("vol5", "contracts", ",.0f"),
+    "Volume per block": ("vol5", "contracts", ",.0f"),
     "Implied volatility": ("IV", "IV %", ".2f"),
     "Premium (last price)": ("ltp", "₹", ",.2f"),
 }
 
 
-def strike_panels(df: pd.DataFrame, strikes: list, metric: str) -> pd.DataFrame:
-    """Long frame for the small-multiples grid: t, K, side, v."""
+BLOCKS = (5, 15, 30, 60)          # minutes; every block counted from 09:15 (NSE's hourly candles)
+SESSION_OPEN = dt.time(9, 15)
+
+
+def block_start(t, minutes: int) -> pd.Series:
+    """Start of the session block each time falls in, counted from 09:15: an hour block is
+    09:15-10:15, 10:15-11:15 ... 14:15-15:15, 15:15-15:30 (as NSE / chart sites draw hourly
+    candles). Clock-hour blocks (09:00-10:00) would give the first hour only 45 minutes."""
+    t = pd.Series(pd.to_datetime(t)).reset_index(drop=True)
+    anchor = t.dt.normalize() + pd.Timedelta(hours=SESSION_OPEN.hour, minutes=SESSION_OPEN.minute)
+    m = pd.Timedelta(minutes=minutes)
+    return anchor + ((t - anchor) // m) * m
+
+
+def strike_panels(df: pd.DataFrame, strikes: list, metric: str,
+                  minutes: int | None = None) -> pd.DataFrame:
+    """Long frame for the small-multiples grid: t, K, side, v.
+
+    minutes=None: every reading. Otherwise one point per block:
+      levels (OI, OI change, IV, premium) - the LAST reading in the block, plotted at that
+        reading's own time (the block still running ends at 'now', not in the future);
+      volume - contracts traded IN the block (bars at the block's start), default 5 min."""
     col = METRICS[metric][0]
     w = df[df["K"].isin(strikes)]
     if w.empty:
         return pd.DataFrame(columns=["t", "K", "side", "v"])
     if col == "vol5":
+        m = minutes or 5
         w = w.sort_values("t")
         parts = []
         for (side, K), g in w.groupby(["side", "K"]):
@@ -1445,12 +1611,23 @@ def strike_panels(df: pd.DataFrame, strikes: list, metric: str) -> pd.DataFrame:
             step = v.diff()
             step[step < 0] = np.nan          # NSE resets / a bad print: not negative volume
             if len(v):
-                step.iloc[0] = np.nan
-            b = step.resample("5min", label="right", closed="right").sum(min_count=1)
+                # NSE's volume is cumulative from 09:15, so the first reading's own count is
+                # trading between 09:15 and that reading: it belongs to one block only when the
+                # reading is inside the session's FIRST block. A late start (laptop woke at
+                # 10:40) would otherwise pile the whole morning into one bar.
+                b0 = block_start([v.index[0]], m).iloc[0]
+                first_block = b0 == b0.normalize() + pd.Timedelta(
+                    hours=SESSION_OPEN.hour, minutes=SESSION_OPEN.minute)
+                step.iloc[0] = v.iloc[0] if first_block and pd.notna(v.iloc[0]) else np.nan
+            b = step.groupby(block_start(step.index, m).values).sum(min_count=1)
             parts.append(pd.DataFrame({"t": b.index, "K": K, "side": side, "v": b.values}))
         return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
             columns=["t", "K", "side", "v"])
-    return w[["t", "K", "side", col]].rename(columns={col: "v"})
+    out = w[["t", "K", "side", col]].rename(columns={col: "v"})
+    if minutes:
+        out = out.dropna(subset=["v"]).sort_values("t").reset_index(drop=True)
+        out = out.groupby(["side", "K", block_start(out["t"], minutes)]).tail(1)
+    return out.reset_index(drop=True)
 
 
 def oi_blocks(df: pd.DataFrame, strikes: list, minutes: int = 15) -> pd.DataFrame:
@@ -1465,8 +1642,7 @@ def oi_blocks(df: pd.DataFrame, strikes: list, minutes: int = 15) -> pd.DataFram
         if g.empty:
             continue
         prev0 = g["oi"].iloc[0] - (g["doi"].iloc[0] or 0.0)
-        last = g.set_index("t")["oi"].resample(f"{minutes}min", label="left",
-                                               closed="left").last().dropna()
+        last = g.groupby(block_start(g["t"], minutes).values)["oi"].last().dropna()
         chg = last.diff()
         chg.iloc[0] = last.iloc[0] - prev0
         out.append(pd.DataFrame({"block": chg.index, "K": K, "side": side, "chg": chg.values}))
@@ -1715,6 +1891,10 @@ TIP_BUCKET = {
     "Put ΔOI": "Puts opened (+) or closed (−) in this bucket today, contracts.",
     "Call ΔOI since first": "Calls opened or closed since today's first logged reading.",
     "Put ΔOI since first": "Puts opened or closed since today's first logged reading.",
+    "Index now": "The index level at the latest reading and where it sits against this "
+                 "bucket. The buckets are fixed at the 09:15 open, the index moves: '◀ index "
+                 "here' marks the bucket holding the strike nearest the index; the others show "
+                 "how far the index must travel to reach their nearest strike.",
     "Call volume": "Call contracts traded today in this bucket.",
     "Put volume": "Put contracts traded today in this bucket.",
     "Calls − puts ₹ Cr": "Calls added minus puts added today, as ₹ crore of exposure "
@@ -1760,6 +1940,9 @@ def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.Data
         return bmap
     cc = st.column_config
     cfg = {c: cc.Column(c, help=TIP_BUCKET[c]) for c in bt.columns if c in TIP_BUCKET}
+    # name the index and the time: 'Nifty 50 @ 11:42' (a past day shows its last reading)
+    cfg["Index now"] = cc.TextColumn(f"{DISPLAY.get(code, code)} @ {latest.get('t', '')[11:16]}",
+                                     help=TIP_BUCKET["Index now"])
     for c in ("Call OI", "Put OI", "Call volume", "Put volume"):
         cfg[c] = cc.NumberColumn(c, format="%,.0f", help=TIP_BUCKET[c])
     for c in ("Call ΔOI", "Put ΔOI", "Call ΔOI since first", "Put ΔOI since first"):
@@ -1787,13 +1970,13 @@ def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.Data
                "Nifty +0.40/+0.57); in the NEXT block nothing (pooled t −0.7 to +0.9; 'puts "
                "built' was followed by a rise 45-54% of the time against a 48-51% base). A "
                "rising PCR is what a rally looks like, not a reason to expect one.")
-    _lines(st, bs.pivot(index="t", columns="bucket", values="PCR")
-           .reindex(columns=[b for b in BUCKET_NAMES if b in set(bs["bucket"])]),
-           "put ÷ call OI", BUCKET_COLOR, height=220, fmt=".2f")
+    _panel_lines(st, bs.pivot(index="t", columns="bucket", values="PCR")
+                 .reindex(columns=[b for b in BUCKET_NAMES if b in set(bs["bucket"])]),
+                 "put ÷ call OI", BUCKET_COLOR, height=200, fmt=".2f")
     metric = b2.segmented_control("Show", ["OI change", "Open interest", "Volume per 5 min"],
                                   default="OI change", key=f"if_bmetric_{code}") or "OI change"
     if metric == "Volume per 5 min":
-        v = strike_panels(df, strikes, "Volume per 5 min")
+        v = strike_panels(df, strikes, "Volume per block", 5)
         v["bucket"] = v["K"].map(bmap)
         long = (v.dropna(subset=["v"]).groupby(["t", "bucket", "side"])["v"].sum()
                 .reset_index())
@@ -1840,6 +2023,102 @@ def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.Data
     return bmap
 
 
+def panel_titles(wide: pd.DataFrame, fmt: str = "{:.2f}", dfmt: str = "{:+.2f}") -> dict:
+    """{series: 'Best · 0.48 now · -0.02 since 09:20'} from each line's first and last value."""
+    out = {}
+    for c in wide.columns:
+        v = wide[c].dropna()
+        if v.empty:
+            out[c] = str(c)
+            continue
+        out[c] = (f"{c} · {fmt.format(v.iloc[-1])} now · "
+                  f"{dfmt.format(v.iloc[-1] - v.iloc[0])} since {v.index[0]:%H:%M}")
+    return out
+
+
+def _panel_lines(st, wide: pd.DataFrame, ylab: str, colors: dict | None = None,
+                 height: int = 170, fmt: str = ".2f", width: int = 330) -> None:
+    """One small chart per line, each zoomed to its OWN range. On one shared axis the PCR
+    lines sat at 0.5 / 0.6 / 1.3 and each bucket's real movement (a few hundredths) was
+    flattened to nothing (9 Nov 2026). The header carries the level and the change, so the
+    buckets still compare by number."""
+    import altair as alt
+    if wide is None or wide.empty or wide.dropna(how="all").empty:
+        st.caption("Not enough logged readings yet.")
+        return
+    titles = panel_titles(wide, "{:" + fmt + "}", "{:+" + fmt + "}")
+    order = [titles[c] for c in wide.columns]
+    long = (wide.rename_axis("t").reset_index()
+            .melt("t", var_name="series", value_name="v").dropna())
+    long["panel"] = long["series"].map(titles)
+    long = im._with_segments(long, "t", "series")
+    color = alt.Color("series:N", legend=None)
+    if colors:
+        color = alt.Color("series:N", legend=None,
+                          scale=alt.Scale(domain=list(colors), range=list(colors.values())))
+    ch = (alt.Chart(long).mark_line(strokeWidth=2)
+          .encode(x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", tickCount=6)),
+                  y=alt.Y("v:Q", title=ylab, scale=alt.Scale(zero=False, nice=True)),
+                  color=color, detail="line:N",
+                  tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"), "series:N",
+                           alt.Tooltip("v:Q", title=ylab, format=fmt)])
+          .properties(width=width, height=height)
+          .facet(column=alt.Column("panel:N", sort=order, title=None,
+                                   header=alt.Header(labelFontSize=12, labelFontWeight="bold")))
+          .resolve_scale(y="independent"))
+    st.altair_chart(ch)
+
+
+def index_domain(spot: pd.Series, open_lvl=None, pad: float = 0.08) -> tuple | None:
+    """y-range for the index line: the day's own low-high (and the open, if known) plus 8% each
+    side. Altair's 'nice' rounding stretched a 160-point Nifty day to a 1,000-point axis
+    (9 Nov 2026: the line sat flat on the 25,000 gridline)."""
+    v = pd.to_numeric(spot, errors="coerce").dropna()
+    if v.empty:
+        return None
+    lo, hi = float(v.min()), float(v.max())
+    if open_lvl:
+        lo, hi = min(lo, float(open_lvl)), max(hi, float(open_lvl))
+    w = hi * 0.001                             # a flat stretch still gets 0.1% of height,
+    if hi - lo < w:                            # centred on it
+        extra = (w - (hi - lo)) / 2
+        lo, hi = lo - extra, hi + extra
+    span = hi - lo
+    return lo - pad * span, hi + pad * span
+
+
+def _index_line(st, spot: pd.Series, name: str, open_lvl=None, height: int = 220) -> None:
+    """The index through the session on its OWN range, with the 09:15 open as a dashed line
+    and the day's low / high / last in the header."""
+    import altair as alt
+    v = pd.to_numeric(spot, errors="coerce").dropna()
+    dom = index_domain(v, open_lvl)
+    if dom is None:
+        st.caption("Not enough logged readings yet.")
+        return
+    long = v.rename("v").rename_axis("t").reset_index().assign(series=name)
+    long = im._with_segments(long, "t", "series")
+    last = float(v.iloc[-1])
+    head = f"{name} {last:,.2f}"
+    if open_lvl:
+        head += f" ({last - open_lvl:+,.2f} · {(last / open_lvl - 1) * 100:+.2f}% from open {open_lvl:,.2f})"
+    head += f" · low {v.min():,.2f} at {v.idxmin():%H:%M} · high {v.max():,.2f} at {v.idxmax():%H:%M}"
+    line = (alt.Chart(long).mark_line(strokeWidth=2, color="#5aa9e6")
+            .encode(x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M")),
+                    y=alt.Y("v:Q", title=None,
+                            scale=alt.Scale(domain=list(dom), nice=False, zero=False),
+                            axis=alt.Axis(format=",.0f", tickCount=5)),
+                    detail="line:N",
+                    tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"),
+                             alt.Tooltip("v:Q", title=name, format=",.2f")]))
+    ch = line
+    if open_lvl:
+        ref = pd.DataFrame({"y": [float(open_lvl)], "lab": [f"open {open_lvl:,.2f}"]})
+        ch = ch + alt.Chart(ref).mark_rule(color="#999", strokeDash=[4, 4]).encode(y="y:Q")             + alt.Chart(ref).mark_text(align="left", dx=4, dy=-6, color="#999", fontSize=10)             .encode(x=alt.value(0), y="y:Q", text="lab:N")
+    st.markdown(f"**{head}**")
+    st.altair_chart(ch.properties(height=height), width="stretch")
+
+
 def _lines(st, wide: pd.DataFrame, ylab: str, colors: dict | None = None, height=240,
            zero=False, fmt="+,.0f"):
     import altair as alt
@@ -1865,7 +2144,8 @@ def _lines(st, wide: pd.DataFrame, ylab: str, colors: dict | None = None, height
     st.altair_chart(ch, width="stretch")
 
 
-def _panels_chart(st, long: pd.DataFrame, strikes: list, atm, metric: str, shared: bool):
+def _panels_chart(st, long: pd.DataFrame, strikes: list, atm, metric: str, shared: bool,
+                  minutes: int | None = None):
     import altair as alt
     if long.empty or long["v"].dropna().empty:
         st.caption("Not enough logged readings yet.")
@@ -1875,7 +2155,8 @@ def _panels_chart(st, long: pd.DataFrame, strikes: list, atm, metric: str, share
     long["strike"] = [f"{k:,.0f}" + (" ★ ATM" if k == atm else "") for k in long["K"]]
     order = [f"{k:,.0f}" + (" ★ ATM" if k == atm else "") for k in sorted(strikes, reverse=True)]
     long["g"] = long["side"] + "·" + long["K"].astype(str)
-    long = im._with_segments(long, "t", "g")
+    # a line breaks only where a whole block has no reading (laptop asleep), not between blocks
+    long = im._with_segments(long, "t", "g", pd.Timedelta(minutes=(minutes or 0) + 6))
     mark = alt.Chart(long).mark_bar() if metric.startswith("Volume") else \
         alt.Chart(long).mark_line(strokeWidth=1.8)
     base = mark.encode(
@@ -1887,7 +2168,8 @@ def _panels_chart(st, long: pd.DataFrame, strikes: list, atm, metric: str, share
                         scale=alt.Scale(domain=["CE", "PE"], range=[CE_COLOR, PE_COLOR]),
                         legend=alt.Legend(orient="bottom", labelExpr=(
                             "datum.label == 'CE' ? 'Calls (CE)' : 'Puts (PE)'"))),
-        tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"), "side:N",
+        tooltip=[alt.Tooltip("t:T", title=("block from" if metric.startswith("Volume")
+                                           else "time"), format="%H:%M"), "side:N",
                  alt.Tooltip("K:Q", title="strike", format=",.0f"),
                  alt.Tooltip("v:Q", title=unit, format=fmt)])
     if not metric.startswith("Volume"):
@@ -2025,36 +2307,104 @@ def _expiry_label(e: dt.date, expiries: list, today: dt.date) -> str:
     return f"{e:%d %b %Y} · {kind}" + (f" · {left}" if left else "")
 
 
-def _freshness(st, latest: dict, fut: dict | None, rows: list, live: bool):
-    now = _now()
+def freshness(latest: dict, fut: dict | None, rows: list, live: bool,
+              now: dt.datetime | None = None) -> dict:
+    """The page's clocks as ages in seconds — the same four Index Management shows.
 
-    def ago(s):
+      chain stamp  - the time NSE printed on the option chain (moves about once a minute)
+      chain read   - when the writer last ASKED NSE for it (can be seconds ago while the stamp
+                     is a minute old: NSE has nothing newer, we are not late)
+      changed      - when the chain's NUMBERS last changed (a frozen feed keeps a ticking stamp)
+      futures      - NSE's stamp on the index futures read, and when it was read
+    Levels follow Index Management: green up to 3 minutes, orange to 6, red beyond — only
+    while the market is open; grey otherwise."""
+    now = now or _now()
+
+    def ts(x):
         try:
-            return f"{(now - dt.datetime.fromisoformat(s)).total_seconds():.0f}s ago"
+            return dt.datetime.fromisoformat(x) if x else None
         except (TypeError, ValueError):
-            return "—"
-    t = latest.get("t")
-    stale = False
-    if live and t and market_window():
-        try:
-            stale = (now - dt.datetime.fromisoformat(t)).total_seconds() > STALE_AFTER
-        except ValueError:
-            pass
-    # green only while the market is open and the stamp is fresh; grey = closed / past day
-    dot = ":red[●]" if stale else ":green[●]" if live and market_window() else ":gray[●]"
-    bits = [f"{dot} **Chain** · NSE time {t[11:19] if t else '—'} · read {ago(latest.get('f'))}"
-            + (f" · numbers last changed {ago(latest.get('c'))}" if live and latest.get("c")
-               else "")]
-    if fut and fut.get("t"):
-        bits.append(f"**Futures** · NSE time {fut['t'][11:19]}")
-    bits.append(f"**Logged today** · {len(rows)} readings"
-                + (f" from {rows[0]['t'][11:16]}" if rows else ""))
-    st.markdown("  ·  ".join(bits))
-    if stale:
-        st.warning(f"NSE's chain stamp is more than {STALE_AFTER/60:.0f} minutes old while the "
-                   "market is open. The writer re-primes its NSE session by itself after "
-                   f"{HEAL_AFTER/60:.0f} minutes; ↻ refresh in the sidebar forces it now.")
+            return None
 
+    def age(x):
+        return None if x is None else max(0.0, (now - x).total_seconds())
+
+    open_now = live and in_session(now) and capture_window(now)
+
+    def level(a):
+        if a is None:
+            return "none"
+        if not open_now:
+            return "closed"
+        return "ok" if a <= im.FRESH_OK else "warn" if a <= im.FRESH_WARN else "stale"
+
+    c_stamp, c_read, c_chg = ts(latest.get("t")), ts(latest.get("f")), ts(latest.get("c"))
+    f_stamp, f_read = ts((fut or {}).get("t")), ts((fut or {}).get("f"))
+    out = dict(chain_stamp=c_stamp, chain_age=age(c_stamp), chain_read_age=age(c_read),
+               changed_age=age(c_chg) if live else None,
+               fut_stamp=f_stamp, fut_age=age(f_stamp), fut_read_age=age(f_read),
+               drawn=now, open=open_now,
+               next_chain=None if c_read is None or not open_now
+               else max(0.0, CHAIN_EVERY - age(c_read)),
+               next_fut=None if f_read is None or not open_now
+               else max(0.0, FUT_EVERY - age(f_read)),
+               logged=len(rows or []),
+               log_from=rows[0]["t"][11:16] if rows else None)
+    # The DOT is judged on how old NSE's data was WHEN READ plus how overdue the next read is,
+    # not on its age now: futures are asked every 120 s and NSE's stamp is already 40-66 s old
+    # when read (9 Nov 2026), so 'age now' crossed the 3-minute orange line between every two
+    # reads with nothing wrong. A frozen feed (old when read) and a dead writer (reads
+    # overdue) both still turn it orange / red.
+    def effective(a, read_a, every):
+        if a is None or read_a is None:
+            return a
+        return max(0.0, a - read_a) + max(0.0, read_a - every)
+    out["chain_level"] = level(effective(out["chain_age"], out["chain_read_age"], CHAIN_EVERY))
+    out["fut_level"] = level(effective(out["fut_age"], out["fut_read_age"], FUT_EVERY))
+    return out
+
+
+def _freshness(st, latest: dict, fut: dict | None, rows: list, live: bool):
+    """The time strip above the page, refreshed with it every 15s (as Index Management's)."""
+    f = freshness(latest, fut, rows, live)
+    ago, lv = im._ago, im._LEVEL
+    with st.container(border=True):
+        c = st.columns(4)
+        if f["chain_stamp"]:
+            c[0].markdown(
+                f"{lv[f['chain_level']]} **Option chain** · NSE time "
+                f"**{f['chain_stamp']:%H:%M:%S}**  \n:gray[{ago(f['chain_age'])}"
+                + (f" · numbers changed {ago(f['changed_age'])}" if f["changed_age"] is not None
+                   else "") + "]")
+        else:
+            c[0].markdown(":gray[○] **Option chain** · not read yet")
+        if f["fut_stamp"]:
+            c[1].markdown(f"{lv[f['fut_level']]} **Index futures** · NSE time "
+                          f"**{f['fut_stamp']:%H:%M:%S}**  \n:gray[{ago(f['fut_age'])}]")
+        else:
+            c[1].markdown(":gray[○] **Index futures** · not read yet")
+        if f["open"]:
+            c[2].markdown(f"**Next check** · chain in **{f['next_chain'] or 0:.0f}s**, futures in "
+                          f"**{f['next_fut'] or 0:.0f}s**  \n"
+                          f":gray[chain last asked {ago(f['chain_read_age'])}]")
+        else:
+            c[2].markdown("**Next check** · market closed  \n"
+                          + (":gray[final numbers for the session]" if live
+                             else ":gray[a past session, from the log]"))
+        c[3].markdown(f"**Page drawn** · **{f['drawn']:%H:%M:%S}**  \n"
+                      f":gray[redraws every 15s · {f['logged']} readings logged"
+                      + (f" from {f['log_from']}" if f["log_from"] else "") + "]")
+        if f["chain_level"] in ("warn", "stale") or f["fut_level"] in ("warn", "stale"):
+            st.caption(":orange[A dot that is not green means NSE has not published newer data "
+                       "for over 3 minutes (red: over 6). Read the page as of that time, not "
+                       f"as now. The writer opens a fresh NSE session by itself after "
+                       f"{HEAL_AFTER / 60:.0f} minutes of unchanged numbers; ↻ refresh in the "
+                       "sidebar forces it now.]")
+        else:
+            st.caption("NSE time = the time printed on NSE's own data. The chain and the futures "
+                       "each move about once a minute, however often this page asks — a stamp up "
+                       "to two minutes old is normal. 'Numbers changed' catches a feed whose clock "
+                       "ticks while its numbers have stopped.")
 
 def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     rows = chain_log(code, day, expiry)
@@ -2085,10 +2435,13 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
 
     c1, c2, c3 = st.columns([1.3, 1.3, 2])
     anchor = c1.segmented_control(
-        "Window", ["around live ATM", "around first-reading ATM"], default="around live ATM",
-        key=f"if_anchor_{code}", help="Live ATM: the 17 strikes follow the index. First-"
-        "reading ATM: they stay where they were at the day's first reading, so the session "
-        "charts keep the same strikes even after a big move.") or "around live ATM"
+        "Window", ["09:15 open (fixed)", "live ATM"], default="09:15 open (fixed)",
+        key=f"if_anchor2_{code}", help="09:15 open (default): the strike nearest the index's "
+        "official opening price, and 8 strikes either side, fixed for the day — the buckets "
+        "(Best / Better / Good) are decided then and do not move. Example: Nifty opens at "
+        "23,780 → 23,800 is the centre, 23,000-24,600 the ladder on a 100-point gap. Live ATM: "
+        "the ladder re-centres on the index at every refresh (the day's lines are recomputed "
+        "for those strikes).") or "09:15 open (fixed)"
     mode = c2.segmented_control(
         "Read", ["IV read", "premium read"], default="IV read", key=f"if_mode_{code}",
         help="IV read: OI change vs IV change since the first reading. Premium read: premium "
@@ -2120,11 +2473,14 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
         help=f"Default {BAND} (17 strikes). The log holds {KEEP} listed strikes and every "
              f"100-point strike within {LOG_GRID_N} steps either side, so a wide ladder has "
              "its history too.")
-    ref = first if (anchor.startswith("around first") and first) else latest
+    ref = latest
     rce, rpe = row_sides(ref)
     all_ks = grid(set(rce) & set(rpe), step)
-    strikes = window(all_ks, grid_atm(ref, step), n_side)
     atm_now = grid_atm(latest, step)
+    o_lvl, o_src = day_open(code, day, rows)
+    fixed = anchor.startswith("09:15") and o_lvl is not None
+    centre = pick_atm(all_ks, o_lvl) if fixed else atm_now
+    strikes = window(all_ks, centre, n_side)
     lot, lot_how = _lot(code, expiry, latest, day)
     with c3:
         st.caption(f"Lot **{lot or '—'}** ({lot_how or 'unknown'}). ₹ figures = contracts × "
@@ -2187,9 +2543,28 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
                    "IV on this page is computed from the options' own parity forward and "
                    "does not have that problem. Open interest after 15:40 is NSE's corrected, "
                    "official figure.")
+    if fixed:
+        steps = (all_ks.index(atm_now) - all_ks.index(centre)
+                 if atm_now in all_ks and centre in all_ks else None)
+        where = bucket_map(strikes, centre).get(atm_now)
+        msg = (f"📍 **Ladder fixed at the 09:15 open**: {DISPLAY[code]} opened at **{o_lvl:,.2f}** "
+               f"({o_src}) → centre strike **{centre:,.0f}**, {len(strikes)} strikes, buckets fixed "
+               f"for the day. Now {latest.get('u', 0):,.2f} → live ATM {atm_now:,.0f}"
+               + (f", {abs(steps)} strike{'s' if abs(steps) != 1 else ''} "
+                  f"{'above' if steps > 0 else 'below'} the open strike" if steps else
+                  ", at the open strike" if steps == 0 else "")
+               + (f" (in **{where}**)." if where else "."))
+        if where is None:
+            st.warning(msg + " The index has moved OFF the morning ladder — its live ATM is not "
+                       "among these strikes. Switch Window to 'live ATM' to follow it.")
+        else:
+            st.caption(msg)
+    elif anchor.startswith("09:15"):
+        st.warning(f"⏱️ Opening level not available ({o_src}), so the ladder follows the live "
+                   "ATM. Past days use NSE's end-of-day open once DCM has loaded it.")
     st.subheader(f"The {len(strikes)} strikes — calls left, puts right")
     tab = ladder(latest, first, strikes, mode, atm_now, ivbase)
-    center = grid_atm(ref, step)
+    center = centre
     tab["Bucket"] = tab["Strike"].map(bucket_map(strikes, center))
     _ladder_view(st, tab, latest, mode)
     rs = reconcile_summary(code)
@@ -2216,8 +2591,7 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
                         step)
     if not ss.empty:
         unit = "₹ Cr" if lot else "contracts"
-        _lines(st, ss[["spot"]].rename(columns={"spot": DISPLAY[code]}), "index", height=150,
-               fmt=",.2f")
+        _index_line(st, ss["spot"], DISPLAY[code], o_lvl)
         _lines(st, ss[["calls", "puts"]].rename(columns={"calls": "calls opened",
                                                          "puts": "puts opened"}),
                f"OI change, {unit}", {"calls opened": CE_COLOR, "puts opened": PE_COLOR},
@@ -2233,18 +2607,32 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
         st.caption("Session lines appear once a few readings are logged.")
 
     st.subheader("Strike by strike — calls vs puts through the session")
-    k1, k2 = st.columns([3, 1])
+    k1, k3, k2 = st.columns([3, 2, 1])
     metric = k1.segmented_control("Show", list(METRICS), default="OI change since yesterday",
                                   key=f"if_metric_{code}") or "OI change since yesterday"
+    is_vol = metric.startswith("Volume")
+    # volume has no 'each reading' (a 1-minute difference of a cumulative count is mostly
+    # noise and NSE's stamp steps ~1 min), so it gets its own key and options
+    pblk = k3.segmented_control(
+        "Time block", list(BLOCKS) if is_vol else ["each reading", *BLOCKS], default=5,
+        key=f"if_pblk_{code}" + ("_v" if is_vol else ""),
+        format_func=lambda x: x if isinstance(x, str) else ("1 hr" if x == 60 else f"{x} min"),
+        help="Blocks count from 09:15 (an hour = 09:15-10:15 ..., as NSE's hourly candles). "
+             "Lines show the LAST reading of each block, so the block still running ends at "
+             "now. Volume = contracts traded in the block. 'Each reading' = every ~1-min "
+             "read, nothing smoothed.") or 5
+    pmin = None if isinstance(pblk, str) else int(pblk)
     shared = k2.toggle("Same scale on every strike", value=True, key=f"if_shared_{code}",
                        help="On: panels compare with each other. Off: each panel zooms to its "
                             "own range (small strikes become readable, sizes no longer compare).")
-    _panels_chart(st, strike_panels(df, strikes, metric), strikes, atm_now, metric,
-                  shared)
+    _panels_chart(st, strike_panels(df, strikes, metric, pmin), strikes, atm_now, metric,
+                  shared, pmin)
 
     st.subheader("Where positions were opened and closed — by block")
-    mins = st.segmented_control("Block", [5, 15, 30], default=15, key=f"if_blk_{code}",
-                                format_func=lambda x: f"{x} min") or 15
+    mins = st.segmented_control("Time block", list(BLOCKS), default=15, key=f"if_blk_{code}",
+                                format_func=lambda x: "1 hr" if x == 60 else f"{x} min",
+                                help="Blocks count from 09:15: an hour = 09:15-10:15, "
+                                     "10:15-11:15 ... 15:15-15:30.") or 15
     _heatmap(st, oi_blocks(df, strikes, mins), strikes, atm_now, mins)
     st.caption("Each cell = contracts opened (blue) or closed (red) at that strike in that "
                "block. The first block counts from yesterday's close, so the opening rush is "
@@ -2269,9 +2657,9 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
         p1, p2 = st.columns(2)
         with p1:
             st.caption("PCR (Put-Call Ratio) through the session")
-            _lines(st, ss[["pcr_band", "pcr_all"]].rename(
-                columns={"pcr_band": f"{len(strikes)} strikes", "pcr_all": "whole chain"}), "put ÷ call OI",
-                height=170, fmt=".2f")
+            _panel_lines(st, ss[["pcr_band", "pcr_all"]].rename(
+                columns={"pcr_band": f"{len(strikes)} strikes", "pcr_all": "whole chain"}),
+                "put ÷ call OI", height=160, fmt=".2f", width=230)
         with p2:
             st.caption("Max pain vs the index")
             _lines(st, ss[["max pain", "spot"]].rename(columns={"spot": "index"}), "level",

@@ -234,7 +234,7 @@ def test_strike_panels_volume_blocks_never_negative():
         if k[0] == 25000.0:
             k[1 + f.NF + 4] = 10.0
     df = f.frame(rows)
-    p = f.strike_panels(df, [25000.0], "Volume per 5 min")
+    p = f.strike_panels(df, [25000.0], "Volume per block")
     assert (p["v"].dropna() >= 0).all() and len(p)
     p2 = f.strike_panels(df, [25000.0, 25050.0], "Implied volatility")
     assert set(p2["side"]) == {"CE", "PE"}
@@ -727,9 +727,20 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
     # every metric shown, switches work
     at.segmented_control(key="if_mode_NIFTY").set_value("premium read").run()
     assert not at.exception
-    at.segmented_control(key="if_metric_NIFTY").set_value("Volume per 5 min").run()
+    at.segmented_control(key="if_metric_NIFTY").set_value("Volume per block").run()
     assert not at.exception
-    at.segmented_control(key="if_anchor_NIFTY").set_value("around first-reading ATM").run()
+    at.segmented_control(key="if_pblk_NIFTY_v").set_value(60).run()
+    assert not at.exception
+    at.segmented_control(key="if_metric_NIFTY").set_value("Open interest").run()
+    at.segmented_control(key="if_pblk_NIFTY").set_value("each reading").run()
+    assert not at.exception
+    at.segmented_control(key="if_pblk_NIFTY").set_value(30).run()
+    assert not at.exception
+    at.segmented_control(key="if_blk_NIFTY").set_value(60).run()
+    assert not at.exception
+    at.segmented_control(key="if_bmetric_NIFTY").set_value("Volume per 5 min").run()
+    assert not at.exception
+    at.segmented_control(key="if_anchor2_NIFTY").set_value("live ATM").run()
     assert not at.exception
     at.select_slider(key="if_nside_NIFTY").set_value(20).run()
     assert not at.exception and not at.error
@@ -737,7 +748,7 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
         at.segmented_control(key="if_step_NIFTY").set_value(gap).run()
         assert not at.exception and not at.error, gap
     assert any("Best / Better / Good" in x.value for x in at.subheader)
-    for m in ("Open interest", "Volume per 5 min", "OI change"):
+    for m in ("Open interest", "Volume per block", "OI change"):
         at.segmented_control(key="if_bmetric_NIFTY").set_value(m).run()
         assert not at.exception and not at.error, m
     at.segmented_control(key="if_bbase_NIFTY").set_value("since this morning's first reading").run()
@@ -842,3 +853,174 @@ def test_auto_gap_reaches_the_priced_move():
     g, em, _ = f.auto_gap([row(58000.0, 1450.0, False), row(58000.0, 1450.0)])
     assert g == 200 and em == pytest.approx(2.5)                       # first computable
     assert f.auto_gap([], None)[0] == 100
+
+
+# ── ladder + buckets fixed at the 09:15 OPEN (user, 7 Nov 2026) ─────────────────────────
+def test_open_anchor_example_23780():
+    """User's example: the index opens at 23,780 -> centre 23,800 -> 8 strikes either side on a
+    100-point gap -> buckets decided from there for the day."""
+    ks = [float(k) for k in range(22000, 25601, 50)]
+    g = f.grid(ks, 100)
+    centre = f.pick_atm(g, 23780.0)
+    w = f.window(g, centre, 8)
+    assert centre == 23800.0 and w[0] == 23000.0 and w[-1] == 24600.0 and len(w) == 17
+    b = f.bucket_map(w, centre)
+    assert [k for k in w if b[k] == "Best"] == [float(k) for k in range(23500, 24101, 100)]
+
+
+def test_day_open_sources_in_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "_dcm_open", lambda code, day: None)
+    monkeypatch.setattr(f.im, "DATA_DIR", tmp_path)
+    day = dt.date(2026, 11, 6)
+    r = lambda t, u, **kw: dict({"t": f"2026-11-06T{t}", "u": u}, **kw)  # noqa: E731
+    # 1. NSE open stored by the writer wins, whatever the first reading says
+    o, src = f.day_open("NIFTY", day, [r("09:16:47", 24399.0), r("10:00:00", 24450.0,
+                                                                 o=24538.2, os="nse")])
+    assert o == 24538.2 and "official" in src
+    # 2. Index Management's same-day read (zero NSE calls)
+    f.im._write_json(tmp_path / "latest_NIFTY.json", {"cash": {
+        "ts": "2026-11-06T09:16:46", "index": {"open": 24538.2}}})
+    assert f.day_open("NIFTY", day, [r("09:16:47", 24399.0)])[0] == 24538.2
+    (tmp_path / "latest_NIFTY.json").unlink()
+    # 3. first reading only when it IS the open (by 09:20)
+    o, src = f.day_open("NIFTY", day, [r("09:16:47", 24399.0)])
+    assert o == 24399.0 and "first reading" in src
+    # 4. a late start is never passed off as the open
+    o, src = f.day_open("NIFTY", day, [r("11:00:05", 24800.0)])
+    assert o is None and "11:00" in src
+    # yesterday's Index Management read does not count for today
+    f.im._write_json(tmp_path / "latest_NIFTY.json", {"cash": {
+        "ts": "2026-11-05T15:30:00", "index": {"open": 24378.05}}})
+    assert f.day_open("NIFTY", day, [r("11:00:05", 24800.0)])[0] is None
+
+
+def test_log_keeps_the_open_ladder_after_a_big_move():
+    """Bank Nifty on a 200 gap: the open ladder reaches 1,600 points; after a 1,000-point run
+    those strikes must still be logged."""
+    ch = f.parse_chain(payload(spot=59000.0, lo=54000, hi=62000, step=100), EXP)
+    ks = [k[0] for k in f.compact(ch)["k"]]
+    assert 56200.0 not in ks                              # beyond 2,100 of today's ATM
+    ks2 = [k[0] for k in f.compact(ch, anchor=58000.0)["k"]]
+    assert {float(k) for k in range(56400, 59601, 200)} <= set(ks2)   # open 58,000 +-1,600
+
+
+def test_writer_stamps_the_open_on_rows(tmpdir_fno, monkeypatch):
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 10, 0, 30))
+    monkeypatch.setattr(f, "nse_open", lambda code, day, client=None: 24538.2)
+    f.poll_chain("NIFTY", EXP, _Client([payload(ts="06-Nov-2026 10:00:00")]))
+    row = f.chain_log("NIFTY", DAY, EXP.isoformat())[0]
+    assert row["o"] == 24538.2 and row["os"] == "nse"
+    # before 09:16 the open is not asked for
+    monkeypatch.setattr(f, "_S", {})
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 6, 9, 15, 20))
+    assert f._day_open_writer("NIFTY", f._now()) is None
+
+
+# ── time strip (user, 9 Nov: Index F&O lacked Index Management's clocks) ───────────────
+def test_freshness_clocks_and_levels(monkeypatch):
+    now = dt.datetime(2026, 11, 9, 10, 0, 41)
+    latest = {"t": "2026-11-09T09:59:58", "f": "2026-11-09T10:00:31", "c": "2026-11-09T10:00:31"}
+    fut = {"t": "2026-11-09T09:58:48", "f": "2026-11-09T10:00:05"}
+    fr = f.freshness(latest, fut, [{"t": "2026-11-09T09:20:53"}], True, now)
+    assert fr["chain_age"] == 43 and fr["chain_level"] == "ok" and fr["open"]
+    assert fr["next_chain"] == pytest.approx(f.CHAIN_EVERY - 10)
+    assert fr["next_fut"] == pytest.approx(f.FUT_EVERY - 36)
+    assert fr["fut_level"] == "ok" and fr["log_from"] == "09:20" and fr["logged"] == 1
+    # NSE's data was 5 min old when read (frozen feed) -> orange; 10 min -> red
+    old = dict(latest, t="2026-11-09T09:55:00")
+    assert f.freshness(old, fut, [], True, now)["chain_level"] == "warn"
+    older = dict(latest, t="2026-11-09T09:50:00")
+    assert f.freshness(older, fut, [], True, now)["chain_level"] == "stale"
+    # 9 Nov false alarm: futures stamp 3 min 10 s old, but it was 66 s old when read 124 s
+    # ago and the next read is due -> green, not orange
+    fut2 = {"t": "2026-11-09T09:57:31", "f": "2026-11-09T09:58:37"}
+    assert f.freshness(latest, fut2, [], True, now)["fut_level"] == "ok"
+    # the writer died: last read 8 min ago -> red even though the data was fresh then
+    dead = {"t": "2026-11-09T09:52:00", "f": "2026-11-09T09:52:40", "c": None}
+    assert f.freshness(dead, fut, [], True, now)["chain_level"] == "stale"
+    # after the bell, or a past session: grey, no next check
+    shut = f.freshness(latest, fut, [], True, dt.datetime(2026, 11, 9, 16, 30))
+    assert shut["chain_level"] == "closed" and shut["next_chain"] is None and not shut["open"]
+    assert f.freshness(latest, fut, [], False, now)["chain_level"] == "closed"
+    assert f.freshness({}, None, [], True, now)["chain_level"] == "none"
+
+
+def test_chain_error_logged_once_an_hour(tmpdir_fno, monkeypatch):
+    monkeypatch.setattr(f, "_now", lambda: dt.datetime(2026, 11, 9, 10, 0))
+    bad = _Client([{"records": {"data": [{"strikePrice": 27000, "expiryDates": "29-Dec-2026",
+                                          "CE": _side(27000, 27200, True)}]}}])
+    for _ in range(3):
+        assert not f.poll_chain("FINNIFTY", dt.date(2026, 12, 29), bad)
+    log = (tmpdir_fno / "errors.log").read_text(encoding="utf-8")
+    assert log.count("FINNIFTY 2026-12-29") == 1
+
+
+def test_panel_titles_carry_level_and_change():
+    """9 Nov: on one shared axis the bucket PCRs (0.47 / 0.72 / 1.32) were flat lines; each
+    bucket now gets its own panel and the header says the level and the change."""
+    idx = pd.to_datetime(["2026-11-09 09:20", "2026-11-09 10:00", "2026-11-09 11:00"])
+    wide = pd.DataFrame({"Best": [0.46, 0.50, 0.47], "Good": [1.26, np.nan, 1.32],
+                         "Better": [np.nan, np.nan, np.nan]}, index=idx)
+    t = f.panel_titles(wide)
+    assert t["Best"] == "Best · 0.47 now · +0.01 since 09:20"
+    assert t["Good"] == "Good · 1.32 now · +0.06 since 09:20"
+    assert t["Better"] == "Better"
+
+
+def test_index_column_marks_one_bucket_and_distances():
+    ks = list(range(24300, 26000, 100))                 # 17 strikes, centre 25,100
+    bmap = f.bucket_map(ks, 25100)
+    w = f.spot_vs_buckets(25312.4, bmap)               # nearest 25,300 -> Best
+    assert w["Best"] == "◀ index here"
+    assert w["Better"].startswith("188 pts up to 25,500")
+    assert w["Good"].startswith("388 pts up to 25,700")
+    w = f.spot_vs_buckets(25460, bmap)                 # nearest 25,500 -> Better
+    assert w["Better"] == "◀ index here" and "down to 25,400" in w["Best"]
+    assert sum(v == "◀ index here" for v in f.spot_vs_buckets(25450, bmap).values()) == 1
+    w = f.spot_vs_buckets(26100, bmap)                 # off the ladder: no bucket holds it
+    assert "◀ index here" not in w.values() and w["Good"].startswith("⚠ index past the ladder")
+    assert set(f.spot_vs_buckets(None, bmap).values()) == {"—"}
+
+
+def test_blocks_count_from_0915():
+    t = pd.Series(pd.to_datetime(["2026-11-10 09:15:00", "2026-11-10 10:14:59",
+                                  "2026-11-10 10:15:00", "2026-11-10 15:29:00"]))
+    assert [x.strftime("%H:%M") for x in f.block_start(t, 60)] == ["09:15", "09:15", "10:15",
+                                                                   "15:15"]
+    assert [x.strftime("%H:%M") for x in f.block_start(t, 30)] == ["09:15", "09:45", "10:15",
+                                                                   "15:15"]
+
+
+def test_volume_blocks_keep_opening_trades_and_sum_to_day():
+    rows = _session(70)                                # 09:16 .. 10:25, cumulative 1,000/min
+    df = f.frame(rows)
+    p = f.strike_panels(df, [25000.0], "Volume per block", 60)
+    pe = p[p["side"] == "PE"].set_index("t")["v"]
+    # first hour 09:15-10:15 includes the 09:15-09:16 trades of the first reading
+    assert pe.iloc[0] == 59_000 and pe.iloc[1] == 11_000 and pe.sum() == 70_000
+    # a late start (first reading 10:40) must NOT dump the whole morning into one bar
+    late = f.frame(_session(30, start=dt.datetime(2026, 11, 6, 10, 40)))
+    q = f.strike_panels(late, [25000.0], "Volume per block", 60)
+    assert q[q["side"] == "PE"]["v"].sum() == 29_000
+
+
+def test_level_blocks_take_last_reading_of_each_block():
+    rows = _session(40)                                # 09:16 .. 09:55
+    df = f.frame(rows)
+    p = f.strike_panels(df, [25000.0], "Open interest", 15)
+    pe = p[p["side"] == "PE"].sort_values("t")
+    # blocks 09:15 / 09:30 / 09:45: last readings 09:29, 09:44, 09:55 (still running = now)
+    assert [x.strftime("%H:%M") for x in pe["t"]] == ["09:29", "09:44", "09:55"]
+    assert pe["v"].iloc[-1] == 1000.0 + 100 * 39
+    raw = f.strike_panels(df, [25000.0], "Open interest")
+    assert len(raw[raw["side"] == "PE"]) == 40
+
+
+def test_index_domain_is_the_days_own_range():
+    t = pd.date_range("2026-11-09 09:16", periods=4, freq="min")
+    s = pd.Series([24950.0, 25000.0, 25110.0, 25008.0], index=t)
+    lo, hi = f.index_domain(s, 25076.4)
+    assert 24930 < lo < 24950 and 25110 < hi < 25130          # not a 1,000-point axis
+    lo, hi = f.index_domain(pd.Series([25000.0] * 3, index=t[:3]))
+    assert hi - lo == pytest.approx(25000 * 0.001 * 1.16)     # flat day still has room
+    assert f.index_domain(pd.Series(dtype=float)) is None
