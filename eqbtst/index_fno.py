@@ -73,7 +73,11 @@ NF = len(FIELDS)
 
 CHAIN_EVERY = 60.0       # nearest expiry, and whatever expiry is on screen (NSE refreshes ~60 s)
 OTHER_EVERY = 180.0      # the other captured expiries
-FUT_EVERY = 120.0
+FUT_EVERY = 60.0         # same beat as the nearest chain, so a block's last futures reading
+                         # and last chain reading coincide; NSE refreshes the derivatives
+                         # payload at least every ~80 s (Index Management, 13 Oct 2026), and
+                         # at 120 s only 2-4 reads a day repeated the previous values. Cost:
+                         # +2 requests/min over 4 indices (13 Nov 2026)
 EXPIRIES_EVERY = 3600.0
 IDLE_EVERY = 900.0       # outside market hours, only for an index someone is looking at
 VIEW_TTL = 600.0
@@ -2290,6 +2294,94 @@ def fut_word(chg, doi) -> str | None:
         ("short covering" if chg > 0 else "long unwind")
 
 
+FUT_BLOCK_FLOOR = 0.001   # |OI change| in a block under 0.1% of the contract's OI = quiet
+                          # (Nifty Nov-2026: median 15-min block 240-600 of ~186k = 0.13-0.32%)
+FUT_BLOCK_MIN = 100       # ... and never under 100 contracts: the far month holds a few
+                          # thousand, where 0.1% is 3 contracts and every block 'builds'
+FUT_PX_FLOOR = 0.0002     # |price change| under 0.02% (5 pts on 25,000) = flat: OI alone can't say
+FUT_ROLL_SESSIONS = 5     # within this many sessions of expiry, near-out / next-in = the roll
+FUT_STATE_LEAN = {"Long build-up": 1, "Short covering": 1, "Short build-up": -1,
+                  "Long unwinding": -1, "Quiet": 0, "Unclear": 0, "Roll": 0}
+FUT_STATE_SHORT = {"Long build-up": "LB", "Short covering": "SC", "Short build-up": "SB",
+                   "Long unwinding": "LU", "Quiet": "·", "Unclear": "?", "Roll": "roll"}
+
+
+def fut_block_state(d_px, d_oi, px, oi, oi_floor: float = FUT_BLOCK_FLOOR,
+                    px_floor: float = FUT_PX_FLOOR) -> str:
+    """Futures 'who did what' in one block from price change × OI change, the standard
+    four words. Futures have one position per contract — no buyers/writers split — so a
+    block says long/short build-up or covering/unwinding, not call/put anything."""
+    if d_px is None or d_oi is None or pd.isna(d_px) or pd.isna(d_oi) or not oi or not px:
+        return "Unclear"
+    if abs(d_oi) < max(oi_floor * oi, FUT_BLOCK_MIN):
+        return "Quiet"
+    if abs(d_px) < px_floor * px:
+        return "Unclear"
+    return (("Long build-up" if d_px > 0 else "Short build-up") if d_oi > 0 else
+            ("Short covering" if d_px > 0 else "Long unwinding"))
+
+
+def fut_blocks(rows: list, minutes: int = 15, day: dt.date | None = None) -> pd.DataFrame:
+    """Index futures per expiry and block: last reading of each block, price / OI / basis
+    change in the block, volume traded in it, the state. The first block counts from
+    yesterday's close (prev close, OI − change) like the option cells; later blocks are
+    last-reading-to-last-reading, so block OI changes sum to the day's change. In the roll
+    window (≤ FUT_ROLL_SESSIONS to the near expiry) a block where the near month LOSES OI
+    while the next month GAINS it is marked 'Roll' on both — positions moving, not a view."""
+    cols = ["block", "t", "expiry", "px", "d_px", "oi", "d_oi", "vol", "prem", "d_prem",
+            "state", "lean", "near"]
+    recs = []
+    for r in rows:
+        try:
+            t = pd.Timestamp(r["t"])
+        except Exception:                                    # noqa: BLE001
+            continue
+        for e, v in (r.get("F") or {}).items():
+            ltp, prev, oi, doi, vol = (list(v) + [None] * 5)[:5]
+            if ltp is None or oi is None:
+                continue
+            sp = r.get("s")
+            recs.append(dict(t=t, expiry=e, ltp=ltp, prev=prev, oi=oi, doi=doi or 0.0,
+                             vol=vol, prem=(ltp / sp - 1) * 1e4 if sp else np.nan))
+    if not recs:
+        return pd.DataFrame(columns=cols)
+    w = pd.DataFrame(recs).sort_values("t")
+    day = day or w["t"].iloc[0].date()
+    exps = sorted(w["expiry"].unique())
+    near = exps[0]
+    roll = (sessions_left(day, dt.date.fromisoformat(near)) or 99) <= FUT_ROLL_SESSIONS
+    out = []
+    for e, g in w.groupby("expiry"):
+        g = g.reset_index(drop=True)
+        g["block"] = block_start(g["t"], minutes).values
+        last = g.groupby("block").tail(1).set_index("block")
+        bvol = g.groupby("block")["vol"].max() - g.groupby("block")["vol"].min()
+        # first block's volume = the whole cumulative count at its last reading
+        bvol.iloc[0] = last["vol"].iloc[0] if pd.notna(last["vol"].iloc[0]) else np.nan
+        d_oi = last["oi"].diff()
+        d_oi.iloc[0] = last["doi"].iloc[0]                      # vs yesterday's close
+        d_px = last["ltp"].diff()
+        d_px.iloc[0] = (last["ltp"].iloc[0] - last["prev"].iloc[0]
+                        if pd.notna(last["prev"].iloc[0]) else np.nan)
+        d_pr = last["prem"].diff()
+        for b in last.index:
+            stt = fut_block_state(d_px[b], d_oi[b], last["ltp"][b], last["oi"][b])
+            out.append((b, last["t"][b], e, last["ltp"][b], d_px[b], last["oi"][b], d_oi[b],
+                        bvol.get(b, np.nan), last["prem"][b], d_pr.get(b, np.nan), stt,
+                        FUT_STATE_LEAN[stt], e == near))
+    fb = pd.DataFrame(out, columns=cols)
+    if roll and len(exps) > 1:
+        nxt = exps[1]
+        for b in fb["block"].unique():
+            a = fb[(fb["block"] == b) & (fb["expiry"] == near)]
+            c = fb[(fb["block"] == b) & (fb["expiry"] == nxt)]
+            if len(a) and len(c) and a["d_oi"].iloc[0] < 0 < c["d_oi"].iloc[0] and \
+                    abs(a["d_oi"].iloc[0]) >= FUT_BLOCK_FLOOR * a["oi"].iloc[0]:
+                fb.loc[(fb["block"] == b) & (fb["expiry"].isin([near, nxt])),
+                       ["state", "lean"]] = ["Roll", 0]
+    return fb
+
+
 # ── lot size: proven from the bhavcopy, never guessed silently ─────────────────────────────
 _LOTS: dict = {}          # key -> (lot, how, checked_at); a proof is kept all day
 LOT_RETRY_S = 600.0       # an unproven lot is asked again after this long
@@ -2390,6 +2482,8 @@ writing / put buyers leaving), 🔴 = the bearish one, ⚪ = not called.
 **Nothing here forecasts.** Tradebot's tests on index option OI: walls follow price, max pain
 does not pin (49% vs 50%), an OI surge precedes *smaller* moves, call/put crossovers are at
 best mildly contrarian. Use it to see who is positioned where, not which way the index goes.
+
+**The futures row under the index bars** reads the index futures block by block in the same clock: long build-up / short build-up / short covering / long unwinding from price × OI, one row per listed expiry, with volume and the futures premium in the tooltip. Its OI is NSE's live running estimate, which has had the wrong sign at the close on some days — a hint beside the option grids, not a count.
 
 **The ⏱ timer rewinds the whole page.** Drag the slider (or ◀ ▶, 5 minutes a step) to a minute of the session and everything below is rebuilt from the readings logged up to that minute only — metrics, ladder, buckets, both block grids, alerts, futures. It shows what the page showed then, with the provisional OI it had then; nothing later leaks in. Works on today and on any logged session.
 
@@ -2594,20 +2688,26 @@ def _backward_grids(st, df: pd.DataFrame, ks: list, mins: int, by: str, center,
     n = len(blocks)
     stb["cell"] = (stb["word"] if n <= 14 else
                    stb["word"].map(SHORT_WORD).fillna("") if n <= 80 else "")
-    st.markdown(f"**Who did what, counted BACK from the latest reading** — {pick}, {span} "
-                f"blocks ending at {anchor:%H:%M}; each column is labelled by the time it "
-                "ends, the right-most one is the last full block")
-    x_enc = alt.X("blk:O", title=None, sort=blocks, scale=alt.Scale(domain=blocks),
-                  axis=alt.Axis(labelAngle=0, labelFontSize=9, labelOverlap=True))
-    for side, title in (("CE", "CALLS (back from now)"), ("PE", "PUTS (back from now)")):
-        st.markdown(f"**{title}**")
-        _state_grid(st, stb[stb["side"] == side], order, x_enc, n, y_w, 40 * len(ks))
-    st.caption(
-        "Same cells, other clock: the blocks are cut back from the latest reading instead of "
-        "forward from 09:15, so the newest column is always a whole block ('the last "
-        f"{span}') and the columns shift as readings arrive. After the close the two pictures "
-        "cover the same day with boundaries offset — compare them to see which cut reads "
-        "better. Alerts, bars and lines use the 09:15 count only.")
+    # collapsed by default (user, 13 Nov 2026): a second pair of grids doubles the page; the
+    # title carries what it is and when it was cut, so the closed box still says something
+    with st.expander(f"🔁 Same grids counted BACK from the latest reading — {span} blocks "
+                     f"ending at {anchor:%H:%M} (the right-most column is 'the last {span}')",
+                     expanded=False):
+        st.caption(f"{pick}: each column is labelled by the time it ENDS; the forward grids "
+                   "above are labelled by the start.")
+        x_enc = alt.X("blk:O", title=None, sort=blocks, scale=alt.Scale(domain=blocks),
+                      axis=alt.Axis(labelAngle=0, labelFontSize=9, labelOverlap=True))
+        for side, title in (("CE", "CALLS (back from now)"), ("PE", "PUTS (back from now)")):
+            st.markdown(f"**{title}**")
+            _state_grid(st, stb[stb["side"] == side], order, x_enc, n, y_w, 40 * len(ks))
+        st.caption(
+            "Same cells, other clock: the blocks are cut back from the latest reading instead "
+            "of forward from 09:15, so the newest column is always a whole block and the "
+            "columns shift as readings arrive. At the close the two cuts land within a minute "
+            "of each other and show the same picture (92-100% of cells on 11/13 Nov); MID-block "
+            "they agree on only half the cells — so compare them during the session, or pull "
+            "the ⏱ timer to a minute inside a block. Alerts, bars and lines use the 09:15 "
+            "count only.")
 
 
 def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
@@ -2674,8 +2774,69 @@ def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
     return al
 
 
+def _fut_strip(st, code: str, fut_rows: list, mins: int, x_enc, blocks: list, n: int,
+               y_w: int, first_b, running_b, day: dt.date) -> None:
+    """INDEX FUTURES — who did what, block by block: one row per listed expiry on the same
+    time axis as the option grids. Live futures OI is NSE's running estimate — see caption."""
+    import altair as alt
+    if not fut_rows:
+        st.caption("**INDEX FUTURES** — no futures readings logged for this session (the "
+                   "futures log started 9 Nov 2026).")
+        return
+    fb = fut_blocks(fut_rows, mins, day)
+    if fb.empty:
+        return
+    fb["blk"] = pd.to_datetime(fb["block"]).dt.strftime("%H:%M")
+    fb = fb[fb["blk"].isin(blocks)].copy()
+    fb["span"] = block_span(fb["block"], mins, first_b, running_b).values
+    fb["effect"] = np.where(fb["lean"] > 0, "helps the index UP",
+                            np.where(fb["lean"] < 0, "pushes the index DOWN", "no clear effect"))
+    fb["cell"] = fb["state"] if n <= 14 else fb["state"].map(FUT_STATE_SHORT) if n <= 80 else ""
+
+    def _lbl(e):
+        d = dt.date.fromisoformat(e)
+        return f"{d:%d %b}" + (" (expires today)" if d == day else "")
+    fb["row"] = [_lbl(e) for e in fb["expiry"]]
+    order = [_lbl(e) for e in sorted(fb["expiry"].unique())]
+    st.markdown("**INDEX FUTURES** — who did what, block by block (near month first)")
+    base = alt.Chart(fb).encode(
+        x=x_enc, y=alt.Y("row:N", sort=order, title=None,
+                         axis=alt.Axis(labelFontSize=11, labelFontWeight="bold",
+                                       minExtent=y_w, maxExtent=y_w)),
+        tooltip=[alt.Tooltip("span:N", title="block"), alt.Tooltip("row:N", title="expiry"),
+                 alt.Tooltip("state:N", title="state"), alt.Tooltip("effect:N", title="effect"),
+                 alt.Tooltip("px:Q", title="futures", format=",.1f"),
+                 alt.Tooltip("d_px:Q", title="price change", format="+,.1f"),
+                 alt.Tooltip("d_oi:Q", title="OI change (live)", format="+,.0f"),
+                 alt.Tooltip("oi:Q", title="OI at block end", format=",.0f"),
+                 alt.Tooltip("vol:Q", title="volume in block", format=",.0f"),
+                 alt.Tooltip("prem:Q", title="premium over index, bps", format="+,.0f"),
+                 alt.Tooltip("d_prem:Q", title="premium change, bps", format="+,.0f")])
+    rect = base.mark_rect(stroke="#0e1117", strokeWidth=1.5).encode(
+        color=alt.Color("lean:Q", legend=None,
+                        scale=alt.Scale(domain=[-1, 0, 1],
+                                        range=["#d64545", "#3a3f4b", "#1f9d55"])))
+    text = base.mark_text(fontSize=11 if n <= 14 else 10, fontWeight="bold",
+                          color="white").encode(text="cell:N")
+    st.altair_chart((rect + text).properties(height=40 * len(order)), width="stretch")
+    st.caption(
+        "Futures carry one position per contract — no buyers/writers split — so a block says "
+        "**long build-up** (price up, OI up) · **short build-up** (price down, OI up) · "
+        "**short covering** (price up, OI down) · **long unwinding** (price down, OI down); "
+        f"'·' = OI moved under 0.1% / {FUT_BLOCK_MIN} contracts, '?' = price flat. Hover for price, OI, volume and the "
+        "futures premium over the index (a premium that widens as price rises is paid-up "
+        "long demand; it does not depend on the OI estimate). **Live futures OI is NSE's "
+        "running estimate and is the weak link**: reading-to-reading its steps flip sign "
+        "about 1 time in 3 (11 Nov: 58 of 181), and at the close the day's live change had "
+        "the WRONG sign on 11 Nov (+2,163 live vs −9,345 official) and the right one on 9 Nov. "
+        "Read the futures row as a hint next to the option grids, not as a count. In the "
+        f"{FUT_ROLL_SESSIONS} sessions before expiry a block where the near month loses OI "
+        "while the next month gains it is marked **roll** on both — positions moving, not a "
+        "view.")
+
+
 def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap: dict,
-                  center, clicked: bool) -> None:
+                  center, clicked: bool, fut_rows: list | None = None) -> None:
     """The strikes of one bucket, one by one: today's state per call and put, the state block
     by block through the session, each strike's call vs put OI change, and the bucket's
     bullish-minus-bearish contracts per block."""
@@ -2857,18 +3018,42 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
         # inside its height, which crushed the index bars to nothing and the put rows to half
         # height (11 Nov 2026)
         st.markdown("**INDEX** — points moved in each block")
-        st.altair_chart(
-            alt.Chart(idx).mark_bar().encode(
-                x=x_enc.axis(None),
-                y=alt.Y("pts:Q", title="index pts",
-                        axis=alt.Axis(format="+,.0f", minExtent=Y_W, maxExtent=Y_W,
-                                      tickCount=3)),
-                color=alt.Color("dir:N", legend=None,
-                                scale=alt.Scale(domain=["index up", "index down"],
-                                                range=["#1f9d55", "#d64545"])),
-                tooltip=[alt.Tooltip("span:N", title="block"),
-                         alt.Tooltip("pts:Q", title="index move", format="+,.1f")])
-            .properties(height=120), width="stretch")
+        # The first bar holds the overnight gap (13 Nov 2026: −155 on a day whose blocks
+        # moved 5-40 points), so left on one scale it crushed every session bar to a sliver
+        # (user: "looks very narrow"). Scale on the SESSION blocks, clip the gap bar to the
+        # frame and print its value on it; every bar gets its number when the columns allow.
+        intra = idx["pts"].iloc[1:].abs().max() if len(idx) > 1 else np.nan
+        lim = max(float(np.nan_to_num(intra, nan=0.0)), 10.0) * 1.15
+        idx["clip"] = idx["pts"].clip(-lim, lim)
+        idx["lbl"] = [f"{v:+,.0f}" for v in idx["pts"]]
+        if len(idx) and abs(idx["pts"].iloc[0]) > lim:
+            idx.loc[idx.index[0], "lbl"] = f"gap {idx['pts'].iloc[0]:+,.0f}"
+        bars = alt.Chart(idx).mark_bar(clip=True).encode(
+            x=x_enc.axis(None),
+            y=alt.Y("clip:Q", title="index pts", scale=alt.Scale(domain=[-lim, lim]),
+                    axis=alt.Axis(format="+,.0f", minExtent=Y_W, maxExtent=Y_W, tickCount=5)),
+            color=alt.Color("dir:N", legend=None,
+                            scale=alt.Scale(domain=["index up", "index down"],
+                                            range=["#1f9d55", "#d64545"])),
+            tooltip=[alt.Tooltip("span:N", title="block"),
+                     alt.Tooltip("pts:Q", title="index move", format="+,.1f")])
+        layers = [bars]
+        if n <= 30:                                    # labels are legible to ~30 columns
+            txt = dict(fontSize=10, fontWeight="bold", color="#e6e6e6")
+            layers.append(alt.Chart(idx[idx["pts"] >= 0]).mark_text(
+                baseline="bottom", dy=-3, **txt).encode(x=x_enc, y="clip:Q", text="lbl:N"))
+            layers.append(alt.Chart(idx[idx["pts"] < 0]).mark_text(
+                baseline="top", dy=3, **txt).encode(x=x_enc, y="clip:Q", text="lbl:N"))
+        st.altair_chart(alt.layer(*layers).properties(height=200), width="stretch")
+        if len(idx) and abs(idx["pts"].iloc[0]) > lim:
+            st.caption(f"The first bar counts from yesterday's close (the gap, "
+                       f"{idx['pts'].iloc[0]:+,.0f}) and is cut to the session's scale so the "
+                       "other bars stay readable — hover it for the full number.")
+        try:
+            _fut_strip(st, code, fut_rows or [], mins, x_enc, blocks, n, Y_W, first_b,
+                       running_b, dt.date.fromisoformat(str(latest.get("t", ""))[:10]))
+        except Exception as exc:                             # noqa: BLE001 - never block the grids
+            st.caption(f"Futures row not shown: {type(exc).__name__}: {exc}")
         for side, title in (("CE", "CALLS"), ("PE", "PUTS")):
             d = stt[stt["side"] == side]
             if side == "PE" and latest.get("u"):
@@ -3147,7 +3332,8 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
 
 
 def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.DataFrame,
-                    strikes: list, center, lot: int | None, move_pct=None) -> dict:
+                    strikes: list, center, lot: int | None, move_pct=None,
+                    fut_rows: list | None = None) -> dict:
     """Best / Better / Good: table + PCR through the session + calls vs puts per bucket."""
     import altair as alt
     bmap = bucket_map(strikes, center)
@@ -3198,7 +3384,7 @@ def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.Data
     except Exception:                                        # noqa: BLE001 - no selection API
         sel = []
     pick = str(bt["Bucket"].iloc[sel[0]]) if sel and sel[0] < len(bt) else "Best"
-    _bucket_drill(st, code, pick, latest, df, bmap, center, bool(sel))
+    _bucket_drill(st, code, pick, latest, df, bmap, center, bool(sel), fut_rows)
 
     b1, b2 = st.columns([2, 1])
     bbase = b1.segmented_control(
@@ -3913,7 +4099,8 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
                    "appears here once a full day is logged.")
 
     df = frame(rows)
-    _bucket_section(st, code, latest, first, df, strikes, center, lot, h.get("move_pct"))
+    _bucket_section(st, code, latest, first, df, strikes, center, lot, h.get("move_pct"),
+                    fut_rows)
     st.subheader(f"Calls vs puts in these {len(strikes)} strikes through the session")
     base = st.segmented_control(
         "Count from", ["since yesterday's close", "since this morning's first reading"],

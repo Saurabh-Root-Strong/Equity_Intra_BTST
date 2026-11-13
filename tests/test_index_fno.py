@@ -1312,3 +1312,36 @@ def test_rewind_cuts_the_log_at_the_minute_and_steps_five_minutes():
     assert f.rewind_step("14:30", -1, "13:11") == "13:10"         # beyond the data: snap back
     assert f.rewind_step("14:30", +1, "13:11") == "latest"
     assert f.REWIND_STAMPS[1] == "09:15" and f.REWIND_STAMPS[-1] == "15:30"
+
+
+def test_fut_blocks_count_from_yesterday_and_sum_to_the_day():
+    # near month 23 Nov, next 29 Dec; readings every ~2 min across two 15-min blocks
+    def row(hm, ltp, oi, doi, vol, ltp2=25300.0, oi2=20000.0, doi2=0.0, d="2026-11-11"):
+        return {"t": f"{d}T{hm}:00", "s": ltp - 100,
+                "F": {"2026-11-23": [ltp, 25000.0, oi, doi, vol],
+                      "2026-12-29": [ltp2, 25280.0, oi2, doi2, 1000.0]}}
+    rows = [row("09:16", 25050.0, 100000.0, 1000.0, 5000.0),
+            row("09:28", 25080.0, 100400.0, 1400.0, 9000.0),     # last of block 09:15
+            row("09:31", 25040.0, 100900.0, 1900.0, 11000.0),
+            row("09:44", 25010.0, 101000.0, 2000.0, 14000.0)]    # last of block 09:30
+    fb = f.fut_blocks(rows, 15, dt.date(2026, 11, 11))
+    near = fb[fb["near"]].set_index("block")
+    b1, b2 = pd.Timestamp("2026-11-11 09:15"), pd.Timestamp("2026-11-11 09:30")
+    assert near.loc[b1, "d_oi"] == 1400 and near.loc[b1, "d_px"] == 80      # from yesterday
+    assert near.loc[b2, "d_oi"] == 600 and near.loc[b2, "d_px"] == -70
+    assert near["d_oi"].sum() == 2000                                        # = day's change
+    assert near.loc[b1, "vol"] == 9000 and near.loc[b2, "vol"] == 14000 - 11000
+    assert near.loc[b1, "state"] == "Long build-up" and near.loc[b1, "lean"] == 1
+    assert near.loc[b2, "state"] == "Short build-up" and near.loc[b2, "lean"] == -1
+    # quiet / flat floors
+    assert f.fut_block_state(30, 50, 25000, 100000) == "Quiet"                # 0.05% of OI
+    assert f.fut_block_state(2, 500, 25000, 100000) == "Unclear"              # price flat
+    assert f.fut_block_state(-30, -500, 25000, 100000) == "Long unwinding"
+    # roll window (1 session to expiry): near loses OI while next gains -> both 'Roll'
+    rows_r = [row("09:16", 25050.0, 100000.0, -100.0, 5000.0, oi2=20000.0, doi2=100.0,
+                  d="2026-11-20"),
+              row("09:31", 25080.0, 99000.0, -1100.0, 9000.0, oi2=21500.0, doi2=1600.0,
+                  d="2026-11-20")]
+    fr = f.fut_blocks(rows_r, 15, dt.date(2026, 11, 20))
+    assert set(fr[fr["block"] == pd.Timestamp("2026-11-20 09:30")]["state"]) == {"Roll"}
+    assert f.fut_blocks([], 15).empty
