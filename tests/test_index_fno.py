@@ -722,7 +722,7 @@ def test_page_renders_live_and_past(tmpdir_fno, monkeypatch):
     at = AppTest.from_function(app, default_timeout=60).run()
     assert not at.exception, at.exception
     assert not [e for e in at.error], [e.value for e in at.error]
-    assert any("strikes — calls left" in s.value for s in at.subheader)
+    assert any("strikes — calls left" in e.label for e in at.expander)
     assert len(at.dataframe) >= 2
     # every metric shown, switches work
     at.segmented_control(key="if_mode_NIFTY").set_value("premium read").run()
@@ -1199,3 +1199,21 @@ def test_day_check_uses_forward_when_both_rows_have_it():
     # spot moved +60 but the forward +100: the smile slid with the FORWARD, nothing else
     chk = f.day_check(pd.DataFrame(), row(25060, 25100), row(25000, 25000))
     assert max(abs(v[0]) for v in chk["by"].values()) < 1e-6
+
+
+def test_net_driver_level_and_who_moved_it():
+    S = pd.DataFrame([
+        # block 1: calls +500 (writers in, bearish), puts +100 (writers in, bullish)
+        dict(K=25000.0, block=1, side="CE", d_oi=500.0, state="Short build-up", lean=-1),
+        dict(K=25000.0, block=1, side="PE", d_oi=100.0, state="Short build-up", lean=1),
+        # block 2: calls +50, puts -400 (buyers out, bullish) -> puts drove it
+        dict(K=25000.0, block=2, side="CE", d_oi=50.0, state="Quiet", lean=0),
+        dict(K=25000.0, block=2, side="PE", d_oi=-400.0, state="Long unwinding", lean=1),
+        # block 3: only calls logged
+        dict(K=25000.0, block=3, side="CE", d_oi=-100.0, state="Long unwinding", lean=-1)])
+    nd = f.net_driver(S).set_index("block")
+    assert list(nd["level"]) == [400.0, 850.0, 750.0]                 # cumulative calls − puts
+    assert nd.loc[1, "side"] == "CE" and nd.loc[1, "lean"] == -1 and nd.loc[1, "code"] == "CW+"
+    assert nd.loc[2, "side"] == "PE" and nd.loc[2, "lean"] == 1 and nd.loc[2, "code"] == "PB−"
+    assert nd.loc[3, "dP"] == 0.0 and nd.loc[3, "side"] == "CE"       # missing side counts zero
+    assert f.net_driver(pd.DataFrame()).empty

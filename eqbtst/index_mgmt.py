@@ -5259,13 +5259,15 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
         _code_mtime = _mtimes()
     except OSError:
         _code_mtime = None
+    _relaunch = False
     try:
         while _now().time() < until and _now().weekday() < 5:
             time.sleep(30)
             try:
                 if _code_mtime and _mtimes() != _code_mtime:
-                    print(f"[{_now():%H:%M:%S}] code changed - stepping aside for the new "
+                    print(f"[{_now():%H:%M:%S}] code changed - restarting on the new "
                           "version", flush=True)
+                    _relaunch = True
                     break
             except OSError:
                 pass
@@ -5293,6 +5295,22 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
         rows = {c: len(_st(c)["tape"]) for c in NSE_NAME}
         print(f"[{_now():%d %b %H:%M:%S}] capture stopped; price rows logged today: {rows}",
               flush=True)
+        if _relaunch:
+            # RESTART, do not just step aside. Leaving the takeover to the dashboard (only
+            # while a browser tab is open) or the task's next run lost every writer from
+            # 15:26 to 19:41 on 11 Nov 2026 — the 15:40 corrected close of three indices
+            # with it. The new process runs the edited code and takes the free lock at once.
+            try:
+                import subprocess
+                flags = 0
+                if os.name == "nt":
+                    flags = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+                subprocess.Popen([sys.executable, "-m", "eqbtst.index_mgmt", "capture"],
+                                 cwd=str(Path(__file__).resolve().parent.parent),
+                                 creationflags=flags, close_fds=True)
+                print(f"[{_now():%H:%M:%S}] new capture process started", flush=True)
+            except Exception as exc:                         # noqa: BLE001
+                _log_error("capture", f"could not restart: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

@@ -1889,6 +1889,51 @@ def check_label(state: str | None, doi, vol, rel, expiry_day: bool,
     return f"⚠️ IV says {PLAIN_STATE[iv_state]} ({rel:+.1f})", iv_state
 
 
+def net_driver(states: pd.DataFrame) -> pd.DataFrame:
+    """Per strike and block: calls − puts OI change since yesterday's close at the block's end
+    (`level`), the block's step (`step` = calls' change − puts' change), and WHO drove the
+    step: the side that moved more contracts, with its state and what that does to the index.
+
+    A rising calls − puts line is NOT bullish by itself: it rises on call buying (bullish),
+    call writing (bearish), put long unwinding (bullish) or put short covering (bearish) — so
+    the driver, not the slope, carries the meaning. `lean` = sign of both sides' bullish minus
+    bearish contracts; `code` names the bigger mover. A side with no reading in a block counts
+    zero; a tie goes to the calls."""
+    cols = ["K", "block", "level", "step", "dC", "dP", "side", "state", "lean", "code",
+            "c_state", "p_state"]
+    if states.empty:
+        return pd.DataFrame(columns=cols)
+    w = states.pivot_table(index=["K", "block"], columns="side",
+                           values="d_oi", aggfunc="sum").reindex(columns=["CE", "PE"])
+    st_ = states.set_index(["K", "block", "side"])
+    out = []
+    for K, g in w.groupby(level=0):
+        g = g.droplevel(0).sort_index()
+        dc, dp = g["CE"].fillna(0.0), g["PE"].fillna(0.0)
+        level = (dc - dp).cumsum()
+        for b in g.index:
+            def look(sd, col, default=None):
+                try:
+                    v = st_.loc[(K, b, sd), col]
+                    return v.iloc[0] if isinstance(v, pd.Series) else v
+                except KeyError:
+                    return default
+            cs, ps = look("CE", "state"), look("PE", "state")
+            side = "CE" if abs(dc[b]) >= abs(dp[b]) else "PE"
+            state = cs if side == "CE" else ps
+            # colour = BOTH sides together (bullish minus bearish contracts at this strike in
+            # this block): the bigger mover alone would hide a big opposite move on the other
+            # side. The label still names the bigger mover.
+            lc, lp = (look("CE", "lean", 0) or 0), (look("PE", "lean", 0) or 0)
+            lean = int(np.sign(lc * abs(dc[b]) + lp * abs(dp[b])))
+            word = PLAIN_STATE.get(state, "") if state else ""
+            code = (("C" if side == "CE" else "P") + SHORT_WORD.get(word, "")
+                    if state in STATE_NAME.values() else "")
+            out.append((K, b, level[b], dc[b] - dp[b], dc[b], dp[b], side,
+                        state, lean, code, cs, ps))
+    return pd.DataFrame(out, columns=cols)
+
+
 def _strike_says(lc: int, lp: int, sc: str | None = None, sp: str | None = None) -> str:
     """One verdict per strike from its call and put states. Same state on BOTH sides is its
     own read, not 'mixed': writers on both sides = a straddle being sold (a range expected;
@@ -2495,9 +2540,10 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
         blocks = [x.strftime("%H:%M") for x in
                   pd.date_range(b_ts.min(), b_ts.max(), freq=f"{mins}min")]
         n = len(blocks)
-        # what fits in a cell on a laptop-wide page: full words up to ~26 columns (15-min
-        # blocks for a whole day), short codes up to ~80 (5-min), colour only beyond
-        stt["cell"] = (stt["word"] if n <= 26 else
+        # what fits in a cell on a laptop-wide page: full words up to ~14 columns (30-min /
+        # 1-hr blocks; at 15-min, 25 columns, 'Writers out' ran into its neighbours — 11 Nov
+        # 2026), short codes up to ~80 (5-min), colour only beyond
+        stt["cell"] = (stt["word"] if n <= 14 else
                        stt["word"].map(SHORT_WORD).fillna("") if n <= 80 else "")
         st.markdown(f"**Who did what, block by block** — {pick}, {span} blocks from 09:15")
         x_enc = alt.X("blk:O", title=None, sort=blocks, scale=alt.Scale(domain=blocks),
@@ -2571,7 +2617,7 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                          alt.Tooltip("vol:Q", title="volume", format=",.0f"),
                          alt.Tooltip("fresh:Q", title="fresh (OI change ÷ volume)",
                                      format="+.1%")])
-            txt = base.mark_text(fontSize=12 if n <= 26 else 11, fontWeight="bold",
+            txt = base.mark_text(fontSize=12 if n <= 14 else 11, fontWeight="bold",
                                  color="#ffffff").encode(text="cell:N")
             st.altair_chart((rect + txt).properties(height=40 * len(ks)), width="stretch")
         st.markdown(":green-background[ helps the index UP ] &nbsp; "
@@ -2580,8 +2626,8 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
         st.caption(
             "**Buyers in** = new longs (they paid) · **Writers in** = new shorts (they sold the "
             "option) · **Writers out** = shorts buying back · **Buyers out** = longs selling."
-            + (" At 5-min blocks: **B+** buyers in · **W+** writers in · **W−** writers out · "
-               "**B−** buyers out." if 26 < n <= 80 else "")
+            + (" Codes: **B+** buyers in · **W+** writers in · **W−** writers out · "
+               "**B−** buyers out." if 14 < n <= 80 else "")
             + " **Green = helps the index up** (calls: buyers in, writers out; puts: writers "
             "in, buyers out). '·' = quiet, '?' = unclear. Hover a cell for the numbers. A "
             "column that turns the index bar's colour on both sides is mostly the candle "
@@ -2665,9 +2711,7 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                 + ("**bulls ahead**." if last["net"] > 0 else "**bears ahead**."
                    if last["net"] < 0 else "even."))
 
-        st.markdown("**Each strike — calls vs puts OI change since yesterday**")
-        _panels_chart(st, strike_panels(df, ks, "OI change since yesterday", mins), ks,
-                      center, "OI change since yesterday", False, mins)
+        _driver_panels(st, net_driver(stt), ks, center, mins, blocks, span)
         net = strike_panels(df, ks, "OI change since yesterday", mins)
         if not net.empty:
             net = (net.pivot_table(index=["t", "K"], columns="side", values="v")
@@ -2697,7 +2741,7 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
     import altair as alt
     long = long.copy()
     long["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in long["K"]]
-    order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(strikes, reverse=True)]
+    order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(strikes)]
     long["sign"] = np.where(long["v"] >= 0, "calls heavier", "puts heavier")
     area = (alt.Chart(long).mark_bar(opacity=0.85)
             .encode(x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9,
@@ -2714,6 +2758,112 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
                  columns=4)
           .resolve_scale(y="independent"))
     st.altair_chart(ch)
+
+
+
+def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: list,
+                   span: str) -> None:
+    """Calls − puts OI change per strike. Each block is one SEGMENT of the line, coloured by
+    what that block's change did to the index (both sides counted); only the three biggest
+    moves per strike are labelled with who drove them."""
+    import altair as alt
+    st.markdown(f"**Each strike — calls − puts OI change, and who moved it** ({span} blocks)")
+    if nd.empty:
+        st.caption("Not enough logged readings yet.")
+        return
+    nd = nd.sort_values(["K", "block"]).copy()
+    nd["t"] = pd.to_datetime(nd["block"])
+    nd["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in nd["K"]]
+    # lowest strike first, reading left-to-right / top-to-bottom like a price axis
+    order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(ks)]
+    g = nd.groupby("K")
+    # each segment runs from the previous block's level to this block's; the first starts
+    # at 0 one block earlier (the count is since yesterday's close)
+    nd["t0"] = g["t"].shift().fillna(nd["t"] - pd.Timedelta(minutes=mins))
+    nd["y0"] = g["level"].shift().fillna(0.0)
+    gap = (nd["t"] - nd["t0"]) > pd.Timedelta(minutes=mins)
+    nd["absstep"] = nd["step"].abs()
+    # colour only the moves that matter (≥10% of the strike's biggest block): a colour flip
+    # on every few-hundred-contract wiggle striped the whole line (11 Nov 2026)
+    sig = nd["absstep"] >= 0.10 * nd.groupby("K")["absstep"].transform("max")
+    nd["effect"] = np.where(gap, "gap in the log",
+                            np.where(~sig, "small move",
+                                     np.where(nd["lean"] > 0, "helps the index UP",
+                                              np.where(nd["lean"] < 0, "pushes the index DOWN",
+                                                       "no clear effect"))))
+    nd["blk"] = nd["t"].dt.strftime("%H:%M")
+    nd["c_who"] = [PLAIN_STATE.get(x, "—") if isinstance(x, str) else "—" for x in nd["c_state"]]
+    nd["p_who"] = [PLAIN_STATE.get(x, "—") if isinstance(x, str) else "—" for x in nd["p_state"]]
+
+    def k_(v):
+        a = abs(v)
+        return (f"{v / 1e5:+.1f}L" if a >= 1e5 else f"{v / 1e3:+.0f}k" if a >= 1e3
+                else f"{v:+.0f}")
+    # label up to 3 of the biggest moves per strike, at least 2 blocks apart (labels crowded
+    # each other at the open), each saying what the DRIVER did in its own contracts:
+    # 'PW+ 29k' = put writers added 29,000 (not the line's −29k step)
+    nd["drv"] = np.where(nd["side"] == "CE", nd["dC"], nd["dP"]).astype(float)
+    big = nd["absstep"] >= 0.25 * nd.groupby("K")["absstep"].transform("max")
+    nd["lab"] = ""
+    for K, gk in nd[big & (nd["code"] != "") & ~gap].groupby("K"):
+        picked = []
+        for ix, r in gk.sort_values("absstep", ascending=False).iterrows():
+            if len(picked) == 3:
+                break
+            if all(abs((r["t"] - q).total_seconds()) > 2 * mins * 60 for q in picked):
+                picked.append(r["t"])
+                nd.at[ix, "lab"] = r["code"] + " " + k_(abs(r["drv"])).lstrip("+")
+    nd["up"] = nd["step"] >= 0
+    x = alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9, tickCount=7))
+    tip = [alt.Tooltip("blk:N", title="block from"), alt.Tooltip("strike:N"),
+           alt.Tooltip("level:Q", title="calls − puts since yesterday", format="+,.0f"),
+           alt.Tooltip("step:Q", title="change in this block", format="+,.0f"),
+           alt.Tooltip("dC:Q", title="calls' OI change", format="+,.0f"),
+           alt.Tooltip("c_who:N", title="calls: who"),
+           alt.Tooltip("dP:Q", title="puts' OI change", format="+,.0f"),
+           alt.Tooltip("p_who:N", title="puts: who"), alt.Tooltip("effect:N")]
+    ysc = alt.Scale(zero=False, nice=True, padding=22)      # headroom for the labels
+    y = alt.Y("level:Q", title=None, scale=ysc,
+              axis=alt.Axis(format="~s", labelFontSize=10))
+    seg = alt.Chart().mark_rule(strokeWidth=3, strokeCap="round").encode(
+        x="t0:T", x2="t:T", y=alt.Y("y0:Q", title=None, scale=ysc), y2="level:Q",
+        tooltip=tip,
+        color=alt.Color("effect:N", title=None,
+                        scale=alt.Scale(domain=["helps the index UP", "pushes the index DOWN",
+                                                "small move", "no clear effect",
+                                                "gap in the log"],
+                                        range=["#22b864", "#e04848", "#8a93a3", "#8a93a3",
+                                               "#4a505a"]),
+                        legend=alt.Legend(orient="bottom")),
+        strokeDash=alt.condition("datum.effect == 'gap in the log'", alt.value([4, 4]),
+                                 alt.value([1, 0])))
+    end = (alt.Chart().transform_filter("datum.lab != ''")
+           .mark_circle(size=70, color="#f2f4f7", stroke="#0e1117", strokeWidth=1.5)
+           .encode(x=x, y=y, tooltip=tip))
+    lab_up = (alt.Chart().transform_filter("datum.lab != '' && datum.up")
+              .mark_text(dy=-15, fontSize=11, fontWeight="bold", color="#f2f4f7")
+              .encode(x=x, y=y, text="lab:N"))
+    lab_dn = (alt.Chart().transform_filter("datum.lab != '' && !datum.up")
+              .mark_text(dy=17, fontSize=11, fontWeight="bold", color="#f2f4f7")
+              .encode(x=x, y=y, text="lab:N"))
+    zero = alt.Chart().mark_rule(color="#555", strokeDash=[3, 3]).encode(y=alt.datum(0))
+    ch = (alt.layer(zero, seg, end, lab_up, lab_dn, data=nd).properties(width=560, height=210)
+          .facet(facet=alt.Facet("strike:N", sort=order, title=None,
+                                 header=alt.Header(labelFontSize=12, labelFontWeight="bold")),
+                 columns=2)
+          .resolve_scale(y="independent"))
+    st.altair_chart(ch)
+    st.caption(
+        "The line = calls' OI change minus puts' since yesterday's close (above the dashed 0 = "
+        "more calls added than puts). **Each piece of the line is one block, coloured by what "
+        "that block did to the index**, both sides counted: 🟢 more contracts helping it up "
+        "(call buyers in, call writers out, put writers in, put buyers out), 🔴 more pushing "
+        "it down; grey = a small move (under 10% of the strike's biggest). A rise is not "
+        "bullish by itself — a red rise is call writing. Up to three big moves per strike "
+        "are labelled with who drove them and how many contracts THEY added or cut: C/P = "
+        "calls/puts, then B+ buyers in · W+ writers in · W− writers out · B− buyers out "
+        "(PW+ 29k = put writers added 29,000, which pulls the line down). Hover any piece "
+        "for both sides. Own scale per panel.")
 
 
 def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.DataFrame,
@@ -3379,11 +3529,13 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     elif anchor.startswith("09:15"):
         st.warning(f"⏱️ Opening level not available ({o_src}), so the ladder follows the live "
                    "ATM. Past days use NSE's end-of-day open once DCM has loaded it.")
-    st.subheader(f"The {len(strikes)} strikes — calls left, puts right")
     tab = ladder(latest, first, strikes, mode, atm_now, ivbase)
     center = centre
     tab["Bucket"] = tab["Strike"].map(bucket_map(strikes, center))
-    _ladder_view(st, tab, latest, mode)
+    # collapsed by default: the bucket drill-down below carries the per-strike story; the
+    # full 17-strike table opens on demand
+    with st.expander(f"📋 The {len(strikes)} strikes — calls left, puts right", expanded=False):
+        _ladder_view(st, tab, latest, mode)
     rs = reconcile_summary(code)
     if rs and rs.get("sign") is not None:
         st.caption(
