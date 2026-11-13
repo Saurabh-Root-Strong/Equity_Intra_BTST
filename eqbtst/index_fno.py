@@ -1643,13 +1643,14 @@ def build_state(side: str, d_oi, d_x, oi_now, by: str = "premium",
 
 
 def strike_states(df: pd.DataFrame, strikes: list, minutes: int = 15,
-                  by: str = "premium") -> pd.DataFrame:
+                  by: str = "premium", anchor=None) -> pd.DataFrame:
     """Per strike, side and block: OI change, premium change, IV change and the state.
 
     Each block runs from the previous block's last reading to its own last reading. The
     first block runs from YESTERDAY's close for OI (OI - change) and premium (last - change),
     so the opening rush is in it; IV has no close of yesterday, so its first block starts at
-    the first reading. Blocks of OI change sum exactly to the day's change."""
+    the first reading. Blocks of OI change sum exactly to the day's change. `anchor` = count
+    the blocks BACK from that time instead of forward from 09:15 (see block_start)."""
     cols = ["block", "t", "K", "side", "oi", "d_oi", "d_px", "d_iv", "vol", "fresh",
             "state", "lean"]
     w = df[df["K"].isin(strikes)].dropna(subset=["oi"]).sort_values("t")
@@ -1657,11 +1658,14 @@ def strike_states(df: pd.DataFrame, strikes: list, minutes: int = 15,
         return pd.DataFrame(columns=cols)
     # the smile fit runs per reading: only when IV is the judge (premium mode stays cheap)
     press = iv_pressure(df) if by == "IV" else pd.Series(dtype=float)
-    first_blk = None
+    # the session's first block: 09:15's when counted forward, the earliest reading's when
+    # counted back (its start may fall before 09:15 — it still begins at the open)
+    first_blk = (block_start(w["t"].iloc[:1], minutes, anchor).iloc[0] if anchor is not None
+                 else None)
     out = []
     for (side, K), g in w.groupby(["side", "K"]):
         g = g.reset_index(drop=True)
-        g["block"] = block_start(g["t"], minutes).values
+        g["block"] = block_start(g["t"], minutes, anchor).values
         g["ivp"] = press.reindex(list(zip(g["t"], g["K"], g["side"]))).values \
             if len(press) else np.nan
         dv = g["vol"].diff()
@@ -1792,7 +1796,8 @@ def unusual_blocks(states: pd.DataFrame, minutes: int, x: float = ALERT_X,
     return pd.DataFrame(out, columns=cols)
 
 
-def alert_lines(al: pd.DataFrame, center, running_block=None, expiry_day: bool = False) -> list:
+def alert_lines(al: pd.DataFrame, center, running_block=None, expiry_day: bool = False,
+                minutes: int | None = None) -> list:
     """One plain line per unusual block, newest first: who, how many, how unusual.
     `running_block` = the block still being filled (live session only)."""
     lines = []
@@ -1803,7 +1808,8 @@ def alert_lines(al: pd.DataFrame, center, running_block=None, expiry_day: bool =
         dot = "🟢" if r["lean"] > 0 else "🔴" if r["lean"] < 0 else "⚪"
         eff = ("helps the index UP" if r["lean"] > 0 else "pushes the index DOWN"
                if r["lean"] < 0 else "")
-        blk = pd.Timestamp(r["block"]).strftime("%H:%M")
+        blk = (block_span([r["block"]], minutes).iloc[0] if minutes
+               else pd.Timestamp(r["block"]).strftime("%H:%M"))
         k = f"{r['K']:,.0f}" + (" ★" if r["K"] == center else "")
         notes = []
         if running_block is not None and r["block"] == running_block:
@@ -2159,14 +2165,36 @@ BLOCKS = (5, 15, 30, 60)          # minutes; every block counted from 09:15 (NSE
 SESSION_OPEN = dt.time(9, 15)
 
 
-def block_start(t, minutes: int) -> pd.Series:
+def block_start(t, minutes: int, anchor=None) -> pd.Series:
     """Start of the session block each time falls in, counted from 09:15: an hour block is
     09:15-10:15, 10:15-11:15 ... 14:15-15:15, 15:15-15:30 (as NSE / chart sites draw hourly
     candles). Clock-hour blocks (09:00-10:00) would give the first hour only 45 minutes."""
     t = pd.Series(pd.to_datetime(t)).reset_index(drop=True)
-    anchor = t.dt.normalize() + pd.Timedelta(hours=SESSION_OPEN.hour, minutes=SESSION_OPEN.minute)
     m = pd.Timedelta(minutes=minutes)
+    if anchor is not None:
+        # COUNTED BACK from `anchor` (the latest reading): blocks are (anchor − k·m, anchor −
+        # (k−1)·m], so the newest block is always a full one ending now. Still keyed by START.
+        a = pd.Timestamp(anchor)
+        k = ((a - t) // m) + 1
+        return a - k * m
+    anchor = t.dt.normalize() + pd.Timedelta(hours=SESSION_OPEN.hour, minutes=SESSION_OPEN.minute)
     return anchor + ((t - anchor) // m) * m
+
+
+def block_span(block, minutes: int, first=None, running=None) -> pd.Series:
+    """'13:15–13:30' for each block start (the column label is the START, as a candle's).
+    The first block adds 'from yesterday's close' (its OI and premium count from there);
+    the block still being filled adds 'so far'. Blocks never run past 15:30."""
+    b = pd.Series(pd.to_datetime(block)).reset_index(drop=True)
+    end = b + pd.Timedelta(minutes=minutes)
+    close = b.dt.normalize() + pd.Timedelta(hours=15, minutes=30)
+    end = end.where(end <= close, close)
+    out = b.dt.strftime("%H:%M") + "–" + end.dt.strftime("%H:%M")
+    if first is not None:
+        out = out.where(b != pd.Timestamp(first), out + " · from yesterday's close")
+    if running is not None:
+        out = out.where(b != pd.Timestamp(running), out + " · so far")
+    return out
 
 
 def strike_panels(df: pd.DataFrame, strikes: list, metric: str,
@@ -2363,6 +2391,8 @@ writing / put buyers leaving), 🔴 = the bearish one, ⚪ = not called.
 does not pin (49% vs 50%), an OI surge precedes *smaller* moves, call/put crossovers are at
 best mildly contrarian. Use it to see who is positioned where, not which way the index goes.
 
+**The ⏱ timer rewinds the whole page.** Drag the slider (or ◀ ▶, 5 minutes a step) to a minute of the session and everything below is rebuilt from the readings logged up to that minute only — metrics, ladder, buckets, both block grids, alerts, futures. It shows what the page showed then, with the provisional OI it had then; nothing later leaks in. Works on today and on any logged session.
+
 **The scorecard (bottom of the page) keeps the page honest.** Every finished session is
 re-read at eight fixed times from its own log — only what was known then — and stored next
 to what the index did in the next 30 and 60 minutes and to the close. Seven readings were
@@ -2503,11 +2533,89 @@ def _drill_cat(state, lean) -> str:
     return f"{'bullish' if lean > 0 else 'bearish'} · {'new positions' if new else 'exits'}"
 
 
+def _state_grid(st, d: pd.DataFrame, order: list, x_enc, n: int, y_w: int, height: int) -> None:
+    """One CALLS or PUTS grid: strike rows x block columns, coloured by effect on the index,
+    the state's word or code in the cell."""
+    import altair as alt
+    base = alt.Chart(d).encode(
+        x=x_enc, y=alt.Y("strike:N", sort=order, title=None,
+                         axis=alt.Axis(labelFontSize=12, labelFontWeight="bold",
+                                       labelOverlap=False, minExtent=y_w, maxExtent=y_w)))
+    rect = base.mark_rect(stroke="#0e1117", strokeWidth=1).encode(
+        color=alt.Color("effect:N", title=None,
+                        scale=alt.Scale(domain=["helps the index UP", "pushes the index DOWN",
+                                                "no clear effect"],
+                                        range=["#1f9d55", "#d64545", "#3a3f47"]),
+                        legend=None),
+        tooltip=[alt.Tooltip("span:N", title="block"),
+                 alt.Tooltip("strike:N"), alt.Tooltip("word:N", title="who"),
+                 alt.Tooltip("d_oi:Q", title="OI change (contracts)", format="+,.0f"),
+                 alt.Tooltip("d_px:Q", title="premium change ₹", format="+,.2f"),
+                 alt.Tooltip("d_iv:Q", title="IV pressure (pts)", format="+,.2f"),
+                 alt.Tooltip("vol:Q", title="volume", format=",.0f"),
+                 alt.Tooltip("fresh:Q", title="fresh (OI change ÷ volume)", format="+.1%")])
+    txt = base.mark_text(fontSize=12 if n <= 14 else 11, fontWeight="bold",
+                         color="#ffffff").encode(text="cell:N")
+    st.altair_chart((rect + txt).properties(height=height), width="stretch")
+
+
+def _backward_grids(st, df: pd.DataFrame, ks: list, mins: int, by: str, center,
+                    order: list, pick: str, y_w: int) -> None:
+    """The same CALLS / PUTS grids with the blocks COUNTED BACK from the latest reading:
+    the newest column is always a full block ending now ('the last 15 minutes'), the
+    earliest one is whatever is left after 09:15 (plus the overnight change). Labelled by
+    END time. The user wants both pictures to judge, after the close, which reads better."""
+    import altair as alt
+    if df.empty:
+        return
+    anchor = df["t"].max()
+    stb = strike_states(df, ks, mins, by, anchor)
+    if stb.empty:
+        return
+    span = "1 hr" if mins == 60 else f"{mins} min"
+    stb["word"] = stb["state"].map(PLAIN_STATE).fillna("")
+    stb["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in stb["K"]]
+    stb["effect"] = np.where(stb["lean"] > 0, "helps the index UP",
+                             np.where(stb["lean"] < 0, "pushes the index DOWN",
+                                      "no clear effect"))
+    b = pd.to_datetime(stb["block"])
+    end = (b + pd.Timedelta(minutes=mins)).where(b + pd.Timedelta(minutes=mins) <= anchor,
+                                                 anchor)
+    stb["blk"] = end.dt.strftime("%H:%M")
+    first_b = b.min()
+    start_txt = b.dt.strftime("%H:%M").where(b >= b.dt.normalize() + pd.Timedelta(
+        hours=SESSION_OPEN.hour, minutes=SESSION_OPEN.minute), "09:15")
+    stb["span"] = (start_txt + "–" + end.dt.strftime("%H:%M")).where(
+        b != first_b, start_txt + "–" + end.dt.strftime("%H:%M") + " · from yesterday's close")
+    blocks = [x.strftime("%H:%M") for x in
+              pd.date_range(end.min(), end.max(), freq=f"{mins}min")]
+    if blocks and blocks[-1] != stb["blk"].max():
+        blocks.append(stb["blk"].max())
+    n = len(blocks)
+    stb["cell"] = (stb["word"] if n <= 14 else
+                   stb["word"].map(SHORT_WORD).fillna("") if n <= 80 else "")
+    st.markdown(f"**Who did what, counted BACK from the latest reading** — {pick}, {span} "
+                f"blocks ending at {anchor:%H:%M}; each column is labelled by the time it "
+                "ends, the right-most one is the last full block")
+    x_enc = alt.X("blk:O", title=None, sort=blocks, scale=alt.Scale(domain=blocks),
+                  axis=alt.Axis(labelAngle=0, labelFontSize=9, labelOverlap=True))
+    for side, title in (("CE", "CALLS (back from now)"), ("PE", "PUTS (back from now)")):
+        st.markdown(f"**{title}**")
+        _state_grid(st, stb[stb["side"] == side], order, x_enc, n, y_w, 40 * len(ks))
+    st.caption(
+        "Same cells, other clock: the blocks are cut back from the latest reading instead of "
+        "forward from 09:15, so the newest column is always a whole block ('the last "
+        f"{span}') and the columns shift as readings arrive. After the close the two pictures "
+        "cover the same day with boundaries offset — compare them to see which cut reads "
+        "better. Alerts, bars and lines use the 09:15 count only.")
+
+
 def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
-            latest: dict) -> pd.DataFrame:
+            latest: dict, al: pd.DataFrame | None = None) -> pd.DataFrame:
     """⚡ Unusual blocks on the whole ladder, newest first; a toast for each new one while
     the session is live. Returns the flagged rows (K, side, block, ...)."""
-    al = unusual_blocks(stt_all, mins)
+    if al is None:
+        al = unusual_blocks(stt_all, mins)
     span = "1 hr" if mins == 60 else f"{mins} min"
     n_blk = stt_all["block"].nunique()
     if al.empty:
@@ -2521,13 +2629,13 @@ def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
         return al
     last_block = stt_all["block"].max()
     expiry_day = str(latest.get("e", ""))[:10] == str(latest.get("t", ""))[:10]
-    now = _now()
+    now = _view_now(st)
     live = (str(latest.get("t", ""))[:10] == now.date().isoformat()
             and SESSION_OPEN <= now.time() <= dt.time(15, 31))
     running = last_block if live and now < last_block + pd.Timedelta(minutes=mins) else None
     srt = al.sort_values(["block", "ratio"], ascending=[False, False]).reset_index(drop=True)
     lines = [ln + (f" · :gray[{bmap[k]}]" if k in bmap else "")
-             for ln, k in zip(alert_lines(srt, center, running, expiry_day), srt["K"])]
+             for ln, k in zip(alert_lines(srt, center, running, expiry_day, mins), srt["K"])]
     with st.container(border=True):
         st.markdown(f"**⚡ Unusual blocks today — all {len(bmap)} strikes, {span} blocks** "
                     f"({len(al)})")
@@ -2548,7 +2656,8 @@ def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
     # toast new ones while live (the page refreshes every 15 s)
     try:
         today = _now().date().isoformat()
-        if str(latest.get("t", ""))[:10] == today and hasattr(st, "session_state"):
+        if (str(latest.get("t", ""))[:10] == today and hasattr(st, "session_state")
+                and not st.session_state.get("if_view_now")):   # rewound: old news, no pop-up
             key = f"if_alert_seen_{code}_{mins}"
             seen = st.session_state.get(key)
             keys = {(r["K"], r["side"], str(r["block"])) for _, r in al.iterrows()}
@@ -2685,11 +2794,14 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
         if stt.empty:
             st.caption("The block picture appears once a few readings are logged.")
             return
-        al = _alerts(st, code, stt_all, mins, center, bmap, latest)
+        # found now (the grid marks its cells with ⚡), SHOWN after the tug-of-war bars, where
+        # the user reads the day's flow before the per-strike lines (13 Nov 2026)
+        al = unusual_blocks(stt_all, mins)
         flagged = set(zip(al["K"], al["side"], al["block"])) if not al.empty else set()
         stt["word"] = stt["state"].map(PLAIN_STATE).fillna("")
         stt["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in stt["K"]]
-        order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(ks, reverse=True)]
+        # lowest strike on top, like the line panels (user, 13 Nov 2026)
+        order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(ks)]
         stt["panel"] = stt["side"].map({"CE": "CALLS", "PE": "PUTS"})
         span = "1 hr" if mins == 60 else f"{mins} min"
 
@@ -2699,6 +2811,13 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                                  np.where(stt["lean"] < 0, "pushes the index DOWN",
                                           "no clear effect"))
         stt["blk"] = pd.to_datetime(stt["block"]).dt.strftime("%H:%M")
+        # the block a cell covers, for every tooltip: '13:15–13:30', the first one 'from
+        # yesterday's close', the one still filling 'so far' (user asked 13 Nov 2026)
+        first_b, last_b = stt["block"].min(), stt["block"].max()
+        now_ = _view_now(st)
+        running_b = (last_b if str(latest.get("t", ""))[:10] == now_.date().isoformat()
+                     and now_ < last_b + pd.Timedelta(minutes=mins) else None)
+        stt["span"] = block_span(stt["block"], mins, first_b, running_b).values
         # EVERY block between the first and the last, so a capture gap (laptop asleep) shows
         # as empty columns — an ordinal axis otherwise closes it up silently, and the block
         # after it, which absorbs the whole gap's change, looks like one ordinary block
@@ -2730,7 +2849,8 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
             except ValueError:
                 pc0 = None
             mv.iloc[0] = ub.iloc[0] - (pc0 or latest.get("o") or u.iloc[0])
-        idx = pd.DataFrame({"blk": pd.to_datetime(ub.index).strftime("%H:%M"), "pts": mv.values})
+        idx = pd.DataFrame({"blk": pd.to_datetime(ub.index).strftime("%H:%M"), "pts": mv.values,
+                            "span": block_span(ub.index, mins, first_b, running_b).values})
         idx = idx[idx["blk"].isin(blocks)]
         idx["dir"] = np.where(idx["pts"] >= 0, "index up", "index down")
         # titles and legend live OUTSIDE the charts: Streamlit fits a chart's title + legend
@@ -2746,7 +2866,7 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                 color=alt.Color("dir:N", legend=None,
                                 scale=alt.Scale(domain=["index up", "index down"],
                                                 range=["#1f9d55", "#d64545"])),
-                tooltip=[alt.Tooltip("blk:N", title="block from"),
+                tooltip=[alt.Tooltip("span:N", title="block"),
                          alt.Tooltip("pts:Q", title="index move", format="+,.1f")])
             .properties(height=120), width="stretch")
         for side, title in (("CE", "CALLS"), ("PE", "PUTS")):
@@ -2766,29 +2886,7 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                                + (f" · {now_u - o:+,.2f} ({(now_u / o - 1) * 100:+.2f}%) from "
                                   f"the 09:15 open {o:,.2f}" if o else ""))
             st.markdown(f"**{title}**")
-            base = alt.Chart(d).encode(
-                x=x_enc, y=alt.Y("strike:N", sort=order, title=None,
-                                 axis=alt.Axis(labelFontSize=12, labelFontWeight="bold",
-                                               labelOverlap=False,
-                                               minExtent=Y_W, maxExtent=Y_W)))
-            rect = base.mark_rect(stroke="#0e1117", strokeWidth=1).encode(
-                color=alt.Color("effect:N", title=None,
-                                scale=alt.Scale(domain=["helps the index UP",
-                                                        "pushes the index DOWN",
-                                                        "no clear effect"],
-                                                range=["#1f9d55", "#d64545", "#3a3f47"]),
-                                legend=None),
-                tooltip=[alt.Tooltip("blk:N", title="block from"),
-                         alt.Tooltip("strike:N"), alt.Tooltip("word:N", title="who"),
-                         alt.Tooltip("d_oi:Q", title="OI change (contracts)", format="+,.0f"),
-                         alt.Tooltip("d_px:Q", title="premium change ₹", format="+,.2f"),
-                         alt.Tooltip("d_iv:Q", title="IV pressure (pts)", format="+,.2f"),
-                         alt.Tooltip("vol:Q", title="volume", format=",.0f"),
-                         alt.Tooltip("fresh:Q", title="fresh (OI change ÷ volume)",
-                                     format="+.1%")])
-            txt = base.mark_text(fontSize=12 if n <= 14 else 11, fontWeight="bold",
-                                 color="#ffffff").encode(text="cell:N")
-            st.altair_chart((rect + txt).properties(height=40 * len(ks)), width="stretch")
+            _state_grid(st, d, order, x_enc, n, Y_W, 40 * len(ks))
         st.markdown(":green-background[ helps the index UP ] &nbsp; "
                     ":red-background[ pushes the index DOWN ] &nbsp; "
                     ":gray-background[ no clear effect ]")
@@ -2800,7 +2898,11 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
             + " **Green = helps the index up** (calls: buyers in, writers out; puts: writers "
             "in, buyers out). '·' = quiet, '?' = unclear. Hover a cell for the numbers. A "
             "column that turns the index bar's colour on both sides is mostly the candle "
-            "showing through.")
+            f"showing through. **A column is labelled by its start**, like a candle: '13:15' "
+            f"= 13:15–{(dt.datetime(2000, 1, 1, 13, 15) + dt.timedelta(minutes=mins)):%H:%M}, "
+            "the change between the last reading before 13:15 and the last reading in it. "
+            "The 09:15 column counts from yesterday's close; the newest column is 'so far'.")
+        _backward_grids(st, df, ks, mins, by, center, order, pick, Y_W)
 
         # 2) the day added up, per strike
         with st.expander(f"Day total per strike — who did what, added up ({pick})"):
@@ -2851,6 +2953,7 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
         bb = bull_bear(stt)
         if not bb.empty:
             bb["blk"] = pd.to_datetime(bb["block"]).dt.strftime("%H:%M")
+            bb["span"] = block_span(bb["block"], mins, first_b, running_b).values
             long = pd.concat([
                 bb.assign(kind="bullish contracts", v=bb["bull"]),
                 bb.assign(kind="bearish contracts", v=-bb["bear"])])
@@ -2862,7 +2965,7 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                                 scale=alt.Scale(domain=["bullish contracts", "bearish contracts"],
                                                 range=["#1f9d55", "#d64545"]),
                                 legend=alt.Legend(orient="bottom")),
-                tooltip=[alt.Tooltip("blk:N", title="block from"),
+                tooltip=[alt.Tooltip("span:N", title="block"),
                          alt.Tooltip("bull:Q", title="bullish contracts", format=",.0f"),
                          alt.Tooltip("bear:Q", title="bearish contracts", format=",.0f"),
                          alt.Tooltip("net:Q", title="net (bullish − bearish)", format="+,.0f")]))
@@ -2880,8 +2983,9 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                 + ("**bulls ahead**." if last["net"] > 0 else "**bears ahead**."
                    if last["net"] < 0 else "even."))
 
+        _alerts(st, code, stt_all, mins, center, bmap, latest, al)
         _driver_panels(st, net_driver(stt), ks, center, mins, blocks, span,
-                       {(k, b) for k, _, b in flagged})
+                       {(k, b) for k, _, b in flagged}, running_b)
         net = strike_panels(df, ks, "OI change since yesterday", mins)
         if not net.empty:
             net = (net.pivot_table(index=["t", "K"], columns="side", values="v")
@@ -2932,7 +3036,7 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
 
 
 def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: list,
-                   span: str, flagged: set | None = None) -> None:
+                   span: str, flagged: set | None = None, running=None) -> None:
     """Calls − puts OI change per strike. Each block is one SEGMENT of the line, coloured by
     what that block's change did to the index (both sides counted); only the three biggest
     moves per strike are labelled with who drove them."""
@@ -2962,7 +3066,8 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
                                               np.where(nd["lean"] < 0, "pushes the index DOWN",
                                                        "no clear effect"))))
     nd["blk"] = nd["t"].dt.strftime("%H:%M")
-    nd["c_who"] = [PLAIN_STATE.get(x, "—") if isinstance(x, str) else "—" for x in nd["c_state"]]
+    nd["span"] = block_span(nd["t"], mins, nd["t"].min(), running).values
+    nd["c_who"] =[PLAIN_STATE.get(x, "—") if isinstance(x, str) else "—" for x in nd["c_state"]]
     nd["p_who"] = [PLAIN_STATE.get(x, "—") if isinstance(x, str) else "—" for x in nd["p_state"]]
 
     def k_(v):
@@ -2990,7 +3095,7 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
                 nd.at[ix, "lab"] = "⚡" + (r["lab"] or r["code"] + " " + k_(abs(r["drv"])).lstrip("+"))
     nd["up"] = nd["step"] >= 0
     x = alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9, tickCount=7))
-    tip = [alt.Tooltip("blk:N", title="block from"), alt.Tooltip("strike:N"),
+    tip = [alt.Tooltip("span:N", title="block"), alt.Tooltip("strike:N"),
            alt.Tooltip("level:Q", title="calls − puts since yesterday", format="+,.0f"),
            alt.Tooltip("step:Q", title="change in this block", format="+,.0f"),
            alt.Tooltip("dC:Q", title="calls' OI change", format="+,.0f"),
@@ -3310,8 +3415,9 @@ def _panels_chart(st, long: pd.DataFrame, strikes: list, atm, metric: str, share
                         scale=alt.Scale(domain=["CE", "PE"], range=[CE_COLOR, PE_COLOR]),
                         legend=alt.Legend(orient="bottom", labelExpr=(
                             "datum.label == 'CE' ? 'Calls (CE)' : 'Puts (PE)'"))),
-        tooltip=[alt.Tooltip("t:T", title=("block from" if metric.startswith("Volume")
-                                           else "time"), format="%H:%M"), "side:N",
+        tooltip=[alt.Tooltip("t:T", title=(f"{minutes}-min block starting"
+                                           if metric.startswith("Volume") else "time"),
+                             format="%H:%M"), "side:N",
                  alt.Tooltip("K:Q", title="strike", format=",.0f"),
                  alt.Tooltip("v:Q", title=unit, format=fmt)])
     if not metric.startswith("Volume"):
@@ -3345,7 +3451,7 @@ def _heatmap(st, blk: pd.DataFrame, strikes: list, atm, minutes: int):
                   color=alt.Color("chg:Q", title="contracts",
                                   scale=alt.Scale(scheme="redblue", domain=[-m, m],
                                                   clamp=True)),
-                  tooltip=[alt.Tooltip("block:T", title=f"{minutes}-min block from",
+                  tooltip=[alt.Tooltip("block:T", title=f"{minutes}-min block starting",
                                        format="%H:%M"), "side:N",
                            alt.Tooltip("K:Q", title="strike", format=",.0f"),
                            alt.Tooltip("chg:Q", title="contracts opened (+) / closed (−)",
@@ -3548,8 +3654,46 @@ def _freshness(st, latest: dict, fut: dict | None, rows: list, live: bool):
                        "to two minutes old is normal. 'Numbers changed' catches a feed whose clock "
                        "ticks while its numbers have stopped.")
 
+# ⏱ Rewind: every 5-min stamp of the session, plus 'latest' (user asked 13 Nov 2026: "a small
+# button timer, so I can see what the data showed at that time")
+REWIND_STEP = 5
+REWIND_STAMPS = ["latest"] + [f"{h:02d}:{m:02d}" for h in range(9, 16) for m in range(0, 60, 5)
+                              if (9, 15) <= (h, m) <= (15, 30)]
+
+
+def rewind(rows: list, stamp: str) -> list:
+    """The log as it stood at `stamp` ('HH:MM' or 'latest'): every reading stamped at or
+    before that minute. Point-in-time, like the scorecard — nothing after the stamp leaks in."""
+    if stamp == "latest":
+        return rows
+    return [r for r in rows if str(r.get("t", ""))[11:16] <= stamp]
+
+
+def rewind_step(stamp: str, direction: int, last: str | None) -> str:
+    """One ◀/▶ press. ◀ from 'latest' lands on the last 5-min stamp at or before the latest
+    reading (`last` = 'HH:MM'); ▶ past that goes back to 'latest'."""
+    st_ = [x for x in REWIND_STAMPS[1:] if last is None or x <= last] or REWIND_STAMPS[1:2]
+    if stamp == "latest":
+        return st_[-1] if direction < 0 else "latest"
+    if stamp not in st_:                 # beyond the data (set on a longer day): snap to its end
+        return st_[-1] if direction < 0 else "latest"
+    j = st_.index(stamp) + direction
+    return "latest" if j >= len(st_) else st_[max(j, 0)]
+
+
+def _view_now(st) -> dt.datetime:
+    """'Now' for the page: the rewound as-of time while the viewer has the timer pulled back,
+    else the clock. Decides which block is 'still running' (so far)."""
+    try:
+        v = st.session_state.get("if_view_now")
+    except Exception:                                        # noqa: BLE001 - AppTest / no state
+        v = None
+    return v or _now()
+
+
 def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
     rows = chain_log(code, day, expiry)
+    st.session_state["if_view_now"] = None    # the timer sets it below when pulled back
     lat = load_latest(code) if live else {}
     latest = (lat.get("chain") or {}).get(expiry) if live else None
     if latest is None and rows:
@@ -3558,10 +3702,53 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
         st.info("No chain read yet for this expiry — the capture asks NSE within a minute "
                 "of the page opening (or at 09:15 on a trading day).")
         return
-    first = rows[0] if rows else None
     fut_rows = fut_log(code, day)
+    # ⏱ the timer: rewind the whole page to a minute of the session
+    last_hm = str(rows[-1].get("t", ""))[11:16] if rows else None
+    rk = f"if_asof_{code}"
+    if rk not in st.session_state:
+        st.session_state[rk] = "latest"
+    r0, r1, r2 = st.columns([0.5, 6, 0.5])
+    if r0.button("◀", key=f"if_asof_back_{code}", help="5 minutes earlier"):
+        st.session_state[rk] = rewind_step(st.session_state[rk], -1, last_hm)
+    if r2.button("▶", key=f"if_asof_fwd_{code}", help="5 minutes later ('latest' at the end)"):
+        st.session_state[rk] = rewind_step(st.session_state[rk], +1, last_hm)
+    stamp = r1.select_slider(
+        "⏱ Show the page as it stood at", REWIND_STAMPS, key=rk,
+        help="Drag (or ◀ ▶) to a minute of the session and every number, grid and chart below "
+             "is rebuilt from the readings logged up to that minute only — the metrics, the "
+             "ladder, the buckets, the block grids (forward AND backward, both cut at that "
+             "minute), the alerts, the futures. Nothing later leaks in, so it shows what "
+             "the page would have shown at that time (with the live, provisional OI it had "
+             "then — not NSE's corrected close). 'latest' = live / the full day.") or "latest"
+    pinned = stamp != "latest"
+    if pinned and last_hm and stamp >= last_hm:
+        # the timer sits at or beyond the last reading (set on a longer day, or today's log
+        # has not reached it yet): that IS the latest picture — say so, don't fake a 'so far'
+        st.caption(f"⏱ The timer ({stamp}) is at or past the last reading ({last_hm}), so this "
+                   "is the latest picture. Pull it back to rewind.")
+        pinned = False
+    if pinned:
+        rows = rewind(rows, stamp)
+        fut_rows = rewind(fut_rows, stamp)
+        if not rows:
+            st.info(f"⏱ No chain reading by {stamp} on this session (first logged at "
+                    f"{last_hm and str(chain_log(code, day, expiry)[0].get('t', ''))[11:16]}).")
+            st.session_state["if_view_now"] = None
+            return
+        latest, lat, live = rows[-1], {}, False
+        st.session_state["if_view_now"] = dt.datetime.combine(
+            day, dt.time(int(stamp[:2]), int(stamp[3:])))
+        st.caption(f"⏱ **Rewound to {stamp}** — rebuilt from the {len(rows)} readings up to "
+                   f"{str(latest.get('t', ''))[11:19]} (the day runs to {last_hm}). The block "
+                   "the timer sits in is shown 'so far', as it was then. Pull the slider to "
+                   "'latest' to come back.")
+    else:
+        st.session_state["if_view_now"] = None
+    first = rows[0] if rows else None
     fut = (lat.get("fut") if live else None) or (fut_rows[-1] if fut_rows else None)
-    _freshness(st, latest, fut, rows, live)
+    if not pinned:
+        _freshness(st, latest, fut, rows, live)
     if rows and rows[0].get("src") == "fyers":
         st.warning(
             "🧪 **Test data — Tradebot's Fyers capture, not NSE's feed.** Imported with "
@@ -3811,7 +3998,7 @@ def _draw(st, code: str, expiry: str, day: dt.date, live: bool) -> None:
 
     st.subheader("Index futures")
     fs = fut_series(fut_rows)
-    official = (load_close(code, day).get("fut") or None)
+    official = None if pinned else (load_close(code, day).get("fut") or None)
     if official and (not fut or official.get("t", "") >= fut.get("t", "")):
         fut = official
     is_official = bool(fut) and fut.get("t", "")[11:16] >= CLOSE_FROM.strftime("%H:%M")

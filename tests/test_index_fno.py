@@ -1266,3 +1266,49 @@ def test_unusual_blocks_needs_a_baseline_and_skips_gaps_and_thin_wings():
     thin = _cells(6, {(3, 24300.0, "PE"): 9_000.0}, oi=100_000.0)   # 18x but 0.5% of put OI
     assert f.unusual_blocks(thin, 15).empty
     assert f.unusual_blocks(pd.DataFrame(), 15).empty
+
+
+def test_block_span_labels_start_to_end_and_marks_first_and_running():
+    b = pd.to_datetime(["2026-11-13 09:15", "2026-11-13 13:15", "2026-11-13 15:15"])
+    s = f.block_span(b, 15, b[0], b[2])
+    assert list(s) == ["09:15–09:30 · from yesterday's close", "13:15–13:30", "15:15–15:30 · so far"]
+    assert list(f.block_span(b, 60)) == ["09:15–10:15", "13:15–14:15", "15:15–15:30"]
+    assert "12:15–12:30" in f.alert_lines(
+        pd.DataFrame([dict(block=pd.Timestamp("2026-11-13 12:15"), t=None, K=25100.0, side="CE",
+                           d_oi=50_000.0, state="Long build-up", lean=1, ratio=7.0,
+                           typical=7_000.0, share=0.03, gap=False, undone=False)]),
+        25200.0, None, False, 15)[0]
+
+
+def test_block_start_counted_back_from_an_anchor():
+    t = pd.to_datetime(["2026-11-13 09:16", "2026-11-13 13:13", "2026-11-13 13:14",
+                        "2026-11-13 13:28"])
+    a = pd.Timestamp("2026-11-13 13:28")
+    s = list(f.block_start(t, 15, a))
+    assert s[3] == a - pd.Timedelta(minutes=15)                 # (13:13, 13:28] = last 15 min
+    assert s[2] == a - pd.Timedelta(minutes=15) and s[1] == a - pd.Timedelta(minutes=30)
+    assert s[0] == a - pd.Timedelta(minutes=17 * 15)            # 09:13–09:28 holds 09:16
+    rows = _session(40)
+    df = f.frame(rows)
+    fwd = f.strike_states(df, [25000.0], 15)
+    back = f.strike_states(df, [25000.0], 15, "premium", df["t"].max())
+    pe_f, pe_b = fwd[fwd["side"] == "PE"], back[back["side"] == "PE"]
+    assert pe_f["d_oi"].sum() == pytest.approx(pe_b["d_oi"].sum())   # same day's change
+    assert (pe_b["block"].max() + pd.Timedelta(minutes=15)) == df["t"].max()
+
+
+def test_rewind_cuts_the_log_at_the_minute_and_steps_five_minutes():
+    rows = [{"t": f"2026-11-13T{hm}:30"} for hm in ("09:15", "09:16", "13:09", "13:10", "13:11")]
+    assert f.rewind(rows, "latest") is rows
+    assert [r["t"][11:16] for r in f.rewind(rows, "13:10")] == ["09:15", "09:16", "13:09", "13:10"]
+    assert f.rewind(rows, "09:00") == []
+    # ◀ from latest lands on the last 5-min stamp at or before the latest reading
+    assert f.rewind_step("latest", -1, "13:11") == "13:10"
+    assert f.rewind_step("13:10", -1, "13:11") == "13:05"
+    assert f.rewind_step("09:15", -1, "13:11") == "09:15"          # floor
+    assert f.rewind_step("13:10", +1, "13:11") == "latest"         # past the end = latest
+    assert f.rewind_step("13:05", +1, "13:11") == "13:10"
+    assert f.rewind_step("latest", +1, "13:11") == "latest"
+    assert f.rewind_step("14:30", -1, "13:11") == "13:10"         # beyond the data: snap back
+    assert f.rewind_step("14:30", +1, "13:11") == "latest"
+    assert f.REWIND_STAMPS[1] == "09:15" and f.REWIND_STAMPS[-1] == "15:30"
