@@ -1217,3 +1217,52 @@ def test_net_driver_level_and_who_moved_it():
     assert nd.loc[2, "side"] == "PE" and nd.loc[2, "lean"] == 1 and nd.loc[2, "code"] == "PB−"
     assert nd.loc[3, "dP"] == 0.0 and nd.loc[3, "side"] == "CE"       # missing side counts zero
     assert f.net_driver(pd.DataFrame()).empty
+
+
+def _cells(blocks, big=None, oi=100_000.0):
+    """A ladder of 17 strikes x 2 sides: every cell changes 500 contracts, except `big`
+    = {(block_index, K, side): d_oi}."""
+    recs = []
+    t0 = pd.Timestamp("2026-11-11 09:15")
+    for i in range(blocks):
+        b = t0 + pd.Timedelta(minutes=15 * i)
+        for K in range(24300, 26000, 100):
+            for side in ("CE", "PE"):
+                d = (big or {}).get((i, float(K), side), 500.0)
+                recs.append(dict(block=b, t=b + pd.Timedelta(minutes=14), K=float(K),
+                                 side=side, oi=oi, d_oi=d, d_px=1.0, d_iv=np.nan, vol=5000.0,
+                                 fresh=0.1, state="Long build-up" if d > 0 else "Long unwinding",
+                                 lean=(1 if d > 0 else -1) if side == "CE" else
+                                 (-1 if d > 0 else 1)))
+    return pd.DataFrame(recs)
+
+
+def test_unusual_blocks_flags_only_the_outsized_change():
+    st_ = _cells(6, {(0, 25000.0, "CE"): 90_000.0,          # first block: overnight, never judged
+                     (3, 25200.0, "PE"): 40_000.0,          # 80x the ladder's blocks, 2.4% of put OI
+                     (4, 25200.0, "PE"): -25_000.0,         # takes most of it back
+                     (4, 24300.0, "CE"): 900.0})            # 1.8x: nothing
+    al = f.unusual_blocks(st_, 15)
+    assert [(r.K, r.side) for r in al.itertuples()] == [(25200.0, "PE"), (25200.0, "PE")]
+    r = al.iloc[0]
+    assert r["ratio"] == pytest.approx(80.0) and r["share"] == pytest.approx(40_000 / 1.7e6)
+    assert bool(r["undone"]) is True and bool(al.iloc[1]["undone"]) is False
+    lines = f.alert_lines(al, 25100.0, None, False)
+    assert lines[0].startswith("🟢 **10:15 · 25,200 · put buyers out -25,000**")   # newest first
+    assert "half taken back next block" in lines[1] and "80× the day's big blocks" in lines[1]
+    assert "block still running" in f.alert_lines(al, 25100.0, al["block"].max(), False)[0]
+    assert "expiry day" not in f.alert_lines(al, 25100.0, None, True)[0]   # 10:15: not settling
+    late = al.copy()
+    late["block"] = pd.Timestamp("2026-11-11 14:30")
+    assert "expiry day: positions settling" in f.alert_lines(late, 25100.0, None, True)[0]
+
+
+def test_unusual_blocks_needs_a_baseline_and_skips_gaps_and_thin_wings():
+    assert f.unusual_blocks(_cells(2, {(1, 25000.0, "CE"): 90_000.0}), 15).empty   # no yardstick
+    g = _cells(6, {(3, 25000.0, "CE"): 40_000.0})
+    g.loc[(g["block"] == g["block"].unique()[3]) & (g["K"] == 25000.0) & (g["side"] == "CE"),
+          "t"] += pd.Timedelta(minutes=45)                   # that reading came after a hole
+    assert f.unusual_blocks(g, 15).empty
+    thin = _cells(6, {(3, 24300.0, "PE"): 9_000.0}, oi=100_000.0)   # 18x but 0.5% of put OI
+    assert f.unusual_blocks(thin, 15).empty
+    assert f.unusual_blocks(pd.DataFrame(), 15).empty

@@ -5246,12 +5246,25 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
     except Exception as exc:                                 # noqa: BLE001
         _log_error("fno", f"index_fno not started: {type(exc).__name__}: {exc}")
         _fno = None
+    if _fno is not None:
+        # grade yesterday's page readings against what the index then did (index_scorecard).
+        # ~30 s a day of pandas: off the main thread so the poll starts on time.
+        def _score():
+            try:
+                from . import index_scorecard
+                n = index_scorecard.score_all()
+                if n:
+                    print(f"  scorecard: graded {n} day-expiry log(s)", flush=True)
+            except Exception as exc:                         # noqa: BLE001
+                _log_error("scorecard", f"{type(exc).__name__}: {exc}")
+        threading.Thread(target=_score, name="fno-scorecard", daemon=True).start()
     last = None
     # STEP ASIDE WHEN THE CODE CHANGES. This job runs all day; a fix made mid-session never
     # reached it (3 Nov 2026: the options read was added at 10:15 but the job started at
     # 09:28 kept logging without it all day). Exiting releases the lock: the dashboard
     # (restarted on the new code) takes over at once, or the next 10-minute run of the task.
-    _watched = [Path(__file__), Path(__file__).with_name("index_fno.py")]
+    _watched = [Path(__file__), Path(__file__).with_name("index_fno.py"),
+                Path(__file__).with_name("index_scorecard.py")]
 
     def _mtimes():
         return tuple(p.stat().st_mtime if p.exists() else None for p in _watched)

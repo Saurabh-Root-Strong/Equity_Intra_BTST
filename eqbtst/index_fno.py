@@ -1729,6 +1729,99 @@ def day_flow(states: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+ALERT_X = 4.0            # a block's OI change this many times the ladder's BIG blocks so far
+ALERT_Q = 0.90           # ... 'big' = the 90th percentile of |OI change| over all cells before it
+#                          (the median was ~30 contracts on Bank Nifty — most cells are near
+#                          zero — so 4x the median flagged 32 blocks on 11 Nov 2026)
+ALERT_MIN_SHARE = 0.01   # ... and at least 1% of that side's OI on the ladder (a wing strike's
+#                          tiny OI can be 10x its own nothing and still be nothing)
+ALERT_MIN_CELLS = 20     # strike-side-blocks the 'typical' must rest on (one full block of 17 = 34)
+ALERT_GAP_X = 2.0        # a block whose last reading is 2+ blocks after the previous one absorbed
+#                          a capture gap: its change is not one block's, never flagged
+ALERT_SHOW = 8
+
+
+def unusual_blocks(states: pd.DataFrame, minutes: int, x: float = ALERT_X,
+                   min_share: float = ALERT_MIN_SHARE) -> pd.DataFrame:
+    """Blocks where one strike-side's OI change dwarfs the day so far: ≥ `x` times the
+    90th-percentile |OI change| over EVERY strike-side-block before it (the whole ladder,
+    not the strike's own past — a strike that was dead all morning has no 'own typical'),
+    and at least `min_share` of that side's OI on the ladder.
+
+    The first block is never judged and never in the baseline: it counts from yesterday's
+    close, so the overnight change sits in it. A block after a hole in the log is skipped
+    (its change belongs to several blocks). The newest block is judged on what it holds so
+    far. `undone` = the next block took back at least half of it (NSE's live OI is
+    provisional; a print that reverses was a correction, not a position)."""
+    cols = ["block", "t", "K", "side", "d_oi", "state", "lean", "ratio", "typical", "share",
+            "gap", "undone"]
+    if states.empty:
+        return pd.DataFrame(columns=cols)
+    s = states.dropna(subset=["d_oi", "oi"]).copy()
+    if s.empty:
+        return pd.DataFrame(columns=cols)
+    s["a"] = s["d_oi"].abs()
+    first_blk = s["block"].min()
+    side_oi = (s.sort_values("t").groupby(["side", "K"])["oi"].last()
+               .groupby(level=0).sum())
+    s = s.sort_values(["side", "K", "block"])
+    g = s.groupby(["side", "K"])
+    s["prev_t"] = g["t"].shift()
+    s["next_d"] = g["d_oi"].shift(-1)
+    out = []
+    for b in sorted(s["block"].unique()):
+        if b == first_blk:
+            continue
+        base = s.loc[(s["block"] < b) & (s["block"] != first_blk), "a"]
+        if len(base) < ALERT_MIN_CELLS:
+            continue
+        typ = max(float(base.quantile(ALERT_Q)), 1.0)
+        for _, r in s[s["block"] == b].iterrows():
+            floor_ = min_share * float(side_oi.get(r["side"], 0.0))
+            if r["a"] < x * typ or r["a"] < floor_ or r["a"] <= 0:
+                continue
+            gap = (pd.notna(r["prev_t"]) and
+                   (r["t"] - r["prev_t"]) > pd.Timedelta(minutes=ALERT_GAP_X * minutes))
+            if gap:
+                continue
+            undone = bool(pd.notna(r["next_d"]) and np.sign(r["next_d"]) == -np.sign(r["d_oi"])
+                          and abs(r["next_d"]) >= 0.5 * r["a"])
+            share = r["a"] / side_oi[r["side"]] if side_oi.get(r["side"]) else np.nan
+            out.append((b, r["t"], r["K"], r["side"], r["d_oi"], r["state"], r["lean"],
+                        r["a"] / typ, typ, share, False, undone))
+    return pd.DataFrame(out, columns=cols)
+
+
+def alert_lines(al: pd.DataFrame, center, running_block=None, expiry_day: bool = False) -> list:
+    """One plain line per unusual block, newest first: who, how many, how unusual.
+    `running_block` = the block still being filled (live session only)."""
+    lines = []
+    for _, r in al.sort_values(["block", "ratio"], ascending=[False, False]).iterrows():
+        word = PLAIN_STATE.get(r["state"]) if r["state"] in STATE_NAME.values() else None
+        who = (("call " if r["side"] == "CE" else "put ") + word.lower()) if word else \
+            ("call" if r["side"] == "CE" else "put") + " OI jumped, side unclear"
+        dot = "🟢" if r["lean"] > 0 else "🔴" if r["lean"] < 0 else "⚪"
+        eff = ("helps the index UP" if r["lean"] > 0 else "pushes the index DOWN"
+               if r["lean"] < 0 else "")
+        blk = pd.Timestamp(r["block"]).strftime("%H:%M")
+        k = f"{r['K']:,.0f}" + (" ★" if r["K"] == center else "")
+        notes = []
+        if running_block is not None and r["block"] == running_block:
+            notes.append("block still running")
+        if r["undone"]:
+            notes.append("half taken back next block")
+        if expiry_day and pd.Timestamp(r["block"]).time() >= dt.time(14, 0):
+            notes.append("expiry day: positions settling")
+        lines.append(
+            f"{dot} **{blk} · {k} · {who} {r['d_oi']:+,.0f}** — {r['ratio']:.0f}× the day's "
+            f"big blocks so far ({r['typical']:,.0f})"
+            + (f", {r['share']:.1%} of the ladder's {'call' if r['side'] == 'CE' else 'put'} OI"
+               if pd.notna(r["share"]) else "")
+            + (f" · {eff}" if eff else "")
+            + (f" · :orange[{' · '.join(notes)}]" if notes else ""))
+    return lines
+
+
 CHECK_BAND = 0.5          # vol pts: a strike's IV move vs the chain's under this = can't tell
 CHECK_NOISE_X = 3.0       # ... and never under 3x the strike's own reading-to-reading wobble
 CHECK_MIN_VOL = 10_000    # contracts today: thinner strikes' IV is quote noise (Fin Nifty 11 Nov
@@ -2269,6 +2362,12 @@ writing / put buyers leaving), 🔴 = the bearish one, ⚪ = not called.
 **Nothing here forecasts.** Tradebot's tests on index option OI: walls follow price, max pain
 does not pin (49% vs 50%), an OI surge precedes *smaller* moves, call/put crossovers are at
 best mildly contrarian. Use it to see who is positioned where, not which way the index goes.
+
+**The scorecard (bottom of the page) keeps the page honest.** Every finished session is
+re-read at eight fixed times from its own log — only what was known then — and stored next
+to what the index did in the next 30 and 60 minutes and to the close. Seven readings were
+named before any grade was looked at. It stays locked until 40 sessions per index; a hit
+rate on fewer days is a coin's recent streak.
 """
 
 TIP = {
@@ -2404,6 +2503,68 @@ def _drill_cat(state, lean) -> str:
     return f"{'bullish' if lean > 0 else 'bearish'} · {'new positions' if new else 'exits'}"
 
 
+def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
+            latest: dict) -> pd.DataFrame:
+    """⚡ Unusual blocks on the whole ladder, newest first; a toast for each new one while
+    the session is live. Returns the flagged rows (K, side, block, ...)."""
+    al = unusual_blocks(stt_all, mins)
+    span = "1 hr" if mins == 60 else f"{mins} min"
+    n_blk = stt_all["block"].nunique()
+    if al.empty:
+        if n_blk < 3:
+            st.caption(f"⚡ Unusual-block alerts start from the third {span} block (the "
+                       "first holds the overnight change; the second is the first yardstick).")
+        else:
+            st.caption(f"⚡ No unusual block yet today — no {span} block ≥ {ALERT_X:.0f}× the "
+                       f"day's big blocks so far on any of the {len(bmap)} strikes (an alert "
+                       "lands here and as a pop-up while the session is live).")
+        return al
+    last_block = stt_all["block"].max()
+    expiry_day = str(latest.get("e", ""))[:10] == str(latest.get("t", ""))[:10]
+    now = _now()
+    live = (str(latest.get("t", ""))[:10] == now.date().isoformat()
+            and SESSION_OPEN <= now.time() <= dt.time(15, 31))
+    running = last_block if live and now < last_block + pd.Timedelta(minutes=mins) else None
+    srt = al.sort_values(["block", "ratio"], ascending=[False, False]).reset_index(drop=True)
+    lines = [ln + (f" · :gray[{bmap[k]}]" if k in bmap else "")
+             for ln, k in zip(alert_lines(srt, center, running, expiry_day), srt["K"])]
+    with st.container(border=True):
+        st.markdown(f"**⚡ Unusual blocks today — all {len(bmap)} strikes, {span} blocks** "
+                    f"({len(al)})")
+        for ln in lines[:ALERT_SHOW]:
+            st.markdown(ln)
+        if len(lines) > ALERT_SHOW:
+            with st.expander(f"{len(lines) - ALERT_SHOW} more"):
+                for ln in lines[ALERT_SHOW:]:
+                    st.markdown(ln)
+        st.caption(
+            f"A block is unusual when one strike-side's OI change is ≥ {ALERT_X:.0f}× the day's "
+            f"big blocks so far (the {ALERT_Q:.0%} point of |OI change| over every strike, side "
+            f"and block before it) and ≥ {ALERT_MIN_SHARE:.0%} of that side's OI on the ladder. "
+            "The first block (overnight "
+            "change) is never judged; a block after a hole in the log is skipped. Live OI is "
+            "provisional: 'half taken back next block' marks a print that reversed. Size is "
+            "not direction — Tradebot's archive found an OI surge precedes SMALLER moves.")
+    # toast new ones while live (the page refreshes every 15 s)
+    try:
+        today = _now().date().isoformat()
+        if str(latest.get("t", ""))[:10] == today and hasattr(st, "session_state"):
+            key = f"if_alert_seen_{code}_{mins}"
+            seen = st.session_state.get(key)
+            keys = {(r["K"], r["side"], str(r["block"])) for _, r in al.iterrows()}
+            if seen is None:
+                st.session_state[key] = keys            # first draw: nothing is 'new'
+            else:
+                for ln, (_, r) in zip(lines, srt.iterrows()):
+                    if (r["K"], r["side"], str(r["block"])) not in seen and r["block"] >= \
+                            last_block - pd.Timedelta(minutes=mins):
+                        st.toast(ln.replace("**", "").split(" · :gray")[0], icon="⚡")
+                st.session_state[key] = seen | keys
+    except Exception:                                        # noqa: BLE001 - toast is a nicety
+        pass
+    return al
+
+
 def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap: dict,
                   center, clicked: bool) -> None:
     """The strikes of one bucket, one by one: today's state per call and put, the state block
@@ -2517,10 +2678,15 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                    f"{OI_FLOOR:.0%} of the strike's OI = quiet. ★ = the morning's centre strike, "
                    "◀ index = strike nearest the index now.")
 
-        stt = strike_states(df, ks, mins, by)
+        # states for the WHOLE ladder once (the IV fit runs per reading, not per strike):
+        # the alert judges every strike against the ladder's day; the grids show the bucket
+        stt_all = strike_states(df, sorted(bmap), mins, by)
+        stt = stt_all[stt_all["K"].isin(ks)].reset_index(drop=True)
         if stt.empty:
             st.caption("The block picture appears once a few readings are logged.")
             return
+        al = _alerts(st, code, stt_all, mins, center, bmap, latest)
+        flagged = set(zip(al["K"], al["side"], al["block"])) if not al.empty else set()
         stt["word"] = stt["state"].map(PLAIN_STATE).fillna("")
         stt["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in stt["K"]]
         order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(ks, reverse=True)]
@@ -2545,6 +2711,9 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
         # 2026), short codes up to ~80 (5-min), colour only beyond
         stt["cell"] = (stt["word"] if n <= 14 else
                        stt["word"].map(SHORT_WORD).fillna("") if n <= 80 else "")
+        if flagged:
+            hot = [(k, sd, b) in flagged for k, sd, b in zip(stt["K"], stt["side"], stt["block"])]
+            stt["cell"] = np.where(hot, "⚡" + stt["cell"].astype(str), stt["cell"])
         st.markdown(f"**Who did what, block by block** — {pick}, {span} blocks from 09:15")
         x_enc = alt.X("blk:O", title=None, sort=blocks, scale=alt.Scale(domain=blocks),
                       axis=alt.Axis(labelAngle=0, labelFontSize=9, labelOverlap=True))
@@ -2711,7 +2880,8 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                 + ("**bulls ahead**." if last["net"] > 0 else "**bears ahead**."
                    if last["net"] < 0 else "even."))
 
-        _driver_panels(st, net_driver(stt), ks, center, mins, blocks, span)
+        _driver_panels(st, net_driver(stt), ks, center, mins, blocks, span,
+                       {(k, b) for k, _, b in flagged})
         net = strike_panels(df, ks, "OI change since yesterday", mins)
         if not net.empty:
             net = (net.pivot_table(index=["t", "K"], columns="side", values="v")
@@ -2762,7 +2932,7 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
 
 
 def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: list,
-                   span: str) -> None:
+                   span: str, flagged: set | None = None) -> None:
     """Calls − puts OI change per strike. Each block is one SEGMENT of the line, coloured by
     what that block's change did to the index (both sides counted); only the three biggest
     moves per strike are labelled with who drove them."""
@@ -2813,6 +2983,11 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
             if all(abs((r["t"] - q).total_seconds()) > 2 * mins * 60 for q in picked):
                 picked.append(r["t"])
                 nd.at[ix, "lab"] = r["code"] + " " + k_(abs(r["drv"])).lstrip("+")
+    # an unusual block (see unusual_blocks) is always labelled, with a ⚡
+    if flagged:
+        for ix, r in nd.iterrows():
+            if (r["K"], r["block"]) in flagged and r["code"]:
+                nd.at[ix, "lab"] = "⚡" + (r["lab"] or r["code"] + " " + k_(abs(r["drv"])).lstrip("+"))
     nd["up"] = nd["step"] >= 0
     x = alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9, tickCount=7))
     tip = [alt.Tooltip("blk:N", title="block from"), alt.Tooltip("strike:N"),
@@ -3771,6 +3946,11 @@ def render_page(st) -> None:
             except Exception as exc:                         # noqa: BLE001
                 st.error(f"Could not rebuild {day:%d %b}: {type(exc).__name__}: {exc}")
         _past()
+    try:
+        from . import index_scorecard
+        index_scorecard.render(st, code)
+    except Exception as exc:                                 # noqa: BLE001
+        st.caption(f"Scorecard not shown: {type(exc).__name__}: {exc}")
 
 
 def capture(until: dt.time = dt.time(15, 45)) -> None:
