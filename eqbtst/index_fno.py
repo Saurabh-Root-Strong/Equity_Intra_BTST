@@ -1075,6 +1075,120 @@ def logged_days(code: str) -> list:
     return sorted(out, reverse=True)
 
 
+# ── how much of a session the log holds ──────────────────────────────────────────────────
+COVER_OPEN, COVER_CLOSE = dt.time(9, 15), dt.time(15, 30)
+COVER_TOL = 180.0        # a reading stands for 3 min: the nearest chain steps 60-120 s in a healthy log
+COVER_HOLE = 300.0       # a silence this long is named on the page
+_COVER: dict = {}        # "CODE_YYYYMMDD" -> {"sig": [...], ...}; finished days, kept on disk
+
+
+def session_coverage(stamps: list, day: dt.date, upto: dt.datetime | None = None,
+                     tol: float = COVER_TOL) -> dict:
+    """Share of the 09:15-15:30 session the readings cover. Every silence longer than `tol`
+    (between two readings, from the open to the first, from the last to the close) loses
+    its length less `tol`. `upto` grades a session still running against the time elapsed.
+    Returns {pct, n, first, last, holes:[[HH:MM, HH:MM, minutes]]}; pct is None before the open."""
+    a = dt.datetime.combine(day, COVER_OPEN)
+    b = dt.datetime.combine(day, COVER_CLOSE)
+    if upto is not None:
+        b = min(b, upto)
+    out = {"pct": None, "n": 0, "first": None, "last": None, "holes": []}
+    span = (b - a).total_seconds()
+    if span <= 0:
+        return out
+    ts = []
+    for t in sorted(set(stamps)):
+        try:
+            x = dt.datetime.fromisoformat(str(t)[:19])
+        except ValueError:
+            continue
+        if x.date() == day and a <= x <= b:
+            ts.append(x)
+    out["n"] = len(ts)
+    if not ts:
+        out["pct"] = 0.0
+        out["holes"] = [[f"{a:%H:%M}", f"{b:%H:%M}", round(span / 60)]]
+        return out
+    out["first"], out["last"] = f"{ts[0]:%H:%M}", f"{ts[-1]:%H:%M}"
+    lost = 0.0
+    edges = [a] + ts + [b]
+    runs = []                    # [start, end]; silences split by one lone reading are one stretch
+    for x, y in zip(edges, edges[1:]):
+        gap = (y - x).total_seconds()
+        if gap > tol:
+            lost += gap - tol
+            if gap >= COVER_HOLE:
+                if runs and runs[-1][1] == x:
+                    runs[-1][1] = y
+                else:
+                    runs.append([x, y])
+    out["holes"] = [[f"{x:%H:%M}", f"{y:%H:%M}", round((y - x).total_seconds() / 60)]
+                    for x, y in runs]
+    out["pct"] = round(100.0 * max(0.0, 1.0 - lost / span), 1)
+    return out
+
+
+def _densest_stamps(rows: list) -> list:
+    by: dict = {}
+    for r in rows:
+        if r.get("e") and r.get("t"):
+            by.setdefault(r["e"], set()).add(r["t"])
+    return sorted(max(by.values(), key=len)) if by else []
+
+
+def day_coverage(code: str, day: dt.date, now: dt.datetime | None = None) -> dict:
+    """Coverage of one logged session, graded on its most-read expiry (the nearest one,
+    polled every 60 s). A finished day is worked out once and kept in coverage.json, so
+    the session list does not re-read every old log; today is graded against the clock."""
+    now = now or _now()
+    path = _path("chain", code, day)
+    if day >= now.date():
+        return session_coverage(_densest_stamps(_rows(path)), day, upto=now)
+    try:
+        f = path if path.exists() else path.with_suffix(".jsonl.gz")
+        st_ = f.stat()
+        sig = [f.name, st_.st_size]
+    except OSError:
+        return session_coverage([], day)
+    key = f"{code}_{day:%Y%m%d}"
+    store = DATA_DIR / "coverage.json"
+    if not _COVER:
+        try:
+            _COVER.update(json.loads(store.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+    hit = _COVER.get(key)
+    if hit and hit.get("sig") == sig and hit.get("tol") == COVER_TOL:
+        return hit
+    cov = session_coverage(_densest_stamps(im._load_jsonl(path)), day)
+    cov["sig"], cov["tol"] = sig, COVER_TOL
+    _COVER[key] = cov
+    try:
+        tmp = store.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(_COVER), encoding="utf-8")
+        os.replace(tmp, store)
+    except OSError:
+        pass
+    return cov
+
+
+def coverage_note(cov: dict, live: bool = False) -> str:
+    """One line under the session picker: what share is there and which stretches are not."""
+    if cov.get("pct") is None:
+        return ""
+    holes = sorted(cov.get("holes") or [], key=lambda h: -h[2])
+    head = (f"📼 Captured **{cov['pct']:.0f}%** of the session{' so far' if live else ''} "
+            f"— {cov['n']} readings of the nearest expiry"
+            + (f", {cov['first']} to {cov['last']}" if cov.get("first") else ""))
+    if not holes:
+        return head + ". No silence of 5 minutes or more."
+    txt = ", ".join(f"{h[0]}–{h[1]} ({h[2]} min)" for h in holes[:5])
+    more = f" and {len(holes) - 5} more" if len(holes) > 5 else ""
+    return (head + f". **Not captured:** {txt}{more}. A block that falls in such a stretch "
+            "shows the whole silence as one step — its change is real but its timing inside "
+            "the gap is unknown.")
+
+
 def logged_expiries(code: str, day: dt.date) -> list:
     return sorted({r.get("e") for r in _rows(_path("chain", code, day)) if r.get("e")})
 
@@ -2485,6 +2599,8 @@ best mildly contrarian. Use it to see who is positioned where, not which way the
 
 **The futures row under the index bars** reads the index futures block by block in the same clock: long build-up / short build-up / short covering / long unwinding from price × OI, one row per listed expiry, with volume and the futures premium in the tooltip. Its OI is NSE's live running estimate, which has had the wrong sign at the close on some days — a hint beside the option grids, not a count.
 
+**The % next to each session is how much of it the log holds.** The capture reads NSE about once a minute; when the dashboard was off or NSE did not answer, there is a silence. Every silence longer than 3 minutes is counted as missing, and the ones of 5 minutes or more are listed under the session box. Inside such a stretch the grids still add up (OI change is first-to-last), but they cannot say when in the gap it happened.
+
 **The ⏱ timer rewinds the whole page.** Drag the slider (or ◀ ▶, 5 minutes a step) to a minute of the session and everything below is rebuilt from the readings logged up to that minute only — metrics, ladder, buckets, both block grids, alerts, futures. It shows what the page showed then, with the provisional OI it had then; nothing later leaks in. Works on today and on any logged session.
 
 **The scorecard (bottom of the page) keeps the page honest.** Every finished session is
@@ -2835,6 +2951,36 @@ def _fut_strip(st, code: str, fut_rows: list, mins: int, x_enc, blocks: list, n:
         "view.")
 
 
+def _expiry_ctx(st) -> dict | None:
+    """What render_page left for the second expiry box (choices, labels, the top box's key)."""
+    try:
+        c = st.session_state.get("if_exp_ctx")
+    except Exception:                                        # noqa: BLE001
+        return None
+    return c if c and c.get("choices") else None
+
+
+def _expiry_twin(st, where, ctx: dict | None) -> None:
+    """A second expiry box between the CALLS and PUTS grids. It mirrors the one at the top
+    of the page: picking here hands the choice to the top box and redraws the whole page
+    (the expiry is chosen outside the 15-second fragment, so a fragment redraw is not enough)."""
+    if not ctx:
+        return
+    ss = st.session_state
+    key = ctx["key"] + "_twin"
+
+    def _picked():
+        ss["if_exp_pending"] = (ctx["key"], ss.get(key))
+
+    if ss.get(key) != ctx["exp"] and not ss.get("if_exp_pending"):
+        ss[key] = ctx["exp"]                    # follow the top box
+    where.selectbox("Expiry (changes the whole page)", ctx["choices"], key=key,
+                    format_func=ctx["label"], on_change=_picked,
+                    help="Same choice as the Expiry box at the top. Every section of the page "
+                         "— metrics, ladder, buckets, both grids, alerts — is drawn for this "
+                         "expiry. The futures row is not: futures have their own months.")
+
+
 def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap: dict,
                   center, clicked: bool, fut_rows: list | None = None) -> None:
     """The strikes of one bucket, one by one: today's state per call and put, the state block
@@ -3054,8 +3200,12 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                        running_b, dt.date.fromisoformat(str(latest.get("t", ""))[:10]))
         except Exception as exc:                             # noqa: BLE001 - never block the grids
             st.caption(f"Futures row not shown: {type(exc).__name__}: {exc}")
+        ectx = _expiry_ctx(st)
         for side, title in (("CE", "CALLS"), ("PE", "PUTS")):
             d = stt[stt["side"] == side]
+            if side == "PE":
+                c_idx, c_exp, _ = st.columns([1.1, 1.7, 2.2], vertical_alignment="center")
+                _expiry_twin(st, c_exp, ectx)
             if side == "PE" and latest.get("u"):
                 # the index level between the two grids: calls above it, puts below
                 o, now_u = latest.get("o"), latest["u"]
@@ -3063,14 +3213,15 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                     pc = prev_close(code, dt.date.fromisoformat(str(latest.get("t", ""))[:10]))
                 except ValueError:
                     pc = None
-                st.metric(DISPLAY.get(code, code), f"{now_u:,.2f}",
+                c_idx.metric(DISPLAY.get(code, code), f"{now_u:,.2f}",
                           (f"{now_u - pc:+,.2f} ({(now_u / pc - 1) * 100:+.2f}%)" if pc else None),
                           help=f"NSE's index level at {str(latest.get('t', ''))[11:19]}"
                                + (f". Change vs the previous close {pc:,.2f} (as NSE and "
                                   "brokers show it)" if pc else "")
                                + (f" · {now_u - o:+,.2f} ({(now_u / o - 1) * 100:+.2f}%) from "
                                   f"the 09:15 open {o:,.2f}" if o else ""))
-            st.markdown(f"**{title}**")
+            st.markdown(f"**{title}**" + (f" · expiry {ectx['label'](ectx['exp'])}"
+                                          if ectx else ""))
             _state_grid(st, d, order, x_enc, n, Y_W, 40 * len(ks))
         st.markdown(":green-background[ helps the index UP ] &nbsp; "
                     ":red-background[ pushes the index DOWN ] &nbsp; "
@@ -4260,11 +4411,31 @@ def render_page(st) -> None:
     today = _now().date()
     days = [d for d in logged_days(code) if d != today]
     opts = ["live"] + days
-    pick = st.selectbox("Session", opts, index=0, key=f"if_day_{code}",
-                        format_func=lambda d: "Today (live)" if d == "live"
-                        else f"{d:%a %d %b %Y} (logged)")
+    covs = {}
+    for d in [today] + days:
+        try:
+            covs[d] = day_coverage(code, d)
+        except Exception as exc:                             # noqa: BLE001
+            _log_error("coverage", f"{type(exc).__name__}: {exc}")
+            covs[d] = {}
+
+    def _day_label(d):
+        c = covs.get(today if d == "live" else d) or {}
+        if d == "live":
+            return ("Today (live)" if c.get("pct") is None or not c.get("n")
+                    else f"Today (live) · {c['pct']:.0f}% captured so far")
+        return (f"{d:%a %d %b %Y} (logged)" if c.get("pct") is None
+                else f"{d:%a %d %b %Y} · {c['pct']:.0f}% captured")
+
+    pick = st.selectbox("Session", opts, index=0, key=f"if_day_{code}", format_func=_day_label,
+                        help="The % is the share of 09:15–15:30 the log holds for the nearest "
+                             "expiry. A silence longer than 3 minutes between two readings "
+                             "counts as missing (less those 3 minutes). 100% = no such gap.")
     live = pick == "live"
     day = today if live else pick
+    note = coverage_note(covs.get(day) or {}, live)
+    if note and (covs[day].get("n") or not live):
+        st.caption(note)
     if live:
         touch(code)
         lat = load_latest(code)
@@ -4293,10 +4464,19 @@ def render_page(st) -> None:
         if not choices:
             st.info("Nothing logged for that session.")
             return
-    exp = st.selectbox("Expiry", choices, index=0, key=f"if_exp_{code}_{pick}",
-                       format_func=lambda e: _expiry_label(e, exps or choices, day)
-                       + ("" if not live or e in captured_expiries(exps, today)
-                          else " · read only while open on screen"))
+    ekey = f"if_exp_{code}_{pick}"
+    pend = st.session_state.pop("if_exp_pending", None)      # picked in the box by the grids
+    if pend and pend[0] == ekey and pend[1] in choices:
+        st.session_state[ekey] = pend[1]
+
+    def _exp_label(e):
+        return (_expiry_label(e, exps or choices, day)
+                + ("" if not live or e in captured_expiries(exps, today)
+                   else " · read only while open on screen"))
+
+    exp = st.selectbox("Expiry", choices, index=0, key=ekey, format_func=_exp_label)
+    st.session_state["if_exp_ctx"] = {"key": ekey, "choices": choices, "exp": exp,
+                                      "label": _exp_label}
     if live:
         touch(code, exp)
         if exp.isoformat() not in (load_latest(code).get("chain") or {}) and _claim():
@@ -4306,6 +4486,8 @@ def render_page(st) -> None:
     if live:
         @st.fragment(run_every="15s")
         def _live():
+            if st.session_state.get("if_exp_pending"):
+                st.rerun()                                   # whole page, with the new expiry
             try:
                 touch(code, exp)
                 _draw(st, code, exp.isoformat(), day, True)
@@ -4315,6 +4497,8 @@ def render_page(st) -> None:
     else:
         @st.fragment
         def _past():
+            if st.session_state.get("if_exp_pending"):
+                st.rerun()
             try:
                 _draw(st, code, exp.isoformat(), day, False)
             except Exception as exc:                         # noqa: BLE001

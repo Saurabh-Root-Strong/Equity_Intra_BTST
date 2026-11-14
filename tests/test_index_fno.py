@@ -1345,3 +1345,50 @@ def test_fut_blocks_count_from_yesterday_and_sum_to_the_day():
     fr = f.fut_blocks(rows_r, 15, dt.date(2026, 11, 20))
     assert set(fr[fr["block"] == pd.Timestamp("2026-11-20 09:30")]["state"]) == {"Roll"}
     assert f.fut_blocks([], 15).empty
+
+
+def test_session_coverage_counts_silences_and_names_the_holes(tmp_path, monkeypatch):
+    import json as _json
+    day = dt.date(2026, 11, 13)
+
+    def at(h, m, s=0):
+        return f"2026-11-13T{h:02d}:{m:02d}:{s:02d}"
+
+    full = [at(h, m) for h in range(9, 16) for m in range(60) if (9, 15) <= (h, m) < (15, 30)]
+    c = f.session_coverage(full, day)
+    assert c["pct"] == 100.0 and c["holes"] == [] and c["first"] == "09:15" and c["last"] == "15:29"
+    # a 30-minute silence 11:00-11:30 loses 30 - 3 = 27 of 375 minutes
+    holed = [x for x in full if not (at(11, 0) < x < at(11, 30))]
+    c = f.session_coverage(holed, day)
+    assert c["pct"] == round(100 * (1 - 27 / 375), 1) and c["holes"] == [["11:00", "11:30", 30]]
+    # late start and early stop are holes too
+    c = f.session_coverage([x for x in full if at(9, 45) <= x <= at(14, 45)], day)
+    assert [h[:2] for h in c["holes"]] == [["09:15", "09:45"], ["14:45", "15:30"]]
+    assert c["pct"] == round(100 * (1 - (27 + 42) / 375), 1)
+    # a 4-minute step loses a minute but is not named
+    c = f.session_coverage([x for x in full if not (at(10, 0) < x < at(10, 4))], day)
+    assert c["pct"] == round(100 * (1 - 1 / 375), 1) and c["holes"] == []
+    # nothing logged; other days' and after-hours stamps do not count
+    assert f.session_coverage([], day)["pct"] == 0.0
+    assert f.session_coverage(["2026-11-12T10:00:00", at(16, 0)], day)["n"] == 0
+    # a running session is graded against the clock, and is undefined before the open
+    c = f.session_coverage([x for x in full if x <= at(10, 0)], day,
+                           upto=dt.datetime(2026, 11, 13, 10, 1))
+    assert c["pct"] == 100.0
+    assert f.session_coverage([], day, upto=dt.datetime(2026, 11, 13, 9, 0))["pct"] is None
+    # the day grade uses the most-read expiry and is cached for a finished day
+    monkeypatch.setattr(f, "DATA_DIR", tmp_path)
+    f._COVER.clear()
+    rows = ([{"t": x, "e": "2026-11-17"} for x in holed]
+            + [{"t": x, "e": "2026-11-23"} for x in full[::3]])
+    f._path("chain", "NIFTY", day).write_text("\n".join(_json.dumps(r) for r in rows),
+                                              encoding="utf-8")
+    now = dt.datetime(2026, 11, 14, 10, 0)
+    c = f.day_coverage("NIFTY", day, now)
+    assert c["holes"] == [["11:00", "11:30", 30]]
+    kept = _json.loads((tmp_path / "coverage.json").read_text(encoding="utf-8"))
+    assert kept["NIFTY_20261113"]["pct"] == c["pct"]
+    assert f.day_coverage("NIFTY", day, now) is c
+    note = f.coverage_note(c)
+    assert "Not captured" in note and "11:00–11:30 (30 min)" in note
+    f._COVER.clear()
