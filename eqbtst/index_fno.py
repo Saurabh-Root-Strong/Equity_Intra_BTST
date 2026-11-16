@@ -3347,6 +3347,28 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
             "Description of positioning, not a signal.")
 
 
+def _clock_ticks(times, minutes: int, most: int) -> list:
+    """Axis ticks for a time panel: block starts counted from 09:15 (09:15, 09:30 ...), every
+    k-th one so that at most `most` labels are drawn. Local wall-clock DateTimes — the rows
+    are naive timestamps, so epoch numbers would shift by the UTC offset."""
+    import altair as alt
+    ts = pd.to_datetime(pd.Series(list(times))).dropna()
+    if ts.empty:
+        return []
+    day = ts.min().normalize()
+    lo = max(ts.min(), day + pd.Timedelta(hours=9, minutes=15))
+    first = day + pd.Timedelta(hours=9, minutes=15)
+    n0 = int((lo - first) / pd.Timedelta(minutes=minutes))
+    marks = []
+    x = first + n0 * pd.Timedelta(minutes=minutes)
+    while x <= ts.max():
+        marks.append(x)
+        x += pd.Timedelta(minutes=minutes)
+    step = max(1, -(-len(marks) // max(most, 1)))
+    return [alt.DateTime(year=int(m.year), month=int(m.month), date=int(m.day),
+                         hours=int(m.hour), minutes=int(m.minute)) for m in marks[::step]]
+
+
 def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
     import altair as alt
     long = long.copy()
@@ -3354,8 +3376,10 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
     order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(strikes)]
     long["sign"] = np.where(long["v"] >= 0, "calls heavier", "puts heavier")
     area = (alt.Chart(long).mark_bar(opacity=0.85)
-            .encode(x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9,
-                                                             tickCount=4)),
+            .encode(x=alt.X("t:T", title=None,
+                            axis=alt.Axis(format="%H:%M", labelFontSize=9, labelAngle=0,
+                                          labelColor="#c9ced6", grid=True, gridOpacity=0.12,
+                                          values=_clock_ticks(long["t"], 60, 7) or alt.Undefined)),
                     y=alt.Y("v:Q", title=None, axis=alt.Axis(labelFontSize=9, format="~s")),
                     color=alt.condition("datum.v >= 0", alt.value(CE_COLOR), alt.value(PE_COLOR)),
                     tooltip=[alt.Tooltip("t:T", title="time", format="%H:%M"),
@@ -3366,7 +3390,7 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
           .facet(facet=alt.Facet("strike:N", sort=order, title=None,
                                  header=alt.Header(labelFontSize=11, labelFontWeight="bold")),
                  columns=4)
-          .resolve_scale(y="independent"))
+          .resolve_scale(y="independent").resolve_axis(x="independent"))
     st.altair_chart(ch)
 
 
@@ -3430,7 +3454,11 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
             if (r["K"], r["block"]) in flagged and r["code"]:
                 nd.at[ix, "lab"] = "⚡" + (r["lab"] or r["code"] + " " + k_(abs(r["drv"])).lstrip("+"))
     nd["up"] = nd["step"] >= 0
-    x = alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9, tickCount=7))
+    # block starts as on the grids above (09:15, 09:30 ...), thinned to ~13 labels a panel
+    x_axis = alt.Axis(format="%H:%M", labelFontSize=10, labelAngle=0, labelColor="#c9ced6",
+                      grid=True, gridOpacity=0.12, tickSize=4,
+                      values=_clock_ticks(nd["t"], mins, 13) or alt.Undefined)
+    x = alt.X("t:T", title=None, axis=x_axis)
     tip = [alt.Tooltip("span:N", title="block"), alt.Tooltip("strike:N"),
            alt.Tooltip("level:Q", title="calls − puts since yesterday", format="+,.0f"),
            alt.Tooltip("step:Q", title="change in this block", format="+,.0f"),
@@ -3442,7 +3470,8 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
     y = alt.Y("level:Q", title=None, scale=ysc,
               axis=alt.Axis(format="~s", labelFontSize=10))
     seg = alt.Chart().mark_rule(strokeWidth=3, strokeCap="round").encode(
-        x="t0:T", x2="t:T", y=alt.Y("y0:Q", title=None, scale=ysc), y2="level:Q",
+        x=alt.X("t0:T", title=None, axis=x_axis), x2="t:T",
+        y=alt.Y("y0:Q", title=None, scale=ysc), y2="level:Q",
         tooltip=tip,
         color=alt.Color("effect:N", title=None,
                         scale=alt.Scale(domain=["helps the index UP", "pushes the index DOWN",
@@ -3467,7 +3496,7 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
           .facet(facet=alt.Facet("strike:N", sort=order, title=None,
                                  header=alt.Header(labelFontSize=12, labelFontWeight="bold")),
                  columns=2)
-          .resolve_scale(y="independent"))
+          .resolve_scale(y="independent").resolve_axis(x="independent"))
     st.altair_chart(ch)
     st.caption(
         "The line = calls' OI change minus puts' since yesterday's close (above the dashed 0 = "
@@ -3479,7 +3508,8 @@ def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: li
         "are labelled with who drove them and how many contracts THEY added or cut: C/P = "
         "calls/puts, then B+ buyers in · W+ writers in · W− writers out · B− buyers out "
         "(PW+ 29k = put writers added 29,000, which pulls the line down). Hover any piece "
-        "for both sides. Own scale per panel.")
+        "for both sides. Own scale per panel; the clock under each panel marks block starts, "
+        "the same times as the grids above: the dot over 10:00 is where the line stood at the END of the 10:00 block.")
 
 
 def _bucket_section(st, code: str, latest: dict, first: dict | None, df: pd.DataFrame,
