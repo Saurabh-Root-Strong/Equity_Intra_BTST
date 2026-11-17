@@ -3157,13 +3157,17 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                 pc0 = None
             mv.iloc[0] = ub.iloc[0] - (pc0 or latest.get("o") or u.iloc[0])
         idx = pd.DataFrame({"blk": pd.to_datetime(ub.index).strftime("%H:%M"), "pts": mv.values,
+                            "u": ub.values,
                             "span": block_span(ub.index, mins, first_b, running_b).values})
         idx = idx[idx["blk"].isin(blocks)]
         idx["dir"] = np.where(idx["pts"] >= 0, "index up", "index down")
         # titles and legend live OUTSIDE the charts: Streamlit fits a chart's title + legend
         # inside its height, which crushed the index bars to nothing and the put rows to half
         # height (11 Nov 2026)
-        st.markdown("**INDEX** — points moved in each block")
+        nm = DISPLAY.get(code, code)
+        st.markdown("**INDEX** — bars: points moved in each block &nbsp; "
+                    f"<span style='color:#ffd54f'>●</span>── {nm} level at each block's end",
+                    unsafe_allow_html=True)
         # The first bar holds the overnight gap (13 Nov 2026: −155 on a day whose blocks
         # moved 5-40 points), so left on one scale it crushed every session bar to a sliver
         # (user: "looks very narrow"). Scale on the SESSION blocks, clip the gap bar to the
@@ -3190,7 +3194,40 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                 baseline="bottom", dy=-3, **txt).encode(x=x_enc, y="clip:Q", text="lbl:N"))
             layers.append(alt.Chart(idx[idx["pts"] < 0]).mark_text(
                 baseline="top", dy=3, **txt).encode(x=x_enc, y="clip:Q", text="lbl:N"))
-        st.altair_chart(alt.layer(*layers).properties(height=200), width="stretch")
+        lv = idx.dropna(subset=["u"]).copy()
+        if len(lv) > 1:
+            # The level on its OWN scale, with no axis: a right-hand axis would narrow the plot
+            # and the bars would stop lining up with the grid columns below. The day's high,
+            # low and latest level are printed on their dots instead. The scale is padded so
+            # the line floats in the band's upper part, clear of the zero line.
+            lo, hi = float(lv["u"].min()), float(lv["u"].max())
+            rng = max(hi - lo, 1.0)
+            lsc = alt.Scale(domain=[lo - rng * 1.1, hi + rng * 0.25], nice=False, zero=False)
+            y_u = alt.Y("u:Q", scale=lsc, axis=None, title=None)
+            i_hi, i_lo, i_last = lv["u"].idxmax(), lv["u"].idxmin(), lv.index[-1]
+            lv["tag"] = ""
+            lv.loc[i_lo, "tag"] = f"low {lv.loc[i_lo, 'u']:,.0f}"
+            lv.loc[i_hi, "tag"] = f"high {lv.loc[i_hi, 'u']:,.0f}"
+            if i_last not in (i_hi, i_lo):
+                lv.loc[i_last, "tag"] = f"{lv.loc[i_last, 'u']:,.0f}"
+            tip = [alt.Tooltip("span:N", title="block"),
+                   alt.Tooltip("u:Q", title=f"{nm} at the block's last reading", format=",.2f"),
+                   alt.Tooltip("pts:Q", title="move in the block", format="+,.1f")]
+            x_ax = x_enc.axis(None)
+            lvl = alt.layer(
+                alt.Chart(lv).mark_line(color="#0e1117", strokeWidth=5, opacity=0.7)
+                .encode(x=x_ax, y=y_u),
+                alt.Chart(lv).mark_line(color="#ffffff", strokeWidth=2).encode(x=x_ax, y=y_u),
+                alt.Chart(lv).mark_point(filled=True, size=40, color="#ffd54f", stroke="#0e1117",
+                                         strokeWidth=1, opacity=1)
+                .encode(x=x_ax, y=y_u, tooltip=tip),
+                alt.Chart(lv[lv["tag"] != ""]).mark_text(
+                    dy=-11, fontSize=11, fontWeight="bold", color="#ffd54f")
+                .encode(x=x_ax, y=y_u, text="tag:N"))
+            chart = alt.layer(alt.layer(*layers), lvl).resolve_scale(y="independent")
+        else:
+            chart = alt.layer(*layers)
+        st.altair_chart(chart.properties(height=220), width="stretch")
         if len(idx) and abs(idx["pts"].iloc[0]) > lim:
             st.caption(f"The first bar counts from yesterday's close (the gap, "
                        f"{idx['pts'].iloc[0]:+,.0f}) and is cut to the session's scale so the "
