@@ -30,6 +30,16 @@ NIFTY_INDEX_NAME = "Nifty 50"          # index_data.index_name for the regime ga
 TRADEBOT_DIR = Path(os.environ.get("EQBTST_TRADEBOT_DIR", r"d:/Python Projects/Tradebot"))
 FYERS_HISTORY_URL = "https://api-t1.fyers.in/data/history"
 FYERS_QUOTES_URL = "https://api-t1.fyers.in/data/quotes"
+# NSE's CLOSING AUCTION start (measured from data, see live._session_extras): from this session
+# the official close is the auction price, no longer the 15:00-15:30 VWAP.
+import datetime as _dt
+CLOSING_AUCTION_FROM = _dt.date(2026, 8, 3)
+# Fyers Standard plan: 5,000 Data calls per DAY per login, shared with Tradebot (Prime: 500,000).
+FYERS_DAILY_CAP = int(os.environ.get("EQBTST_FYERS_DAILY_CAP", "5000"))
+# OPTIONAL self-limit for THIS board: after this many of its own Data calls in a day it stops
+# asking Fyers and runs on NSE, leaving the rest of the login's cap to Tradebot's capturer.
+# 0 = off (use Fyers until the broker itself refuses).
+EQBTST_FYERS_BUDGET = int(os.environ.get("EQBTST_FYERS_BUDGET", "0"))
 NIFTY_FYERS = "NSE:NIFTY50-INDEX"      # live index for the regime / relative strength
 
 # --- LOCKED conviction signal (the accumulation footprint) --------------------

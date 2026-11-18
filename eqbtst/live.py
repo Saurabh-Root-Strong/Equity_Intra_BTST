@@ -176,6 +176,244 @@ def liquid_universe(date: pd.Timestamp | None = None) -> pd.DataFrame:
     return out.copy()
 
 
+# ── Fyers DAILY data-call cap, the call counter, and the NSE fallback ───────────
+# The Standard plan caps Data API calls at 5,000 per DAY per LOGIN (code -360, HTTP 429:
+# "You've reached the Standard plan limit of 5,000 requests/day"). This is NOT the per-minute
+# limit _hist_pace manages: no pacing or retry clears it -- it lasts until the daily reset.
+# The login is SHARED with Tradebot's capturer (~4,237 calls/day on its own), so this board
+# can find the cap already spent. Before this guard every /history call then came back as an
+# empty frame, every enriched row was dropped, and the board told the user to "try a coarser
+# Lower TF (thin candles)" -- a broker refusal reported as a property of the market, on every
+# timeframe.
+#
+# Now: (1) every Data call goes through _fyers_get, which COUNTS it (persisted per day, so a
+# restart keeps the count) and recognises the cap reply; (2) once capped -- or once this
+# board's own optional budget EQBTST_FYERS_BUDGET is spent -- calls are not sent at all and
+# quotes/candles are rebuilt from NSE's website (eqbtst/nse_fallback.py), with a probe of the
+# broker every _QUOTA_RETRY_S in case the cap was transient.
+#
+# THE COUNT IS THIS BOARD'S, NOT THE ACCOUNT'S. Fyers returns no usage headers (checked: the
+# 429 carries none), and Tradebot counts on its own machine -- the VM's count is invisible
+# here. So "left" is an UPPER BOUND until the broker refuses, at which point it is a fact (0),
+# and the count at that moment tells you how much everyone else on the login had spent.
+FYERS_DAILY_CAP = config.FYERS_DAILY_CAP
+_QUOTA_RETRY_S = 600               # after a cap reply, probe the broker again at most every 10 min
+_CALLS_FILE = Path(__file__).resolve().parent.parent / "data" / "fyers_calls.json"
+_calls_lock = threading.Lock()
+_CALLS: dict = {}                  # today's merged view (see _calls_roll)
+_PENDING: dict = {"calls": 0, "by_kind": {}}   # counted here, not yet merged into the file
+_FLUSH = {"at": 0.0}
+_SRC = {"nse_at": None}            # last time NSE served something in place of Fyers
+
+
+class FyersCapped(RuntimeError):
+    """The call was not sent (cap/budget) or the broker refused it with the daily cap."""
+
+
+def _fresh_calls(day: str) -> dict:
+    # cap_first = when the broker FIRST refused today (what the board reports);
+    # cap_at    = its LATEST refusal (what the 10-minute skip window runs from).
+    return {"date": day, "calls": 0, "by_kind": {}, "cap_at": None, "cap_first": None,
+            "cap_msg": None, "calls_at_cap": None}
+
+
+def _read_calls_file() -> dict:
+    try:
+        import json
+        return json.loads(_CALLS_FILE.read_text(encoding="utf-8"))
+    except Exception:                                           # noqa: BLE001
+        return {}
+
+
+def _calls_roll() -> None:
+    """Start/continue today's counters (caller holds _calls_lock). On a new day -- or the
+    first call of a process -- adopt the file's numbers if they are today's."""
+    today = dt.date.today().isoformat()
+    if _CALLS.get("date") == today:
+        return
+    disk = _read_calls_file()
+    _CALLS.clear()
+    _CALLS.update(disk if disk.get("date") == today else _fresh_calls(today))
+    _PENDING["calls"], _PENDING["by_kind"] = 0, {}
+
+
+def _flush_calls(force: bool = False) -> None:
+    """Merge this process's uncounted calls into the file (caller holds _calls_lock).
+    Read-add-write, so two processes on one machine both land; throttled to every 3s."""
+    if not force and time.time() - _FLUSH["at"] < 3.0:
+        return
+    _FLUSH["at"] = time.time()
+    try:
+        import json
+        disk = _read_calls_file()
+        if disk.get("date") != _CALLS["date"]:
+            disk = _fresh_calls(_CALLS["date"])
+        disk["calls"] = int(disk.get("calls") or 0) + _PENDING["calls"]
+        bk = dict(disk.get("by_kind") or {})
+        for k, n in _PENDING["by_kind"].items():
+            bk[k] = int(bk.get(k) or 0) + n
+        disk["by_kind"] = bk
+        # ISO timestamps of one day compare correctly as strings. The LATEST refusal must
+        # win, or the skip window keeps measuring from the first one and, ten minutes after
+        # it, every call goes back to the broker to be refused again.
+        if (_CALLS.get("cap_at") or "") > (disk.get("cap_at") or ""):
+            disk["cap_at"], disk["cap_msg"] = _CALLS["cap_at"], _CALLS.get("cap_msg")
+        if _CALLS.get("cap_first") and not disk.get("cap_first"):
+            disk["cap_first"] = _CALLS["cap_first"]
+            disk["calls_at_cap"] = _CALLS.get("calls_at_cap")
+        _CALLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CALLS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(disk), encoding="utf-8")
+        tmp.replace(_CALLS_FILE)
+        _CALLS.clear()
+        _CALLS.update(disk)
+        _PENDING["calls"], _PENDING["by_kind"] = 0, {}
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
+def _count_call(kind: str) -> None:
+    with _calls_lock:
+        _calls_roll()
+        _PENDING["calls"] += 1
+        _PENDING["by_kind"][kind] = _PENDING["by_kind"].get(kind, 0) + 1
+        _flush_calls()
+
+
+def _calls_today() -> int:
+    with _calls_lock:
+        _calls_roll()
+        return int(_CALLS.get("calls") or 0) + _PENDING["calls"]
+
+
+def _note_quota(j) -> bool:
+    """Record a daily-cap reply. True if `j` (a parsed Fyers JSON body) is one."""
+    if not isinstance(j, dict):
+        return False
+    msg = str(j.get("message") or "")
+    if j.get("code") == -360 or "requests/day" in msg:
+        with _calls_lock:
+            _calls_roll()
+            now = dt.datetime.now().isoformat(timespec="seconds")
+            if not _CALLS.get("cap_first"):
+                _CALLS["calls_at_cap"] = int(_CALLS.get("calls") or 0) + _PENDING["calls"]
+                _CALLS["cap_first"] = now
+            _CALLS["cap_at"] = now
+            _CALLS["cap_msg"] = msg
+            _flush_calls(force=True)
+        return True
+    return False
+
+
+def _cap_at() -> dt.datetime | None:
+    with _calls_lock:
+        _calls_roll()
+        at = _CALLS.get("cap_at")
+    try:
+        return dt.datetime.fromisoformat(at) if at else None
+    except ValueError:
+        return None
+
+
+def data_quota_exhausted() -> str | None:
+    """The broker's daily-cap message if it was hit TODAY, else None. Day-scoped: the cap
+    resets daily, so yesterday's refusal must never blank today's board."""
+    at = _cap_at()
+    if at is None or at.date() != dt.date.today():
+        return None
+    return _CALLS.get("cap_msg") or "Fyers daily data-call limit reached"
+
+
+def fyers_paused() -> str | None:
+    """Why Fyers is not being asked right now (broker cap OR this board's own budget), for
+    messages; None when it is."""
+    m = data_quota_exhausted()
+    if m:
+        return m
+    if _budget_spent():
+        return (f"this board's own budget of {config.EQBTST_FYERS_BUDGET:,} Fyers calls is "
+                f"spent (EQBTST_FYERS_BUDGET)")
+    return None
+
+
+def _budget_spent() -> bool:
+    b = config.EQBTST_FYERS_BUDGET
+    return bool(b) and _calls_today() >= b
+
+
+def _quota_skip() -> bool:
+    """Do not send: the cap was hit recently enough that a call cannot succeed, or this
+    board's own budget is spent."""
+    at = _cap_at()
+    if (at is not None and at.date() == dt.date.today()
+            and (dt.datetime.now() - at).total_seconds() < _QUOTA_RETRY_S):
+        return True
+    return _budget_spent()
+
+
+def _fyers_get(url: str, params: dict, timeout: float, kind: str) -> dict:
+    """THE one way this package sends a Fyers Data call: counted, cap-aware. Returns the
+    parsed JSON; raises FyersCapped when not sent or refused with the daily cap."""
+    if _quota_skip():
+        raise FyersCapped(data_quota_exhausted() or "eqbtst daily Fyers budget spent")
+    _count_call(kind)
+    r = requests.get(url, headers={"Authorization": _auth_header(), "version": "3"},
+                     params=params, timeout=timeout)
+    j = r.json()
+    if _note_quota(j):
+        raise FyersCapped(str(j.get("message") or "daily cap"))
+    return j
+
+
+def _mark_nse() -> None:
+    _SRC["nse_at"] = dt.datetime.now()
+
+
+def data_source() -> str:
+    """'NSE' if NSE stood in for Fyers within the last 10 minutes, else 'FYERS'."""
+    at = _SRC["nse_at"]
+    return "NSE" if (at and (dt.datetime.now() - at).total_seconds() < 600) else "FYERS"
+
+
+def _tradebot_local_calls() -> int | None:
+    """Tradebot's own Data-call count for today on THIS machine (its gate's state file), or
+    None when it is not running here. The VM's count is not visible from the laptop."""
+    try:
+        import json
+        p = Path(config.TRADEBOT_DIR) / "data" / "fyers_data_calls.json"
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return int(d.get("used") or 0) if d.get("date") == dt.date.today().isoformat() else None
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def budget_status() -> dict:
+    """Everything the board shows about the Fyers daily budget. Never raises, no network."""
+    with _calls_lock:
+        _calls_roll()
+        snap = dict(_CALLS)
+        ours = int(snap.get("calls") or 0) + _PENDING["calls"]
+        by_kind = dict(snap.get("by_kind") or {})
+        for k, n in _PENDING["by_kind"].items():
+            by_kind[k] = by_kind.get(k, 0) + n
+    tb = _tradebot_local_calls()
+    capped = data_quota_exhausted() is not None
+    at_cap = snap.get("calls_at_cap")
+    return {
+        "ours": ours, "by_kind": by_kind, "cap": FYERS_DAILY_CAP, "tradebot_local": tb,
+        "left": 0 if capped else max(0, FYERS_DAILY_CAP - ours - (tb or 0)),
+        "left_is_exact": capped,
+        "capped": capped,
+        "cap_at": (snap.get("cap_first") or snap.get("cap_at") or "")[11:16] if capped else None,
+        "ours_at_cap": at_cap if capped else None,
+        "others_at_cap": (max(0, FYERS_DAILY_CAP - int(at_cap)) if (capped and at_cap is not None)
+                          else None),
+        "budget": config.EQBTST_FYERS_BUDGET or None,
+        "budget_spent": _budget_spent(),
+        "src": data_source(),
+    }
+
+
 # ── tier 1: batch quotes scan ──────────────────────────────────────────────────
 _QUOTE_GAP: list[int] = [0]        # symbols lost to a failed /quotes chunk on the last call
 
@@ -189,19 +427,25 @@ def _fetch_quotes(fy_syms: list[str]) -> dict:
     them and nothing could flag the loss. Same failure class as the /history 429 hole that
     cost 20% of the universe: a failure recorded as an answer. It has a wider blast radius
     here because this is the FIRST fetch -- everything downstream inherits the gap.
-    So: retry once, then COUNT what is still missing so the caller can say so out loud."""
+    So: retry once, then COUNT what is still missing so the caller can say so out loud.
+
+    DAILY CAP: chunks the broker will not serve (cap / budget) are filled from NSE's website,
+    which prices the same session; those rows carry `_src: "NSE"`."""
     chunks = [fy_syms[i:i + 50] for i in range(0, len(fy_syms), 50)]
+    capped: list = []
 
     def _one(chunk: list[str]) -> tuple[dict, int]:
         for attempt in (0, 1):
             try:
-                r = requests.get(config.FYERS_QUOTES_URL,
-                                 headers={"Authorization": _auth_header(), "version": "3"},
-                                 params={"symbols": ",".join(chunk)}, timeout=8)
-                d = r.json().get("d") or []
+                _j = _fyers_get(config.FYERS_QUOTES_URL, {"symbols": ",".join(chunk)}, 8,
+                                "quotes")
+                d = _j.get("d") or []
                 if not d:
                     raise ValueError("empty quote batch")
                 return ({it["n"]: (it.get("v") or {}) for it in d if it.get("n")}, 0)
+            except FyersCapped:
+                capped.append(chunk)
+                return ({}, len(chunk))         # daily cap: a retry cannot succeed
             except Exception:
                 if attempt == 0:
                     time.sleep(0.5)                     # one transient blip, not a policy
@@ -221,6 +465,16 @@ def _fetch_quotes(fy_syms: list[str]) -> dict:
             for got, miss in ex.map(_one, chunks):
                 out.update(got)
                 missing += miss
+    if capped:
+        try:
+            from . import nse_fallback
+            got = nse_fallback.quotes([s for c in capped for s in c])
+        except Exception:                                       # noqa: BLE001
+            got = {}
+        if got:
+            _mark_nse()
+            out.update(got)
+            missing = max(0, missing - len(got))
     _QUOTE_GAP[0] = missing
     return out
 
@@ -756,18 +1010,31 @@ def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -
     Pulls a few days so ATR14/RSI14 have enough bars on the coarse (hourly+) frames.
 
     Rate-paced: see _hist_pace. An unpaced fan-out returns 429s that this function would
-    otherwise convert into an empty frame, i.e. into a silent 'n/a' structure label."""
+    otherwise convert into an empty frame, i.e. into a silent 'n/a' structure label.
+
+    DAILY CAP: once Fyers will not serve (see _fyers_get), the frame is rebuilt from NSE +
+    the local candle cache by _fallback_candles -- tagged df.attrs["src"] = "NSE". Every
+    successful 15m fetch of a stock is written to that cache, which is what lets the
+    fallback carry the PRIOR days NSE does not publish."""
+    lb = lookback_days if lookback_days is not None else _LOOKBACK.get(tf, 10)
+    if _quota_skip():
+        return _fallback_candles(sym, tf, lb)
     _hist_pace()
     res = _RES.get(tf, "60")
-    lb = lookback_days if lookback_days is not None else _LOOKBACK.get(tf, 10)
     d_to = dt.date.today()
     d_from = d_to - dt.timedelta(days=lb)
-    r = requests.get(config.FYERS_HISTORY_URL,
-                     headers={"Authorization": _auth_header(), "version": "3"},
-                     params={"symbol": fy_symbol(sym), "resolution": res,
-                             "date_format": "1", "range_from": d_from.isoformat(),
-                             "range_to": d_to.isoformat(), "cont_flag": "1"}, timeout=15)
-    j = r.json()
+    # A BARE INDEX NAME IS NOT AN EQUITY. _index_intraday_5m passes "NIFTY50", and
+    # fy_symbol() turned it into "NSE:NIFTY50-EQ" -- a symbol that does not exist -- so the
+    # Nifty series behind the trigger's running RS leg came back empty and the leg was
+    # silently never applied.
+    fys = f"NSE:{sym}-INDEX" if sym in _INDEX_BARE else fy_symbol(sym)
+    try:
+        j = _fyers_get(config.FYERS_HISTORY_URL,
+                       {"symbol": fys, "resolution": res, "date_format": "1",
+                        "range_from": d_from.isoformat(), "range_to": d_to.isoformat(),
+                        "cont_flag": "1"}, 15, "history")
+    except FyersCapped:
+        return _fallback_candles(sym, tf, lb)
     if j.get("s") != "ok" or not j.get("candles"):
         return pd.DataFrame()
     df = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
@@ -778,7 +1045,140 @@ def fetch_intraday(sym: str, tf: str = "1h", lookback_days: int | None = None) -
     # computed on two different definitions of '1h'. See merge_session_stubs.
     if res.isdigit() and int(res) > 15:
         df = merge_session_stubs(df, int(res))
+    if res == "15" and sym not in _INDEX_BARE:
+        try:
+            from . import nse_fallback
+            nse_fallback.cache_put(sym, df)
+        except Exception:                                       # noqa: BLE001
+            pass
     return df
+
+
+_INDEX_BARE = {"NIFTY50", "NIFTYBANK", "FINNIFTY"}
+_TF_FREQ = {"1h": "60min", "2h": "120min", "4h": "240min"}
+_PRIOR_MEMO: dict = {}          # (sym, date) -> prior-day 15m bars (they cannot change intraday)
+
+
+def _prev_session(today: dt.date) -> dt.date | None:
+    """The last session BEFORE today that the archive knows (RELIANCE trades every session)."""
+    d = _daily_hist().get("RELIANCE")
+    if d is None or d.empty:
+        return None
+    past = d["ts"][d["ts"].dt.date < today]
+    return past.max().date() if not past.empty else None
+
+
+def _prior_15m(sym: str) -> pd.DataFrame:
+    """Broker 15m bars for PRIOR sessions, from every local copy: this lane's fallback cache
+    and the paper lane's top-up cache + Tradebot's 2-year download (paper_hz.load_bars).
+    Fresh fetches win on overlap.
+
+    STALE HISTORY IS NO HISTORY. If the newest bar is older than the previous session, the
+    splice would jump straight from that old day to today and every coarse frame would read
+    across the hole as if it were continuous. Returned empty in that case (frames go 'n/a').
+    A previous session that is merely PARTIAL (cache last written at 14:00) is accepted."""
+    today = dt.date.today()
+    key = (sym, today)
+    if key in _PRIOR_MEMO:
+        return _PRIOR_MEMO[key]
+    from . import nse_fallback as nf
+    parts = []
+    try:
+        from . import paper_hz
+        pb = paper_hz.load_bars(sym, "15m")
+        if pb is not None and not pb.empty:
+            parts.append(pb)
+    except Exception:                                           # noqa: BLE001
+        pass
+    own = nf.cache_get(sym)
+    if not own.empty:
+        parts.append(own)
+    out = pd.DataFrame()
+    if parts:
+        cols = ["ts", "open", "high", "low", "close", "volume"]
+        f = pd.concat([x[cols] for x in parts], ignore_index=True)
+        f["ts"] = pd.to_datetime(f["ts"])
+        f["volume"] = f["volume"].astype(float)
+        cut = pd.Timestamp(today - dt.timedelta(days=nf.CACHE_KEEP_DAYS))
+        f = (f[(f["ts"] >= cut)].drop_duplicates("ts", keep="last")
+             .sort_values("ts").reset_index(drop=True))
+        prev = _prev_session(today)
+        hist = f[f["ts"].dt.date < today]
+        if not hist.empty and (prev is None or hist["ts"].dt.date.max() >= prev):
+            out = f
+    if len(_PRIOR_MEMO) > 2000:
+        _PRIOR_MEMO.clear()
+    _PRIOR_MEMO[key] = out
+    return out
+
+
+def _fallback_candles(sym: str, tf: str, lookback_days: int) -> pd.DataFrame:
+    """fetch_intraday's frame rebuilt WITHOUT Fyers, for when the daily cap is spent.
+
+      1D        EOD archive (every closed session, corporate-action adjusted) + today's
+                forming bar from the NSE quote. Same information as the broker's daily series.
+      15m+      the local cache of the broker's own 15m bars for prior days, spliced with
+                today's bars built from NSE's minute points, then resampled like the scan's
+                own frames. Today's NSE-built bars have volume 0 (NSE does not publish it)
+                and high/low from minute samples.
+      5m/10m/1m today only, from the minute points.
+
+    Tagged attrs["src"] = "NSE" (and "nse_bars" = how many bars came from NSE) so deep_state
+    and the board can say what they are reading. Empty frame on any failure, never raises."""
+    from . import nse_fallback as nf
+    try:
+        today = dt.date.today()
+        cut = pd.Timestamp(today - dt.timedelta(days=lookback_days))
+        n_nse = 0
+        if tf == "1D":
+            d = _daily_hist().get(sym)
+            if d is None or d.empty:
+                return pd.DataFrame()
+            out = d[["ts", "open", "high", "low", "close"]].copy()
+            out["volume"] = 0.0
+            q = nf.quotes([fy_symbol(sym)]).get(fy_symbol(sym)) or {}
+            last_day = pd.Timestamp(out["ts"].max()).date()
+            upd = str(q.get("_upd") or "")[:10]
+            if (q.get("lp") and q.get("open_price") and last_day < today
+                    and upd == today.isoformat()):
+                out = pd.concat([out, pd.DataFrame([{
+                    "ts": pd.Timestamp(today), "open": q["open_price"],
+                    "high": max(q.get("high_price") or q["lp"], q["lp"]),
+                    "low": min(q.get("low_price") or q["lp"], q["lp"]),
+                    "close": q["lp"], "volume": float(q.get("volume") or 0)}])],
+                    ignore_index=True)
+                n_nse = 1
+            out = out[out["ts"] >= cut].reset_index(drop=True)
+        else:
+            pts = nf.minute_points(sym)
+            if tf in ("5m", "10m", "1m"):
+                out = nf.bars_from_points(pts, int(tf[:-1]))
+                n_nse = len(out)
+            else:
+                today15 = nf.bars_from_points(pts, 15)
+                cached = _prior_15m(sym) if sym not in _INDEX_BARE else pd.DataFrame()
+                # NO PRIOR DAYS, NO COARSE FRAME. Today alone is ~6 hourly bars and 1-2 four-
+                # hour bars: enough to pass a "len >= 5" check and print a structure label, ATR
+                # and S/R that mean nothing. Blank ("n/a") is the honest read until the cache
+                # has been filled by a successful Fyers scan.
+                if tf in _TF_FREQ and (cached.empty or
+                                       cached["ts"].dt.date.min() >= today):
+                    return pd.DataFrame()
+                f = nf.splice(cached, today15)
+                if f.empty:
+                    return pd.DataFrame()
+                f = f[f["ts"] >= cut].reset_index(drop=True)
+                n_nse = int(f["ts"].isin(today15["ts"]).sum()) if not today15.empty else 0
+                out = f if tf == "15m" else _resample_ohlcv(f, _TF_FREQ.get(tf, "60min"))
+        if out is None or out.empty:
+            return pd.DataFrame()
+        out = out.reset_index(drop=True)
+        out.attrs["src"] = "NSE"
+        out.attrs["nse_bars"] = n_nse
+        _mark_nse()
+        return out
+    except Exception:                                           # noqa: BLE001
+        return pd.DataFrame()
 
 
 _SESS_CACHE: dict = {}          # (symbol, date) -> ({trigger, vwap}, checked_5min_bucket)
@@ -844,6 +1244,7 @@ def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None
         fine = fetch_intraday(sym, tf="5m", lookback_days=2)
         if fine.empty:
             return prev or _empty
+        _nse = fine.attrs.get("src") == "NSE"
         fine = fine[fine["ts"].dt.date == fine["ts"].dt.date.max()]     # today's 5m bars
         _ctx = _rs_context(fine["ts"], rs_cum9)
         trig, trig_px = _formed_at(fine, ref_close, ref_avg_vol, _ctx)
@@ -855,10 +1256,28 @@ def _session_extras(sym: str, ref_close: float, ref_avg_vol: float | None = None
         # Measured on 38,099 stock-days: the last-30-min VWAP predicts the official close to
         # 1.6 bps, while the 15:30 LTP is off by 14.8 bps. Gating the live close-decision on
         # the LTP therefore judges a DIFFERENT price than the one that was validated.
-        _w = fine[fine["ts"].dt.time >= dt.time(15, 0)]
-        close30 = indicators.vwap(_w) if (len(_w) and float(_w["volume"].sum()) > 0) else None
+        #
+        # THAT RULE ENDED ON 2026-08-03. NSE moved to a CLOSING AUCTION: the official close is
+        # now the auction price, which is also the close of the broker's 15:15 bar. Measured on
+        # 98 names: the broker's last bar matched the archive close to 0.0bps on 1-4% of days in
+        # late July and on 99% from 03-Aug; over Aug-Nov (7,052 stock-days) the 15:00-15:30 VWAP
+        # misses the official close by a median 21bps -- worse than no estimate at all. Before
+        # the auction prints there is no good estimate (the 15:15 last trade misses by a median
+        # 24bps), so none is offered and the LTP stands; after ~15:30 the LTP IS the close.
+        close30 = None
+        if dt.date.today() < config.CLOSING_AUCTION_FROM:
+            _w = fine[fine["ts"].dt.time >= dt.time(15, 0)]
+            close30 = (indicators.vwap(_w) if (len(_w) and float(_w["volume"].sum()) > 0)
+                       else None)
         out = {"trigger": trig, "trig_px": trig_px,
                "vwap": indicators.vwap(fine), "close30": close30}
+        if _nse:
+            # NSE minute bars have NO volume: the bar VWAP above is just the last price, and
+            # the footprint trigger (a volume surge) cannot fire. Take NSE's published session
+            # VWAP and leave the 15:00-15:30 close estimate absent rather than fake it.
+            from . import nse_fallback
+            out["vwap"] = nse_fallback.symbol_vwap(sym)
+            out["close30"] = None
     except Exception:
         return prev or _empty
     _SESS_CACHE[key] = (out, bucket)
@@ -1266,6 +1685,9 @@ def tf_scan(tf: str = "1h", max_names: int = 25, date=None) -> dict:
             "_bar_h": float(cndl["high"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
             "_bar_l": float(cndl["low"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
             "_vwap": s.get("vwap"),
+            # WHERE THE CANDLES CAME FROM: "NSE" once the Fyers daily cap forced the fallback.
+            # refresh_prices needs it to keep a missing VWAP from reading as "below VWAP".
+            "src": s.get("_src", "FYERS"),
         })
     board = pd.DataFrame(rows)
     if not board.empty:
@@ -1314,12 +1736,10 @@ def _fetch_day_candles(date, resolution: str = "15") -> pd.DataFrame:
     frames = []
     for sym in uni["symbol"]:
         try:
-            r = requests.get(config.FYERS_HISTORY_URL,
-                             headers={"Authorization": _auth_header(), "version": "3"},
-                             params={"symbol": fy_symbol(sym), "resolution": resolution,
-                                     "date_format": "1", "range_from": d.isoformat(),
-                                     "range_to": d.isoformat(), "cont_flag": "1"}, timeout=15)
-            j = r.json()
+            j = _fyers_get(config.FYERS_HISTORY_URL,
+                           {"symbol": fy_symbol(sym), "resolution": resolution,
+                            "date_format": "1", "range_from": d.isoformat(),
+                            "range_to": d.isoformat(), "cont_flag": "1"}, 15, "history")
             if j.get("s") != "ok" or not j.get("candles"):
                 continue
             f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
@@ -1350,12 +1770,10 @@ def _fetch_tf_history(date, tf: str, lookback_days: int = 16) -> pd.DataFrame:
     frames = []
     for sym in uni["symbol"]:
         try:
-            r = requests.get(config.FYERS_HISTORY_URL,
-                             headers={"Authorization": _auth_header(), "version": "3"},
-                             params={"symbol": fy_symbol(sym), "resolution": res,
-                                     "date_format": "1", "range_from": d_from,
-                                     "range_to": d.isoformat(), "cont_flag": "1"}, timeout=15)
-            j = r.json()
+            j = _fyers_get(config.FYERS_HISTORY_URL,
+                           {"symbol": fy_symbol(sym), "resolution": res,
+                            "date_format": "1", "range_from": d_from,
+                            "range_to": d.isoformat(), "cont_flag": "1"}, 15, "history")
             if j.get("s") != "ok" or not j.get("candles"):
                 continue
             f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
@@ -1803,6 +2221,13 @@ def mtf_structure(sym: str) -> dict:
         # (the 20-bar window reads the same recent bars either way), while 4h wall counts rose
         # (TRENT 5->9, KOTAKBANK 6->8). Same single API call, larger payload.
         f = fetch_intraday(sym, tf="15m", lookback_days=_MTF_FETCH_DAYS)
+        # NSE FALLBACK WITH NO CACHED HISTORY = TODAY ONLY. The coarse frames below are
+        # resampled HERE, not fetched, so _fallback_candles' guard never sees them: today's ~25
+        # fifteen-minute bars become ~6 hourly bars, pass the len>=5 check, and print a 1h
+        # label (measured: 114 of 259 names got a non-RANGE 1h label that way). Keep 15m,
+        # leave 1h/2h/4h at "n/a" until the cache holds prior sessions.
+        _today_only = (f.attrs.get("src") == "NSE" and not f.empty
+                       and f["ts"].dt.date.nunique() < 2)
         if not f.empty:
             # ADJUST ONCE, HERE, SO EVERY READER SEES THE SAME SERIES. sr_levels back-adjusts
             # internally but struct_full and band_pct do not, so a split inside the 60-day
@@ -1815,7 +2240,8 @@ def mtf_structure(sym: str) -> dict:
             # costs one pass per name and makes sr_levels' own pass a verified no-op.
             f = indicators.adjust_corporate_actions(f)
             _set("15m", f, forming=True)
-            for lab, freq in (("1h", "60min"), ("2h", "120min"), ("4h", "240min")):
+            for lab, freq in (() if _today_only else
+                              (("1h", "60min"), ("2h", "120min"), ("4h", "240min"))):
                 _set(lab, _resample_ohlcv(f, freq), forming=True)   # already stub-merged
     except Exception:
         pass
@@ -2281,9 +2707,14 @@ def archive_staleness() -> dict:
         # rather than a false alarm, which is the safer direction for a warning, and the reason
         # a quorum of symbols (three API calls instead of one) is not worth the cost here.
         f = drop_phantom_bars(fetch_intraday("RELIANCE", tf="1D", lookback_days=12))
+        if f.attrs.get("src") == "NSE":
+            # UNDER THE FALLBACK THE 1D FRAME IS BUILT FROM THE ARCHIVE ITSELF, so comparing
+            # the two would always say "fresh". NSE's own daily series is the independent
+            # calendar instead (its sessions, one point per day).
+            from . import nse_fallback
+            f = nse_fallback.session_dates("RELIANCE")
         if f.empty:
-            _STALE_CACHE[key] = out
-            return out
+            return out                      # not cached: a later call may reach a calendar
         today = pd.Timestamp(dt.date.today())
         completed = f[f["ts"].dt.normalize() < today]      # exclude today's forming bar
         if completed.empty:
@@ -2793,6 +3224,9 @@ def enrich_mtf(board: pd.DataFrame, ltf: str = "1h", risk_on: bool = True,
             "_bar_h": float(cndl["high"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
             "_bar_l": float(cndl["low"].iloc[-1]) if (cndl is not None and len(cndl)) else None,
             "_vwap": s.get("vwap"),
+            # WHERE THE CANDLES CAME FROM: "NSE" once the Fyers daily cap forced the fallback.
+            # refresh_prices needs it to keep a missing VWAP from reading as "below VWAP".
+            "src": s.get("_src", "FYERS"),
         }
 
     # Same parallel-I/O pattern as the universe scan: each survivor's deep_state is one blocking
@@ -2877,6 +3311,8 @@ def refresh_prices(board: pd.DataFrame, risk_on: bool = True) -> pd.DataFrame:
             st_["above_vwap"] = ltp >= float(vw)
         else:
             st_["above_vwap"] = bool(r.get("above_vwap"))
+            if r.get("src") == "NSE":
+                st_["_vwap_unknown"] = True
         rs = (day - idx_ret) if (day is not None and idx_ret is not None) else None
         if rs is not None:
             b.at[i, "RS%"] = round(rs, 2)
@@ -3211,12 +3647,13 @@ def replay_board(date, time_str: str = "13:00", tf: str = "15m",
 def fetch_intraday_range(sym: str, date, resolution: str = "15") -> pd.DataFrame:
     """One symbol's candles for a single past date."""
     d = pd.Timestamp(date).date()
-    r = requests.get(config.FYERS_HISTORY_URL,
-                     headers={"Authorization": _auth_header(), "version": "3"},
-                     params={"symbol": sym, "resolution": resolution, "date_format": "1",
-                             "range_from": d.isoformat(), "range_to": d.isoformat(),
-                             "cont_flag": "1"}, timeout=15)
-    j = r.json()
+    try:
+        j = _fyers_get(config.FYERS_HISTORY_URL,
+                       {"symbol": sym, "resolution": resolution, "date_format": "1",
+                        "range_from": d.isoformat(), "range_to": d.isoformat(),
+                        "cont_flag": "1"}, 15, "history")
+    except FyersCapped:
+        return pd.DataFrame()           # a PAST date: NSE has no history to fall back to
     if j.get("s") != "ok" or not j.get("candles"):
         return pd.DataFrame()
     f = pd.DataFrame(j["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
@@ -3238,6 +3675,8 @@ def _tf_action(s: dict, risk_on: bool) -> str:
     + above session VWAP + RSI not weak + RS>0. CONTEXT ONLY — proven -5bps at every tf."""
     if not risk_on:
         return "AVOID"
+    if s.get("_vwap_unknown"):
+        return "NEUTRAL"                 # NSE fallback without a session VWAP: no side
     bclr = s.get("bar_clr", s["clr"])
     strong = (bclr >= config.CLR_TH and s["above_vwap"]
               and s["tone"] in ("strong", "neutral")
@@ -3255,6 +3694,8 @@ def _tf_sell_action(s: dict, risk_on: bool) -> str:
     # Read the SAME metric the long side does — the last bar OF THIS TIMEFRAME. Using the
     # session's clr here while _tf_action uses bar_clr put two different quantities in one
     # table under one timeframe column, so the SHORT verdict was not a timeframe read at all.
+    if s.get("_vwap_unknown"):
+        return "—"
     bclr = s.get("bar_clr", s["clr"])
     weak = (bclr <= (1 - config.CLR_TH) and not s["above_vwap"]
             and s["tone"] in ("weak", "rolling-over")
@@ -3302,6 +3743,28 @@ def deep_state(sym: str, tf: str = "1h", ref_close: float | None = None,
     _b = c.iloc[-1]
     _rng = float(_b["high"]) - float(_b["low"])
     state["bar_clr"] = round((float(_b["close"]) - float(_b["low"])) / _rng, 3) if _rng > 0 else 0.5
+    # NSE-BUILT BARS CARRY NO VOLUME (see nse_fallback), so the bar-derived VWAP would be the
+    # last close and every name would sit exactly "at VWAP" -- which _tf_action reads as ABOVE
+    # it. Use NSE's own session VWAP (averagePrice) instead; if even that is missing, say the
+    # VWAP is unknown so the verdict goes NEUTRAL rather than guessing a side.
+    src = c.attrs.get("src", "FYERS")
+    state["_src"] = src
+    # Only when the bars carry NO volume: a 1D frame's today-bar has NSE's real day volume, so
+    # it keeps the same VWAP definition the Fyers path uses -- one name, one verdict, whatever
+    # the source.
+    if src == "NSE" and float(session["volume"].sum()) <= 0:
+        state["vol_surge"] = state["vol_pace"] = None
+        vw = None
+        if sym not in _INDEX_BARE and len(today) and today["ts"].dt.date.max() == dt.date.today():
+            from . import nse_fallback
+            vw = nse_fallback.symbol_vwap(sym)
+        if vw:
+            state["vwap"] = round(vw, 2)
+            state["vs_vwap"] = round(100 * (state["ltp"] / vw - 1), 2)
+            state["above_vwap"] = state["ltp"] >= vw
+        else:
+            state["vwap"] = state["vs_vwap"] = None
+            state["_vwap_unknown"] = True
     atr_tf = indicators.atr(c, 14)                          # ATR on the chosen timeframe
     lv = indicators.levels(state["ltp"], atr_tf,
                            day_low=float(session["low"].min()),

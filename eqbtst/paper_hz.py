@@ -255,12 +255,11 @@ def topup_bars(symbols, tf: str = "15m", now: dt.datetime | None = None, progres
             d1 = min(d0 + dt.timedelta(days=89), now.date())
             live._hist_pace()
             try:
-                r = requests.get(config.FYERS_HISTORY_URL,
-                                 headers={"Authorization": live._auth_header(), "version": "3"},
-                                 params={"symbol": live.fy_symbol(sym), "resolution": str(mins),
-                                         "date_format": "1", "range_from": d0.isoformat(),
-                                         "range_to": d1.isoformat(), "cont_flag": "1"},
-                                 timeout=20).json()
+                r = live._fyers_get(config.FYERS_HISTORY_URL,
+                                    {"symbol": live.fy_symbol(sym), "resolution": str(mins),
+                                     "date_format": "1", "range_from": d0.isoformat(),
+                                     "range_to": d1.isoformat(), "cont_flag": "1"},
+                                    20, "history")
             except Exception:                                  # noqa: BLE001
                 r = {}
             if r.get("s") == "ok" and r.get("candles"):

@@ -1822,6 +1822,42 @@ if tf == "Intraday":
         st.warning("🧪 **TEST MODE** — market is closed; data below is UNRELIABLE off-hours "
                    "Fyers (indicative prices, junk volume). Layout/flow testing only.")
 
+    def _render_fyers_budget():
+        """The Fyers daily-budget meter and, once the cap is hit, the NSE-fallback notice.
+        Drawn inside the 5s index-strip fragment so the count moves while you watch."""
+        b = live.budget_status()
+        cap, ours = b["cap"], b["ours"]
+        kinds = " · ".join(f"{k} {n:,}" for k, n in sorted(b["by_kind"].items())) or "none yet"
+        if b["capped"]:
+            _others = (f" Before that this board had sent **{b['ours_at_cap']:,}**, so about "
+                       f"**{b['others_at_cap']:,}** were spent by the login's other user(s) "
+                       f"— Tradebot's capturer (its VM count is not visible from here)."
+                       if b["ours_at_cap"] is not None else "")
+            st.error(
+                f"🚫 **Fyers daily data limit reached at {b['cap_at']} — 0 of {cap:,} left** "
+                f"(confirmed by the broker, not estimated).{_others}\n\n"
+                f"↪ **Now running on NSE's website.** Quotes, indices and the 1D frame are "
+                f"full-fidelity (1D = EOD archive + today's NSE bar). Intraday frames = prior "
+                f"days from the local cache of earlier Fyers fetches + today's bars built from "
+                f"NSE's minute prices: **no volume** (the footprint trigger cannot fire), VWAP = "
+                f"NSE's published session average, high/low from minute samples. Names with no "
+                f"cached history show **n/a on 1h/2h/4h** rather than a starved label. Fyers is "
+                f"re-tried every 10 min; full service returns at the broker's daily reset.")
+            return
+        _tb = (f" · Tradebot on this PC **{b['tradebot_local']:,}**"
+               if b["tradebot_local"] is not None else "")
+        _bud = ""
+        if b["budget"]:
+            _bud = (f" · own budget **{b['budget']:,}**"
+                    + (" — **spent, running on NSE**" if b["budget_spent"] else ""))
+        st.progress(min(1.0, (cap - b["left"]) / cap) if cap else 0.0,
+                    text=(f"📶 Fyers data calls today — this board **{ours:,}** ({kinds}){_tb}"
+                          f"{_bud} · **≤ {b['left']:,} of {cap:,} left**"))
+        st.caption("'Left' is an upper bound: the cap is per login and Tradebot's VM spends "
+                   "from the same pool without this board seeing it. When the broker refuses, "
+                   "it becomes exact (0) and the board switches to NSE by itself."
+                   + (" **Source right now: NSE.**" if b["src"] == "NSE" else ""))
+
     # ── HEADLINE INDEX STRIP ──────────────────────────────────────────────────────────
     # Deliberately AFTER the token and market-closed gates, not under the title: both of
     # those st.stop() the page, so rendering above them would put three blank tiles on a
@@ -1838,6 +1874,7 @@ if tf == "Intraday":
     # future is the entire point of that lane.
     @st.fragment(run_every="5s")
     def _render_index_strip():
+        _render_fyers_budget()
         rows, stamp = live.index_quotes()
         for col, r in zip(st.columns(len(rows)), rows):
             if r["lp"] is None:
@@ -3256,7 +3293,10 @@ if tf == "Intraday":
                         if _warm:
                             st.info(f"⏳ **{_warm} of these {len(_no)} are UNREADABLE, not neutral** "
                                     f"— no candles came back for the {_P['ltf']}/{_P['htf']} frames "
-                                    f"(broker rate-limit), so they could not be judged either way. "
+                                    + ("(Fyers paused, and NSE has no prior-day history for "
+                                       "these names) " if live.fyers_paused() else
+                                       "(broker rate-limit) ")
+                                    + f"so they could not be judged either way. "
                                     f"↻ refresh retries them. The **Positional** horizon reads "
                                     f"1D/1W from the EOD archive and can judge all of them.")
                         _side_table(_no)
@@ -3372,8 +3412,22 @@ if tf == "Intraday":
             # the toggle to OFF behind the user's back — the board would appear to "forget"
             # the filter whenever the Lower-TF read came back thin.
             _conf_toggle()
-            st.info("Matches found, but none could be read on the Lower TF (thin candles). "
-                    "Try a coarser Lower TF.")
+            # SAY WHICH OF TWO VERY DIFFERENT THINGS EMPTIED IT. A broker that refused every
+            # call (Fyers' 5,000/day cap, shared with Tradebot) used to be reported as "thin
+            # candles -- try a coarser Lower TF", sending the user cycling through timeframes
+            # that all fail identically.
+            _qmsg = live.fyers_paused()
+            if _qmsg:
+                st.error(f"🚫 **Fyers is not being used ({_qmsg}), and the NSE fallback could not "
+                         f"rebuild the {levels_tf} frame for any of the {len(capped)} "
+                         f"matches.** NSE publishes only TODAY's minute prices; the prior "
+                         f"days a {levels_tf} read needs come from a local cache that fills "
+                         f"only when a Fyers scan succeeds — and these names have none yet. "
+                         f"**1D (Positional)** reads the EOD archive and works now; **15m** "
+                         f"works from today's NSE minutes. Broker said: *{_qmsg}*")
+            else:
+                st.info("Matches found, but none could be read on the Lower TF (thin candles). "
+                        "Try a coarser Lower TF.")
             st.stop()
 
         # `deliv trend` sits after `side` here TOO. The pre-filter table already placed it

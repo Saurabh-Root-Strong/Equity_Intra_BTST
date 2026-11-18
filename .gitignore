@@ -26,3 +26,8 @@ data/index_mgmt/
 
 # Index F&O lane: intraday option-chain log, close snapshots, reconcile scores (rebuildable)
 data/index_fno/
+
+# Fyers daily call counter (runtime state) + NSE-fallback 15m candle cache
+data/fyers_calls.json
+data/fyers_calls.json.tmp
+data/candle_cache/
