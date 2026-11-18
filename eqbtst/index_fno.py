@@ -1024,7 +1024,12 @@ def _viewing(code: str) -> tuple:
 
 
 # ── reading (any process; the page reads files, so writer and reader share one path) ──────
-_READ: dict = {}      # path -> (mtime, size, rows)
+_READ: dict = {}      # path -> (mtime, size, rows); most recently used LAST, at most READ_KEEP
+# A parsed day of one index is ~17-26 MB (18 Nov 2026: 85 MB for the four); unbounded, every
+# session the picker opened stayed in memory and the 8055 page reached 1.8-2.1 GB on a 7 GB
+# laptop. Eight files = today's four indices plus one other day; older ones are re-read
+# (~0.5 s) when opened again.
+READ_KEEP = 8
 
 
 def _rows(path: Path) -> list:
@@ -1035,11 +1040,17 @@ def _rows(path: Path) -> list:
         sig = (st_.st_mtime, st_.st_size)
     except OSError:
         return []
-    hit = _READ.get(path)
+    hit = _READ.pop(path, None)
     if hit and hit[0] == sig:
+        _READ[path] = hit                        # re-insert: now the most recently used
         return hit[1]
     rows = im._load_jsonl(path)
     _READ[path] = (sig, rows)
+    while len(_READ) > READ_KEEP:                # drop the least recently used
+        try:                                     # page sessions run on their own threads
+            _READ.pop(next(iter(_READ)), None)
+        except (RuntimeError, StopIteration):
+            break
     return rows
 
 
@@ -1189,8 +1200,26 @@ def coverage_note(cov: dict, live: bool = False) -> str:
             "the gap is unknown.")
 
 
+_EXPS: dict = {}         # path -> (mtime, size, sorted expiries)
+
+
 def logged_expiries(code: str, day: dt.date) -> list:
-    return sorted({r.get("e") for r in _rows(_path("chain", code, day)) if r.get("e")})
+    """The expiries a day's log holds. Cached by the file's mtime/size: prev_expiry asks this
+    of EVERY logged day on each redraw, and through _rows (8 files kept) a monthly cycle's
+    ~20 logs would be parsed again every 15 s."""
+    path = _path("chain", code, day)
+    try:
+        st_ = path.stat() if path.exists() else path.with_suffix(".jsonl.gz").stat()
+        sig = (st_.st_mtime, st_.st_size)
+    except OSError:
+        return []
+    hit = _EXPS.get(path)
+    if hit and hit[0] == sig:
+        return hit[1]
+    rows = _rows(path) if day == _now().date() else im._load_jsonl(path)
+    out = sorted({r.get("e") for r in rows if r.get("e")})
+    _EXPS[path] = (sig, out)
+    return out
 
 
 def compress_old_logs(today: dt.date | None = None) -> int:
@@ -1971,6 +2000,192 @@ def prev_session(code: str, day: dt.date) -> dt.date | None:
         return None                                          # locked archive: ask again later
     _PREV_SESSION[(code, day)] = v
     return v
+
+
+# ── biggest since the last expiry (user, 18 Nov 2026) ──────────────────────────────────────
+# The day alert above judges a block against TODAY only. This one asks the cycle question:
+# is this block's OI change bigger than every block on these strikes since the last expiry —
+# every earlier session of the cycle and today's earlier blocks? Per side (calls / puts).
+_CYCLE: dict = {}        # "CODE_YYYYMMDD_EXP_MINS_strikes" -> per-side max; finished days, on disk
+
+
+def judgeable(states: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """The strike-side-blocks a size alert may judge or measure against, with |OI change| in
+    'a': not the session's first block (it counts from yesterday's close, the overnight change
+    and NSE's 15:40 correction sit in it), not a block right after a hole in the log (its
+    change belongs to several blocks), and not a block the NEXT block took straight back (80-125% of
+    it, opposite sign: a provisional print NSE corrected). The newest
+    block has no next one yet and is judged on what it holds."""
+    s = states.dropna(subset=["d_oi"]).copy()
+    if s.empty:
+        return s.assign(a=pd.Series(dtype=float))
+    s["a"] = s["d_oi"].abs()
+    s = s.sort_values(["side", "K", "block"])
+    g = s.groupby(["side", "K"])
+    prev_t = g["t"].shift()
+    gap = prev_t.notna() & ((s["t"] - prev_t) > pd.Timedelta(minutes=ALERT_GAP_X * minutes))
+    nxt = g["d_oi"].shift(-1)
+    # a near-EXACT take-back (80-125% of it, opposite sign) is the mark of a print NSE
+    # corrected; 'writers in +45k, then writers out -60k' is two real moves and stays
+    ratio_ = nxt.abs() / s["a"].where(s["a"] > 0)
+    undone = (nxt.notna() & (np.sign(nxt) == -np.sign(s["d_oi"]))
+              & (ratio_ >= 0.8) & (ratio_ <= 1.25))
+    return s[(s["block"] != s["block"].min()) & ~gap & ~undone & (s["a"] > 0)]
+
+
+def side_max(states: pd.DataFrame, minutes: int, day: dt.date | None = None) -> dict:
+    """{side: the session's biggest judgeable block} — day, block, K, d_oi, a, state, lean."""
+    j = judgeable(states, minutes)
+    out = {}
+    for side, g in j.groupby("side"):
+        r = g.loc[g["a"].idxmax()]
+        out[side] = dict(day=str(day or pd.Timestamp(r["block"]).date()),
+                         block=pd.Timestamp(r["block"]).strftime("%H:%M"), K=float(r["K"]),
+                         d_oi=float(r["d_oi"]), a=float(r["a"]), state=str(r["state"]),
+                         lean=float(r["lean"]))
+    return out
+
+
+def cycle_records(today: pd.DataFrame, prior: dict, minutes: int) -> pd.DataFrame:
+    """Today's blocks that beat EVERYTHING before them in the cycle, per side: the biggest
+    |OI change| of the earlier sessions (`prior`, {side: {...a...}}) and of today's earlier
+    blocks. Causal: a block is judged only on what came before it, so two records can land
+    on one day (the second beat the first). `beat` = the record it broke."""
+    cols = ["block", "t", "K", "side", "d_oi", "state", "lean", "a", "beat"]
+    j = judgeable(today, minutes)
+    out = []
+    for side, g in j.groupby("side"):
+        best = dict(prior.get(side) or {})
+        for b in sorted(g["block"].unique()):
+            cell = g[g["block"] == b]
+            r = cell.loc[cell["a"].idxmax()]
+            if r["a"] > float(best.get("a", 0.0)):
+                if best:                       # nothing to beat = no record (first day)
+                    out.append((b, r["t"], r["K"], side, r["d_oi"], r["state"], r["lean"],
+                                r["a"], dict(best)))
+                best = dict(day=str(pd.Timestamp(b).date()),
+                            block=pd.Timestamp(b).strftime("%H:%M"), K=float(r["K"]),
+                            d_oi=float(r["d_oi"]), a=float(r["a"]), state=str(r["state"]),
+                            lean=float(r["lean"]))
+    return pd.DataFrame(out, columns=cols)
+
+
+def prev_expiry(code: str, day: dt.date) -> dt.date | None:
+    """The latest expiry BEFORE `day` among every expiry the logs ever listed for this index
+    (holiday-shifted ones included: Nifty's 9 Nov 2026 was a Monday). None when the log
+    started inside the cycle (Bank Nifty's October monthly predates the log)."""
+    seen = set()
+    for d in logged_days(code):
+        if d <= day:
+            for e in logged_expiries(code, d):
+                try:
+                    seen.add(dt.date.fromisoformat(str(e)[:10]))
+                except ValueError:
+                    pass
+    before = [e for e in seen if e < day]
+    return max(before) if before else None
+
+
+_TDAYS: dict = {}
+
+
+def trading_days(code: str, a: dt.date, b: dt.date) -> list | None:
+    """Sessions strictly between a and b per DCM's index archive (None if unreadable).
+    Remembered per (code, a, b) for the process: asked on every redraw."""
+    if (code, a, b) in _TDAYS:
+        return _TDAYS[(code, a, b)]
+    try:
+        from . import data
+        with data._connect() as c:
+            rows = c.execute("select distinct trade_date from index_data where trade_date > ? "
+                             "and trade_date < ? and index_name = ? order by 1",
+                             [a, b, DCM_INDEX_NAME[code]]).fetchall()
+        out = [r[0] if isinstance(r[0], dt.date) else dt.date.fromisoformat(str(r[0])[:10])
+               for r in rows]
+    except Exception:                                        # noqa: BLE001
+        return None                                          # locked archive: ask again later
+    _TDAYS[(code, a, b)] = out
+    return out
+
+
+def day_ladder(df: pd.DataFrame, step: float, band: int = BAND) -> list:
+    """The session's own ladder: `band` strikes either side of the listed strike nearest its
+    FIRST reading, on the `step` grid. A past session is measured near ITS money — on
+    today's strikes a day when the index stood 1,000 points away would look quiet and make
+    records cheap (Bank Nifty 18 Nov 2026: 7-day call record 3,381 on today's strikes)."""
+    u = df["u"].dropna()
+    if u.empty or not step:
+        return []
+    listed = sorted(set(df["K"].dropna()))
+    c = min(listed, key=lambda k: abs(k - u.iloc[0])) if listed else round(u.iloc[0] / step) * step
+    c = round(c / step) * step
+    want = [c + i * step for i in range(-band, band + 1)]
+    have = set(listed)
+    return [k for k in want if k in have]
+
+
+def day_side_max(code: str, day: dt.date, expiry: str, step: float, minutes: int) -> dict:
+    """side_max for a FINISHED logged session of one expiry on its own ladder (day_ladder),
+    cached on disk by the log file's name and size (a re-written log is measured again)."""
+    path = _path("chain", code, day)
+    f = path if path.exists() else path.with_suffix(".jsonl.gz")
+    try:
+        sig = [f.name, f.stat().st_size]
+    except OSError:
+        return {}
+    key = f"v2_{code}_{day:%Y%m%d}_{expiry}_{minutes}_step{step:g}_b{BAND}"   # v2: take-backs out
+    store = DATA_DIR / "cycle_max.json"
+    if not _CYCLE:
+        try:
+            _CYCLE.update(json.loads(store.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+    hit = _CYCLE.get(key)
+    if hit and hit.get("sig") == sig:
+        return hit["max"]
+    # read ONCE, uncached, and let go: _rows keeps every parsed log in memory, and a monthly
+    # cycle is up to ~20 logs (18 Nov 2026: MemoryError on a laptop with 0.8 GB free)
+    import gc
+    by_t = {}
+    for r in im._load_jsonl(path):
+        if r.get("e") == expiry and r.get("t"):
+            by_t[r["t"]] = r
+    rows = [by_t[t] for t in sorted(by_t)]
+    del by_t
+    mx = {}
+    if rows:
+        df = frame(rows)
+        del rows
+        ks = day_ladder(df, step)
+        if ks:
+            mx = side_max(strike_states(df[df["K"].isin(ks)], ks, minutes), minutes, day)
+        del df
+    gc.collect()
+    _CYCLE[key] = {"sig": sig, "max": mx}
+    try:
+        tmp = store.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(_CYCLE), encoding="utf-8")
+        os.replace(tmp, store)
+    except OSError:
+        pass
+    return mx
+
+
+def cycle_prior(code: str, day: dt.date, expiry: str, step: float, minutes: int) -> dict:
+    """The cycle so far, before `day`: {start, prev_exp, logged:[dates], missing:[dates],
+    max:{side: record}}. The cycle opens the session after the previous expiry; when that
+    expiry predates the log, it opens at the log's first day (start_is_log=True)."""
+    pe = prev_expiry(code, day)
+    days = [d for d in logged_days(code) if d < day and (pe is None or d > pe)]
+    sess = trading_days(code, pe, day) if pe else None
+    missing = [d for d in (sess or []) if d not in days]
+    best: dict = {}
+    for d in sorted(days):
+        for side, r in day_side_max(code, d, expiry, step, minutes).items():
+            if r and r.get("a", 0) > best.get(side, {}).get("a", 0):
+                best[side] = r
+    return dict(prev_exp=pe, logged=sorted(days), missing=missing, max=best,
+                start_is_log=pe is None)
 
 
 def close_base(code: str, day: dt.date, expiry: str) -> dict | None:
@@ -2890,6 +3105,105 @@ def _alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, bmap: dict,
     return al
 
 
+def _who(state: str, side: str) -> str:
+    word = PLAIN_STATE.get(state) if state in STATE_NAME.values() else None
+    return ((("call " if side == "CE" else "put ") + word.lower()) if word else
+            ("call" if side == "CE" else "put") + " OI moved, side unclear")
+
+
+def _rec_where(r: dict, today: dt.date) -> str:
+    d = dt.date.fromisoformat(r["day"])
+    when = "earlier today" if d == today else f"{d:%a %d %b}"
+    return f"{when} {r['block']} · {r['K']:,.0f} {_who(r['state'], 'CE' if r.get('side', 'CE') == 'CE' else 'PE')}"
+
+
+def _cycle_alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, strikes: list,
+                  latest: dict) -> None:
+    """🏆 Biggest since the last expiry: today's blocks that beat every block on these
+    strikes since the cycle opened (earlier sessions + today's earlier blocks), per side."""
+    try:
+        day = dt.date.fromisoformat(str(latest.get("t", ""))[:10])
+    except ValueError:
+        return
+    exp = str(latest.get("e", ""))[:10]
+    if not exp or stt_all.empty:
+        return
+    span = "1 hr" if mins == 60 else f"{mins} min"
+    ks_ = sorted(strikes)
+    step = float(pd.Series(np.diff(ks_)).mode().iloc[0]) if len(ks_) > 1 else 0.0
+    cp = cycle_prior(code, day, exp, step, mins)
+    pe = cp["prev_exp"]
+    since = (f"the {pe:%d %b} expiry" if pe else
+             f"{cp['logged'][0]:%d %b} (the log's first day — the cycle's start predates it)"
+             if cp["logged"] else "")
+    if not cp["logged"]:
+        st.caption(f"🏆 **Biggest since {('the ' + format(pe, '%d %b') + ' expiry') if pe else 'expiry'}**"
+                   " — first logged session of this cycle: there is nothing earlier to beat, so "
+                   "the day alert above is the whole story today. From the next session on, a "
+                   "block bigger than everything since the expiry is flagged here.")
+        return
+    rec = cycle_records(stt_all, cp["max"], mins)
+    now = _view_now(st)
+    running = (stt_all["block"].max() if day == now.date()
+               and now < stt_all["block"].max() + pd.Timedelta(minutes=mins) else None)
+    for side in ("CE", "PE"):
+        if side in cp["max"]:
+            cp["max"][side]["side"] = side
+    expiry_day = exp == day.isoformat()
+    n_s = len(cp["logged"]) + 1
+    with st.container(border=True):
+        st.markdown(f"**🏆 Biggest since {since} — {len(strikes)} strikes, {span} blocks, "
+                    f"{n_s} sessions** ({len(rec)})")
+        if rec.empty:
+            parts = []
+            for side, nm in (("CE", "calls"), ("PE", "puts")):
+                r = cp["max"].get(side)
+                if r:
+                    parts.append(f"{nm} **{r['d_oi']:+,.0f}** ({_rec_where(r, day)})")
+            st.markdown("Nothing today beats the cycle's biggest block yet — "
+                        + " · ".join(parts) + ".")
+        lines, older = [], []
+        for _, r in rec.sort_values("block", ascending=False).iterrows():
+            dot = "🟢" if r["lean"] > 0 else "🔴" if r["lean"] < 0 else "⚪"
+            eff = ("helps the index UP" if r["lean"] > 0 else "pushes the index DOWN"
+                   if r["lean"] < 0 else "")
+            k = f"{r['K']:,.0f}" + (" ★" if r["K"] == center else "")
+            b = dict(r["beat"], side=r["side"])
+            ratio = r["a"] / b["a"] if b.get("a") else np.nan
+            notes = []
+            if r["block"] == stt_all["block"].max() and running is not None:
+                notes.append("block still running — may shrink or be taken back")
+            if expiry_day:
+                notes.append("expiry day: positions settling")
+            ln = (f"{dot} **{block_span([r['block']], mins).iloc[0]} · {k} · "
+                  f"{_who(r['state'], r['side'])} {r['d_oi']:+,.0f}** — biggest "
+                  f"{'call' if r['side'] == 'CE' else 'put'} block since {since.split(' (')[0]}"
+                  f" ({ratio:.1f}× the previous record {b['d_oi']:+,.0f}, {_rec_where(b, day)})"
+                  + (f" · {eff}" if eff else "")
+                  + (f" · :orange[{' · '.join(notes)}]" if notes else ""))
+            # newest record per side stands; the ones it broke since are folded away
+            (older if r["side"] in {x[0] for x in lines} else lines).append((r["side"], ln))
+        for _, ln in lines:
+            st.markdown(ln)
+        if older:
+            with st.expander(f"{len(older)} earlier record(s) today, since broken"):
+                for _, ln in older:
+                    st.markdown(ln)
+        miss = (f" Not in the log: {', '.join(format(d, '%a %d %b') for d in cp['missing'])} — "
+                "a bigger block on a missing day would not be known." if cp["missing"] else "")
+        st.caption(
+            f"A block is flagged when one strike-side's OI change is bigger than every {span} "
+            f"block on the same side and these {len(strikes)} strikes since {since.split(' (')[0]}: "
+            f"the sessions logged since ({', '.join(format(d, '%a %d') for d in cp['logged'])}) "
+            "and today's earlier blocks. Calls and puts keep separate records; each record is "
+            "judged only on what came before it. Same rules as the day alert: each session's "
+            "first block (the overnight change) and a block after a hole in the log are left "
+            f"out. Each earlier session is measured on ITS OWN {len(strikes)} strikes around its "
+            "first reading (near the money that day), today on today's; the expiry on screen. "
+            "OI activity grows toward expiry, so records cluster in the last sessions, and big "
+            "CLOSING blocks there are often rollover, not a view. Size is not direction." + miss)
+
+
 def _fut_strip(st, code: str, fut_rows: list, mins: int, x_enc, blocks: list, n: int,
                y_w: int, first_b, running_b, day: dt.date) -> None:
     """INDEX FUTURES — who did what, block by block: one row per listed expiry on the same
@@ -3357,16 +3671,26 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
                    if last["net"] < 0 else "even."))
 
         _alerts(st, code, stt_all, mins, center, bmap, latest, al)
+        try:
+            _cycle_alerts(st, code, stt_all, mins, center, sorted(bmap), latest)
+        except Exception as exc:                             # noqa: BLE001 - never block the page
+            st.caption(f"🏆 Cycle record not shown: {type(exc).__name__}: {exc}")
+        # the index's prev close, open and where it is now, on both per-strike headings, and
+        # the strike nearest it tagged in their panel titles (user, 18 Nov 2026)
+        px, tags = price_note(code, latest, ks, now_,
+                              bool(st.session_state.get("if_view_now"))
+                              if hasattr(st, "session_state") else False)
         _driver_panels(st, net_driver(stt), ks, center, mins, blocks, span,
-                       {(k, b) for k, _, b in flagged}, running_b)
+                       {(k, b) for k, _, b in flagged}, running_b, px, tags)
         net = strike_panels(df, ks, "OI change since yesterday", mins)
         if not net.empty:
             net = (net.pivot_table(index=["t", "K"], columns="side", values="v")
                    .reindex(columns=["CE", "PE"]))
             net = (net["CE"] - net["PE"]).rename("v").reset_index().dropna()
             net["side"] = "CE"                                    # one line per panel
-            st.markdown("**Each strike — calls − puts OI change** (above 0 = more calls added)")
-            _net_panels(st, net, ks, center, mins)
+            st.markdown("**Each strike — calls − puts OI change** (above 0 = more calls added)"
+                        + px)
+            _net_panels(st, net, ks, center, mins, tags)
         st.caption(
             "⚠️ **Buying or writing — what this data can and cannot tell.** **Premium:** on 9 "
             "Nov 2026 the colour matched the SAME block's index move 91% (Nifty) / 97% (Bank) "
@@ -3382,6 +3706,59 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
             "index (t −1.4 to +1.5). **Fresh %** (OI change ÷ volume) is the solid number: "
             "only 7-24% of a block's volume becomes positions — the rest is intraday churn. "
             "Description of positioning, not a signal.")
+
+
+def price_note(code: str, latest: dict, ks: list, now, rewound: bool = False) -> tuple:
+    """(heading text, {strike: tag}) for the per-strike panels: the index's previous close,
+    open and latest level, the latest coloured green above the previous close and red below,
+    and ' ◀ now' on the strike nearest the latest level (none when the index left the
+    ladder). ★ on the panels is the morning centre, the strike nearest the open."""
+    o_, u_ = latest.get("o"), latest.get("u")
+    if not u_:
+        return "", {}
+    nm_ = DISPLAY.get(code, code)
+    # 'now' only while the reading is fresh (block boundaries made the running-block test say
+    # 'last' on a live page); past days and stale logs say when it was
+    try:
+        fresh_ = abs(now - pd.Timestamp(latest.get("t"))) <= pd.Timedelta(minutes=5)
+    except (TypeError, ValueError):
+        fresh_ = False
+    # rewound with the timer: the reading is 'fresh' against the rewound clock, but it is
+    # not now — say when it was
+    when = (f"at {str(latest.get('t', ''))[11:16]}" if rewound else
+            "now" if fresh_ else f"last {str(latest.get('t', ''))[11:16]}")
+    # change counted from the PREVIOUS close, like the bars (OI since yesterday) and the index
+    # metric / brokers
+    try:
+        day_ = dt.date.fromisoformat(str(latest.get("t", ""))[:10])
+    except ValueError:
+        day_ = None
+    pc_ = prev_close(code, day_) if day_ else None
+    if not o_ and day_:
+        # after the bell the latest reading is NSE's 15:40 corrected close, which carries no
+        # open (18 Nov 2026: 'open' vanished from the heading): the session log's, then DCM's
+        try:
+            o_ = next((r["o"] for r in chain_log(code, day_, str(latest.get("e", ""))[:10])
+                       if r.get("o")), None) or _dcm_open(code, day_)
+        except Exception:                                    # noqa: BLE001
+            o_ = None
+    px = f" · **{nm_}** prev close **{pc_:,.2f}**" if pc_ else f" · **{nm_}**"
+    px += f" · open **{o_:,.2f}**" if o_ else ""
+    base_ = pc_ or o_
+    chg_ = (u_ - base_) if base_ else 0.0
+    col_ = "green" if chg_ > 0 else "red" if chg_ < 0 else "gray"
+    tail_ = (f" ({chg_:+,.2f}, {(u_ / pc_ - 1) * 100:+.2f}%)" if pc_ else
+             f" ({chg_:+,.2f} from the open)" if o_ else "")
+    tag_ = "now" if when == "now" else "last" if when.startswith("last") else when
+    px += (f" · {when} :{col_}[**{u_:,.2f}**{tail_}] &nbsp; ★ nearest the open · "
+           f"◀ nearest the {'current' if tag_ == 'now' else 'latest'} level")
+    tags: dict = {}
+    if ks:
+        k_now = min(ks, key=lambda k: abs(k - u_))
+        step_ = (sorted(ks)[1] - sorted(ks)[0]) if len(ks) > 1 else 0
+        if not step_ or abs(k_now - u_) <= step_:
+            tags[k_now] = f" ◀ {tag_}"
+    return px, tags
 
 
 def _clock_ticks(times, minutes: int, most: int) -> list:
@@ -3406,11 +3783,14 @@ def _clock_ticks(times, minutes: int, most: int) -> list:
                          hours=int(m.hour), minutes=int(m.minute)) for m in marks[::step]]
 
 
-def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
+def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes,
+                tags: dict | None = None) -> None:
     import altair as alt
+    tags = tags or {}
+    lab = lambda k: f"{k:,.0f}" + (" ★" if k == center else "") + tags.get(k, "")  # noqa: E731
     long = long.copy()
-    long["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in long["K"]]
-    order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(strikes)]
+    long["strike"] = [lab(k) for k in long["K"]]
+    order = [lab(k) for k in sorted(strikes)]
     long["sign"] = np.where(long["v"] >= 0, "calls heavier", "puts heavier")
     area = (alt.Chart(long).mark_bar(opacity=0.85)
             .encode(x=alt.X("t:T", title=None,
@@ -3433,20 +3813,24 @@ def _net_panels(st, long: pd.DataFrame, strikes: list, center, minutes) -> None:
 
 
 def _driver_panels(st, nd: pd.DataFrame, ks: list, center, mins: int, blocks: list,
-                   span: str, flagged: set | None = None, running=None) -> None:
+                   span: str, flagged: set | None = None, running=None, px: str = "",
+                   tags: dict | None = None) -> None:
     """Calls − puts OI change per strike. Each block is one SEGMENT of the line, coloured by
     what that block's change did to the index (both sides counted); only the three biggest
     moves per strike are labelled with who drove them."""
     import altair as alt
-    st.markdown(f"**Each strike — calls − puts OI change, and who moved it** ({span} blocks)")
+    tags = tags or {}
+    st.markdown(f"**Each strike — calls − puts OI change, and who moved it** ({span} blocks)"
+                + px)
     if nd.empty:
         st.caption("Not enough logged readings yet.")
         return
     nd = nd.sort_values(["K", "block"]).copy()
     nd["t"] = pd.to_datetime(nd["block"])
-    nd["strike"] = [f"{k:,.0f}" + (" ★" if k == center else "") for k in nd["K"]]
+    lab = lambda k: f"{k:,.0f}" + (" ★" if k == center else "") + tags.get(k, "")  # noqa: E731
+    nd["strike"] = [lab(k) for k in nd["K"]]
     # lowest strike first, reading left-to-right / top-to-bottom like a price axis
-    order = [f"{k:,.0f}" + (" ★" if k == center else "") for k in sorted(ks)]
+    order = [lab(k) for k in sorted(ks)]
     g = nd.groupby("K")
     # each segment runs from the previous block's level to this block's; the first starts
     # at 0 one block earlier (the count is since yesterday's close)

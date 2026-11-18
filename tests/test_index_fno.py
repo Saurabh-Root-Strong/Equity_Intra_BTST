@@ -1392,3 +1392,65 @@ def test_session_coverage_counts_silences_and_names_the_holes(tmp_path, monkeypa
     note = f.coverage_note(c)
     assert "Not captured" in note and "11:00–11:30 (30 min)" in note
     f._COVER.clear()
+
+
+def _cyc_states(cells):
+    """cells: (block 'HH:MM', t 'HH:MM:SS', K, side, d_oi)"""
+    rows = []
+    for b, t, k, sd, d in cells:
+        rows.append(dict(block=pd.Timestamp(f"2026-11-19 {b}"), t=pd.Timestamp(f"2026-11-19 {t}"),
+                         K=k, side=sd, d_oi=d, oi=1e6, state="Short build-up", lean=-1.0))
+    return pd.DataFrame(rows)
+
+
+def test_cycle_records_beat_everything_before_them_per_side():
+    s = _cyc_states([
+        ("09:15", "09:29:00", 100, "CE", 900_000),   # first block: overnight, never judged
+        ("09:30", "09:44:00", 100, "CE", 30_000),
+        ("09:45", "09:59:00", 100, "CE", 45_000),    # beats prior 40k -> record
+        ("10:00", "10:14:00", 100, "CE", -60_000),   # beats 45k (today) -> second record
+        ("10:15", "10:29:00", 100, "CE", 20_000),    # not above 60k (and not a take-back)
+        ("09:30", "09:44:00", 100, "PE", 20_000),    # puts: prior 25k, never beaten
+    ])
+    prior = {"CE": dict(day="2026-11-18", block="11:45", K=200.0, d_oi=40_000.0, a=40_000.0,
+                        state="Long build-up", lean=1.0),
+             "PE": dict(day="2026-11-18", block="12:00", K=200.0, d_oi=-25_000.0, a=25_000.0,
+                        state="Long unwinding", lean=1.0)}
+    r = f.cycle_records(s, prior, 15)
+    assert list(r["d_oi"]) == [45_000, -60_000] and set(r["side"]) == {"CE"}
+    assert r.iloc[0]["beat"]["day"] == "2026-11-18" and r.iloc[1]["beat"]["a"] == 45_000
+
+
+def test_cycle_records_need_something_to_beat_and_skip_gap_blocks():
+    s = _cyc_states([("09:15", "09:29:00", 100, "CE", 1), ("09:30", "09:44:00", 100, "CE", 5_000),
+                     ("09:45", "09:59:00", 100, "CE", 9_000)])
+    # first day of the cycle: today's own second block is the first yardstick, then it beats it
+    r = f.cycle_records(s, {}, 15)
+    assert list(r["d_oi"]) == [9_000]
+    g = _cyc_states([("09:15", "09:29:00", 100, "CE", 1), ("09:30", "09:44:00", 100, "CE", 5_000),
+                     ("10:30", "10:44:00", 100, "CE", 99_000)])   # after a 60-min hole
+    assert f.cycle_records(g, {"CE": dict(a=6_000.0, d_oi=6_000.0)}, 15).empty
+
+
+def test_read_cache_keeps_only_the_most_recent_files(tmp_path, monkeypatch):
+    f._READ.clear()
+    monkeypatch.setattr(f, "READ_KEEP", 2)
+    ps = []
+    for i in range(3):
+        p = tmp_path / f"chain_X_2026111{i}.jsonl"
+        p.write_text('{"t": "2026-11-10T09:15:00", "e": "2026-11-17"}\n', encoding="utf-8")
+        ps.append(p)
+    f._rows(ps[0]); f._rows(ps[1]); f._rows(ps[0])      # 0 used again -> 1 is the oldest
+    f._rows(ps[2])
+    assert set(f._READ) == {ps[0], ps[2]}
+    f._READ.clear()
+
+
+def test_cycle_records_ignore_a_print_taken_straight_back():
+    # +80k then -78k next block: a corrected print, neither a record nor a yardstick
+    s = _cyc_states([("09:15", "09:29:00", 100, "CE", 1), ("09:30", "09:44:00", 100, "CE", 80_000),
+                     ("09:45", "09:59:00", 100, "CE", -78_000), ("10:00", "10:14:00", 100, "CE", 30_000)])
+    r = f.cycle_records(s, {"CE": dict(a=25_000.0, d_oi=25_000.0)}, 15)
+    # 09:30 is out (taken back), 09:45 itself is a real move (not reversed after), 10:00 < 78k
+    assert list(r["d_oi"]) == [-78_000]
+    assert f.side_max(s, 15)["CE"]["d_oi"] == -78_000
