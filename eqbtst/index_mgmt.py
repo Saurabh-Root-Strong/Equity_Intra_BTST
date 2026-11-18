@@ -2363,6 +2363,7 @@ def _load_weights_file(code: str):
 # and double the calls to NSE.
 _LOCKFILE = "poller.lock"
 _LOCK_STALE = 60.0           # a writer that has not refreshed the lock for this long is gone
+STANDBY_FROM = dt.time(15, 20)  # from here a capture copy finding a writer stays (light) for the close
 _MINE = {"owner": False}
 
 
@@ -2384,6 +2385,16 @@ def _claim() -> bool:
     except OSError:
         _MINE["owner"] = False
     return _MINE["owner"]
+
+
+def lock_held_elsewhere(path: Path, stale: float = _LOCK_STALE) -> bool:
+    """True when the writer lock at `path` belongs to ANOTHER process that refreshed it
+    within `stale` seconds (a live writer)."""
+    try:
+        j = json.loads(path.read_text(encoding="utf-8"))
+        return j.get("pid") != os.getpid() and time.time() - float(j.get("beat", 0)) < stale
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _release() -> None:
@@ -5219,19 +5230,40 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
         pass
     if _awake:
         print("  idle sleep blocked until capture stops", flush=True)
-    try:
-        n = compress_old_logs()
-        if n:
-            print(f"  compressed {n} finished-day log file(s)", flush=True)
-    except Exception:                                        # noqa: BLE001
-        pass
-    try:
-        n = reconcile_oi()
-        if n:
-            print(f"  scored {n} logged day(s) of live open interest against the bhavcopy",
-                  flush=True)
-    except Exception as exc:                                 # noqa: BLE001
-        _log_error("reconcile", f"{type(exc).__name__}: {exc}")
+    # ONE CAPTURE AT A TIME. The task re-runs every 10 minutes as a watchdog; each run used to
+    # do the whole start-up (reconcile, scorecard: ~1.4 GB) and then stand by till 15:45, and
+    # every stand-by copy restarted itself on each code change too — 18 Nov 2026: five copies
+    # at once, the laptop out of memory. With both writers (this one and index_fno's) alive
+    # elsewhere there is nothing to do: leave before the heavy start-up. If the writer dies,
+    # the next 10-minute run (or the dashboard) takes over.
+    # EXCEPT near the close: NSE's corrected close (~15:40) is the next day's premium base, and
+    # the task's last run is 15:35 — a writer dying after it would lose the close with no copy
+    # left to take over. From 15:20 a copy that finds a writer stays as a LIGHT stand-by: the
+    # pollers only (to take over), none of the heavy start-up. At most the 15:25 and 15:35 runs.
+    light = False
+    if (lock_held_elsewhere(DATA_DIR / _LOCKFILE)
+            and lock_held_elsewhere(DATA_DIR.parent / "index_fno" / "poller.lock")):
+        if _now().time() < STANDBY_FROM:
+            print(f"[{_now():%H:%M:%S}] another process is capturing - exiting (the 10-minute "
+                  "task run is the watchdog)", flush=True)
+            return
+        light = True
+        print(f"[{_now():%H:%M:%S}] another process is capturing - light stand-by for the "
+              "close", flush=True)
+    if not light:
+        try:
+            n = compress_old_logs()
+            if n:
+                print(f"  compressed {n} finished-day log file(s)", flush=True)
+        except Exception:                                    # noqa: BLE001
+            pass
+        try:
+            n = reconcile_oi()
+            if n:
+                print(f"  scored {n} logged day(s) of live open interest against the bhavcopy",
+                      flush=True)
+        except Exception as exc:                             # noqa: BLE001
+            _log_error("reconcile", f"{type(exc).__name__}: {exc}")
     for code in NSE_NAME:
         _st(code)
     ensure_poller()
@@ -5240,13 +5272,14 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
     _fno = None
     try:
         from . import index_fno as _fno
-        _fno.compress_old_logs()
-        _fno.reconcile()                 # yesterday's live log vs NSE's corrected close
+        if not light:
+            _fno.compress_old_logs()
+            _fno.reconcile()             # yesterday's live log vs NSE's corrected close
         _fno.ensure_poller()
     except Exception as exc:                                 # noqa: BLE001
         _log_error("fno", f"index_fno not started: {type(exc).__name__}: {exc}")
         _fno = None
-    if _fno is not None:
+    if _fno is not None and not light:
         # grade yesterday's page readings against what the index then did (index_scorecard).
         # ~30 s a day of pandas: off the main thread so the poll starts on time.
         def _score():
@@ -5273,17 +5306,30 @@ def capture(until: dt.time = dt.time(15, 45)) -> None:
     except OSError:
         _code_mtime = None
     _relaunch = False
+    idle_since = time.time()
     try:
         while _now().time() < until and _now().weekday() < 5:
             time.sleep(30)
+            # a writer = this process holds EITHER lock (they can split between processes:
+            # 18 Nov 2026 one copy wrote index_mgmt, another index_fno)
+            writer = bool(_MINE["owner"] or (_fno is not None
+                                              and getattr(_fno, "_MINE", {}).get("owner")))
             try:
                 if _code_mtime and _mtimes() != _code_mtime:
-                    print(f"[{_now():%H:%M:%S}] code changed - restarting on the new "
-                          "version", flush=True)
-                    _relaunch = True
+                    # only a writer restarts itself; a stand-by copy just leaves
+                    print(f"[{_now():%H:%M:%S}] code changed - "
+                          + ("restarting on the new version" if writer else
+                             "stand-by copy exiting"), flush=True)
+                    _relaunch = writer
                     break
             except OSError:
                 pass
+            if writer:
+                idle_since = time.time()
+            elif time.time() - idle_since > 120 and _now().time() < STANDBY_FROM:
+                print(f"[{_now():%H:%M:%S}] another process is capturing - stand-by copy "
+                      "exiting (the 10-minute task run is the watchdog)", flush=True)
+                break
             owner = _MINE["owner"]
             if owner != last:
                 print(f"[{_now():%H:%M:%S}] "
