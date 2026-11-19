@@ -1454,3 +1454,86 @@ def test_cycle_records_ignore_a_print_taken_straight_back():
     # 09:30 is out (taken back), 09:45 itself is a real move (not reversed after), 10:00 < 78k
     assert list(r["d_oi"]) == [-78_000]
     assert f.side_max(s, 15)["CE"]["d_oi"] == -78_000
+
+
+# ── wrong-side strikes ──────────────────────────────────────────────────────────────────
+WS_KS = [24_900.0 + 100 * i for i in range(8)]          # 24,900 .. 25,600
+
+
+def _ws_frame(path, odd=None, start="09:31", day="2026-11-19"):
+    """One reading a minute. path: list of index levels. odd: {K: (from_min, to_min, net)}
+    overrides calls − puts at that strike for those minutes; every other strike leans the
+    ordinary way by 10k (calls heavier above the index, puts heavier below)."""
+    odd = odd or {}
+    t0 = pd.Timestamp(f"{day} {start}")
+    recs = []
+    for i, u in enumerate(path):
+        t = t0 + pd.Timedelta(minutes=i)
+        for k in WS_KS:
+            net = 10_000.0 if k > u else -10_000.0
+            for kk, (a, b, v) in odd.items():
+                if kk == k and a <= i <= b:
+                    net = v
+            recs += [(t, u, k, "CE", max(net, 0.0)), (t, u, k, "PE", max(-net, 0.0))]
+    return pd.DataFrame(recs, columns=["t", "u", "K", "side", "doi"])
+
+
+def test_wrong_side_puts_above_held_then_reached():
+    path = [25_300.0] * 60 + [25_510.0] * 5
+    ws = f.wrong_side(_ws_frame(path, {25_500.0: (5, 64, -20_000.0)}), WS_KS)
+    ev = ws["events"]
+    assert list(ev["K"]) == [25_500.0]
+    r = ev.iloc[0]
+    assert r["heavy"] == "puts" and r["where"] == "above"
+    assert r["since"] == pd.Timestamp("2026-11-19 09:36")
+    assert r["confirmed"] == pd.Timestamp("2026-11-19 09:46")      # held 10 min
+    assert r["reached"] == pd.Timestamp("2026-11-19 10:31")
+    assert r["pts"] == pytest.approx(200.0)
+
+
+def test_wrong_side_calls_below_mirror():
+    ws = f.wrong_side(_ws_frame([25_300.0] * 30, {25_100.0: (0, 29, 20_000.0)}), WS_KS)
+    ev = ws["events"]
+    assert list(ev["K"]) == [25_100.0] and ev.iloc[0]["heavy"] == "calls"
+    assert ev.iloc[0]["reached"] is None and bool(ev.iloc[0]["on_now"])
+
+
+def test_wrong_side_needs_hold_size_unreached_and_settled_open():
+    # held 9 minutes only
+    assert f.wrong_side(_ws_frame([25_300.0] * 30, {25_500.0: (0, 9, -20_000.0)}),
+                        WS_KS)["events"].empty
+    # tilted but smaller than the ladder's typical lean
+    assert f.wrong_side(_ws_frame([25_300.0] * 30, {25_500.0: (0, 29, -4_000.0)}),
+                        WS_KS)["events"].empty
+    # the index already stood at the strike earlier today: positions from the other side
+    path = [25_500.0] * 3 + [25_300.0] * 30
+    assert f.wrong_side(_ws_frame(path, {25_500.0: (0, 32, -20_000.0)}), WS_KS)["events"].empty
+    # before 09:30 NSE's change in OI is unsettled: 09:15-09:29 alone never names a strike
+    assert f.wrong_side(_ws_frame([25_300.0] * 15, {25_500.0: (0, 14, -20_000.0)},
+                                  start="09:15"), WS_KS)["events"].empty
+    # out of the 0.2-1.2% window (25,600 is 1.6% above 25,200)
+    assert f.wrong_side(_ws_frame([25_200.0] * 30, {25_600.0: (0, 29, -20_000.0)}),
+                        WS_KS)["events"].empty
+
+
+def test_wrong_side_reading_gap_breaks_the_run():
+    df = _ws_frame([25_300.0] * 30, {25_500.0: (0, 29, -20_000.0)})
+    t = df["t"]
+    df = df[~((t > pd.Timestamp("2026-11-19 09:37")) & (t < pd.Timestamp("2026-11-19 09:45")))]
+    df = df[df["t"] <= pd.Timestamp("2026-11-19 09:52")]
+    # 09:31-09:37 (6 min), hole, 09:45-09:52 (7 min): never 10 min unbroken
+    assert f.wrong_side(df, WS_KS)["events"].empty
+
+
+def test_wrong_side_samples_and_lines():
+    path = [25_300.0] * 60 + [25_510.0] * 5
+    ws = f.wrong_side(_ws_frame(path, {25_500.0: (5, 64, -20_000.0)}), WS_KS, samples=True)
+    s = ws["samples"]
+    assert not s.empty and (s["dist"].between(0.002, 0.012)).all()
+    assert 25_500.0 not in set(s.loc[s["t"] >= pd.Timestamp("2026-11-19 09:45"), "K"])
+    head, lines, note = f.wrong_side_lines("NIFTY", ws, expiry_day=True)
+    assert "25,500" in lines[0] and "reached 10:31" in lines[0]
+    assert "Expiry day" in note
+    head, lines, _ = f.wrong_side_lines("NIFTY", f.wrong_side(_ws_frame([25_300.0] * 5),
+                                                               WS_KS), False)
+    assert lines == [] and "none today" in head

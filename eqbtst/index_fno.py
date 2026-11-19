@@ -56,6 +56,7 @@ import random
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 from urllib.parse import quote
 
@@ -2188,6 +2189,133 @@ def cycle_prior(code: str, day: dt.date, expiry: str, step: float, minutes: int)
                 start_is_log=pe is None)
 
 
+# ── wrong-side strikes (user, 19 Nov 2026) ───────────────────────────────────────────────
+# A strike ABOVE the index normally shows calls heavier (the call is out of the money); puts
+# heavier there = put writing at an in-the-money put or call writers leaving. Mirror below.
+# The user's read: big players expect the index to get there. Tested before it was built
+# (scripts/study_strike_anomaly*.py, 92 days of Tradebot's archive + the lane's 8): such
+# strikes were reached LESS often than ordinary strikes at the same distance and time
+# (-2.1 pts, t -1.5); the raw rate looks double because the pattern turns up on days already
+# moving toward the strike. So the page DESCRIBES it and the scorecard grades it live.
+WS_DMIN, WS_DMAX = 0.0020, 0.0120   # strike distance from the index (the study's window)
+WS_TILT = 0.20                      # wrong-way net / (|calls Δ| + |puts Δ|): clearly tilted
+WS_HOLD = 10                        # minutes the pattern must hold before it is named
+WS_FROM = dt.time(9, 30)            # NSE's change in OI is unsettled in the first minutes
+WS_GAP = 5                          # minutes without a reading that break a run (unseen)
+WS_CHAIN = 0.75                     # share of the ladder leaning one way = the whole chain
+
+
+def _hours_left(t) -> float:
+    return max(0.0, (pd.Timestamp(t).normalize() + pd.Timedelta("15:30:00")
+                     - pd.Timestamp(t)) / pd.Timedelta(hours=1))
+
+
+def sgn_mv(above: bool) -> int:
+    """+1 when an index rise is a move TOWARD the strike."""
+    return 1 if above else -1
+
+
+def wrong_side(df: pd.DataFrame, strikes: list, samples: bool = False) -> dict:
+    """Wrong-side strikes of one session, point in time, from the chain log frame `df`
+    (OI change since yesterday's close, the screen's bars). A strike is flagged at a reading
+    when it sits 0.2-1.2% from the index, the index has not reached it since the open,
+    calls - puts leans the wrong way by WS_TILT of its gross, and the lean is at least the
+    ladder's median |calls - puts| at that reading (not a crumb). It is NAMED once that held
+    WS_HOLD minutes with no reading gap over WS_GAP. One event per strike per day (its first).
+
+    Returns {events: DataFrame, chain: {puts, calls, n} at the last reading}. Each event:
+    K, where (above/below), heavy (puts/calls), since / confirmed (times), u_since,
+    pts (distance at 'since'), dist / hl / mv (distance %, hours left, % move so far toward
+    the strike, at 'confirmed'), net_now, on_now, last_on, reached (time or None), to_go.
+    samples=True adds 'samples': the ordinary strikes the scorecard measures events against."""
+    out = dict(events=pd.DataFrame(), chain=None, samples=pd.DataFrame())
+    if df is None or df.empty or not strikes or "doi" not in df.columns:
+        return out
+    ks = sorted({float(k) for k in strikes})
+    u = df.groupby("t")["u"].first().dropna().sort_index()
+    u = u[u > 0]
+    if len(u) < 2:
+        return out
+    d = df[df["K"].isin(ks)]
+    piv = d.pivot_table(index="t", columns=["side", "K"], values="doi", aggfunc="last")
+    if piv.empty or not {"CE", "PE"} <= set(piv.columns.get_level_values(0)):
+        return out
+    ce = piv["CE"].reindex(columns=ks).reindex(u.index).ffill()
+    pe = piv["PE"].reindex(columns=ks).reindex(u.index).ffill()
+    C, P = ce.to_numpy(float), pe.to_numpy(float)
+    U, T = u.to_numpy(float), u.index
+    Kr = np.array(ks)[None, :]
+    dist = (Kr - U[:, None]) / U[:, None]
+    up = dist > 0
+    net = C - P
+    wrong = np.where(up, -net, net)
+    gross = np.abs(C) + np.abs(P)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tilt = np.where(gross > 0, wrong / gross, np.nan)
+    with warnings.catch_warnings():                          # an all-empty reading
+        warnings.simplefilter("ignore", RuntimeWarning)
+        typ = np.nanmedian(np.abs(net), axis=1)
+    hi, lo = np.maximum.accumulate(U), np.minimum.accumulate(U)
+    reached = np.where(up, hi[:, None] >= Kr, lo[:, None] <= Kr)
+    in_win = (np.abs(dist) >= WS_DMIN) & (np.abs(dist) <= WS_DMAX)
+    ok_t = np.array([t.time() >= WS_FROM for t in T])[:, None]
+    with np.errstate(invalid="ignore"):
+        flag = (ok_t & in_win & ~reached & (tilt >= WS_TILT)
+                & (wrong >= typ[:, None]) & (typ[:, None] > 0))   # NaN compares False
+    gap = np.r_[False, np.diff(T.values) > np.timedelta64(WS_GAP, "m")]
+    hold = pd.Timedelta(minutes=WS_HOLD)
+    ev = []
+    for j, k in enumerate(ks):
+        start = conf = None
+        for i in range(len(T)):
+            if flag[i, j]:
+                if start is None or gap[i]:
+                    start = i
+                if T[i] - T[start] >= hold:
+                    conf = i
+                    break
+            else:
+                start = None
+        if conf is None:
+            continue
+        above = bool(up[conf, j])
+        hit = np.flatnonzero(reached[conf:, j])
+        r_i = conf + int(hit[0]) if hit.size else None
+        on = np.flatnonzero(flag[:, j])
+        ev.append(dict(
+            K=k, where="above" if above else "below", heavy="puts" if above else "calls",
+            since=T[start], confirmed=T[conf], u_since=float(U[start]),
+            pts=float(abs(k - U[start])), dist=float(abs(dist[conf, j])),
+            hl=_hours_left(T[conf]), mv=float(sgn_mv(above) * (U[conf] / U[0] - 1) * 100),
+            net_now=float(net[-1, j]) if np.isfinite(net[-1, j]) else None,
+            on_now=bool(flag[-1, j]), last_on=T[on[-1]],
+            reached=T[r_i] if r_i is not None else None, to_go=float(abs(k - U[-1]))))
+    out["events"] = pd.DataFrame(ev)
+    if samples:
+        # the yardstick: ORDINARY strikes (in the window, not reached, not flagged) every
+        # 15 min 09:45-14:30, with the same covariates. The scorecard predicts an event's
+        # reach chance from these (distance, hours left, move so far toward the strike).
+        recs = []
+        day0 = T[0].normalize()
+        for m in pd.date_range(day0 + pd.Timedelta("09:45:00"), day0 + pd.Timedelta("14:30:00"),
+                               freq="15min"):
+            i = T.searchsorted(m, side="right") - 1
+            if i < 0 or m - T[i] > pd.Timedelta(minutes=WS_GAP):
+                continue
+            for j in np.flatnonzero(in_win[i] & ~reached[i] & ~flag[i]):
+                above = bool(up[i, j])
+                recs.append(dict(t=T[i], K=ks[j], where="above" if above else "below",
+                                 dist=float(abs(dist[i, j])), hl=_hours_left(T[i]),
+                                 mv=float(sgn_mv(above) * (U[i] / U[0] - 1) * 100),
+                                 touch=bool(reached[-1, j])))
+        out["samples"] = pd.DataFrame(recs)
+    last = net[-1][np.isfinite(net[-1])]
+    if last.size:
+        out["chain"] = dict(puts=float((last < 0).mean()), calls=float((last > 0).mean()),
+                            n=int(last.size))
+    return out
+
+
 def close_base(code: str, day: dt.date, expiry: str) -> dict | None:
     """The PREVIOUS SESSION's close snapshot of this expiry (with our model IV), else None.
 
@@ -3111,6 +3239,57 @@ def _who(state: str, side: str) -> str:
             ("call" if side == "CE" else "put") + " OI moved, side unclear")
 
 
+def wrong_side_lines(code: str, ws: dict, expiry_day: bool) -> tuple:
+    """(heading, bullet lines, footnote) for the page. Pure."""
+    nm = DISPLAY.get(code, code)
+    ev = ws.get("events")
+    ch = ws.get("chain") or {}
+    rule = (f"puts heavier at a strike ABOVE {nm} or calls heavier BELOW it, a strike the "
+            f"index has not reached today, held {WS_HOLD}+ min (OI change since yesterday)")
+    if ev is None or ev.empty:
+        return f"↗ **Wrong-side strikes:** none today — {rule}.", [], ""
+    hm = lambda t: pd.Timestamp(t).strftime("%H:%M")  # noqa: E731
+    out = []
+    for r in ev.sort_values("since").itertuples():
+        side = "below" if r.where == "above" else "above"
+        s = (f"**{r.K:,.0f}** {r.heavy} heavier since {hm(r.since)} — {nm} was "
+             f"{r.u_since:,.0f}, {r.pts:,.0f} pts {side}")
+        if r.net_now is not None:
+            s += f" · calls − puts now {r.net_now:+,.0f}"
+        if r.reached is not None and pd.notna(r.reached):
+            s += f" · ✅ **reached {hm(r.reached)}**"
+        elif r.on_now:
+            s += f" · still on · {r.to_go:,.0f} pts to go"
+        else:
+            s += f" · lean faded after {hm(r.last_on)} · {r.to_go:,.0f} pts to go"
+        out.append(s)
+    note = []
+    lean = max(("puts", ch.get("puts") or 0), ("calls", ch.get("calls") or 0), key=lambda x: x[1])
+    if ch and lean[1] >= WS_CHAIN and (ev["heavy"] == lean[0]).any():
+        note.append(f":orange[Whole ladder {lean[0]} heavier ({lean[1] * ch['n']:.0f} of "
+                    f"{ch['n']} strikes): the day's trend, not one strike's message.]")
+    if expiry_day:
+        note.append(":gray[Expiry day of this contract: OI is mostly positions being closed — "
+                    "read it even less.]")
+    return f"↗ **Wrong-side strikes** — {rule}:", out, " ".join(note)
+
+
+def _wrong_side(st, code: str, df: pd.DataFrame, strikes: list, expiry_day: bool) -> None:
+    ws = wrong_side(df, strikes)
+    head, lines, note = wrong_side_lines(code, ws, expiry_day)
+    if not lines:
+        st.caption(head)
+        return
+    st.markdown(head + "\n" + "\n".join(f"- {s}" for s in lines) + (f"\n\n{note}" if note else ""))
+    st.caption(
+        "Tested before it was built (19 Nov 2026, 92 days of Tradebot's chain archive, four "
+        "indices): strikes showing this were reached **less** often than ordinary strikes at "
+        "the same distance and time of day (−2.1 pts, t −1.5). The raw rate looks double "
+        "(Nifty 100-200 pts away: 17.9% vs 8.0%) only because the pattern turns up on days "
+        "already moving toward the strike — writers cover as the index comes. A description "
+        "of positioning, not a target. The scorecard below grades it live.")
+
+
 def _rec_where(r: dict, today: dt.date) -> str:
     d = dt.date.fromisoformat(r["day"])
     when = "earlier today" if d == today else f"{d:%a %d %b}"
@@ -3675,6 +3854,10 @@ def _bucket_drill(st, code: str, pick: str, latest: dict, df: pd.DataFrame, bmap
             _cycle_alerts(st, code, stt_all, mins, center, sorted(bmap), latest)
         except Exception as exc:                             # noqa: BLE001 - never block the page
             st.caption(f"🏆 Cycle record not shown: {type(exc).__name__}: {exc}")
+        try:
+            _wrong_side(st, code, df, sorted(bmap), expiry_day)
+        except Exception as exc:                             # noqa: BLE001 - never block the page
+            st.caption(f"↗ Wrong-side strikes not shown: {type(exc).__name__}: {exc}")
         # the index's prev close, open and where it is now, on both per-strike headings, and
         # the strike nearest it tagged in their panel titles (user, 18 Nov 2026)
         px, tags = price_note(code, latest, ks, now_,
@@ -4960,6 +5143,11 @@ def render_page(st) -> None:
         index_scorecard.render(st, code)
     except Exception as exc:                                 # noqa: BLE001
         st.caption(f"Scorecard not shown: {type(exc).__name__}: {exc}")
+    try:
+        from . import index_scorecard
+        index_scorecard.render_ws(st, code)
+    except Exception as exc:                                 # noqa: BLE001
+        st.caption(f"Wrong-side scorecard not shown: {type(exc).__name__}: {exc}")
 
 
 def capture(until: dt.time = dt.time(15, 45)) -> None:

@@ -245,7 +245,167 @@ def score_all(today: dt.date | None = None, days_back: int = 400) -> int:
                     im._append(p, r)
                 done.add((day.isoformat(), code, e))
                 n += 1
+    try:
+        ws_score_all(today, days_back)                       # its own file, its own count
+    except Exception as exc:                                 # noqa: BLE001
+        f._log_error("scorecard", f"wrong-side: {type(exc).__name__}: {exc}")
     return n
+
+
+# ── wrong-side strikes (user, 19 Nov 2026) ────────────────────────────────────────────
+# Pre-registered: a strike flagged by index_fno.wrong_side (puts heavier above the index /
+# calls heavier below, not reached, held 10 min) is REACHED BEFORE THE CLOSE more often than
+# an ordinary strike at the same distance, hours left and move so far toward it. The
+# yardstick is fitted on the ordinary strikes (sampled every 15 min) of every scored day; an
+# event's excess = reached (0/1) − the yardstick's chance. One number per day (its events'
+# mean excess), t over days. Expiry days graded apart. The 92-day archive study said −2.1 pts.
+WS_FILE = "wrong_side.jsonl"
+WS_VERSION = 1
+WS_FEATS = ("dist", "hl", "mv")
+
+
+def _ws_path() -> Path:
+    return f.DATA_DIR / WS_FILE
+
+
+def ws_score_day(code: str, day: dt.date, expiry: str) -> list:
+    """Event and yardstick rows for one finished session (the nearest expiry)."""
+    rows = f.chain_log(code, day, expiry)
+    base = dict(v=WS_VERSION, day=day.isoformat(), code=code, e=expiry,
+                expiry_day=expiry == day.isoformat())
+    if not rows or rows[-1]["t"][11:16] < MIN_END.strftime("%H:%M"):
+        return [dict(base, kind="none", why="no log to the close")]
+    ks, _, _ = ladder_for(rows, code, day)
+    if not ks:
+        return [dict(base, kind="none", why="no ladder")]
+    r = f.wrong_side(f.frame(rows), ks, samples=True)
+    out = []
+    for e in r["events"].to_dict("records"):
+        out.append(dict(base, kind="event", K=e["K"], where=e["where"],
+                        t=str(e["confirmed"])[:19], dist=e["dist"], hl=e["hl"], mv=e["mv"],
+                        pts=e["pts"], touch=e["reached"] is not None and pd.notna(e["reached"])))
+    for s in r["samples"].to_dict("records"):
+        out.append(dict(base, kind="base", K=s["K"], where=s["where"], t=str(s["t"])[:19],
+                        dist=s["dist"], hl=s["hl"], mv=s["mv"], touch=s["touch"]))
+    return out or [dict(base, kind="none", why="nothing in the window")]
+
+
+def ws_score_all(today: dt.date | None = None, days_back: int = 400) -> int:
+    today = today or f._now().date()
+    p = _ws_path()
+    old = im._load_jsonl(p)
+    keep = [r for r in old if r.get("v") == WS_VERSION]
+    if len(keep) != len(old):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(r) + "\n" for r in keep), encoding="utf-8")
+    done = {(r.get("day"), r.get("code")) for r in keep}
+    n = 0
+    for code in f.CODES:
+        for day in f.logged_days(code):
+            if (day >= today and f._now().time() < dt.time(16, 0)) \
+                    or (today - day).days > days_back or (day.isoformat(), code) in done:
+                continue
+            exps = [e for e in f.logged_expiries(code, day) if e >= day.isoformat()]
+            if not exps:
+                continue
+            try:
+                recs = ws_score_day(code, day, exps[0])
+            except Exception as exc:                         # noqa: BLE001
+                f._log_error("scorecard", f"wrong-side {code} {day}: {type(exc).__name__}: {exc}")
+                continue
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            done.add((day.isoformat(), code))
+            n += 1
+    return n
+
+
+def ws_load(code: str | None = None) -> pd.DataFrame:
+    rows = [r for r in im._load_jsonl(_ws_path()) if r.get("v") == WS_VERSION
+            and (code is None or r.get("code") == code)]
+    return pd.DataFrame(rows)
+
+
+def _fit_lr(X: np.ndarray, y: np.ndarray, lam: float = 1.0, it: int = 60) -> np.ndarray:
+    X = np.c_[np.ones(len(X)), X]
+    w = np.zeros(X.shape[1])
+    R = lam * np.eye(X.shape[1])
+    R[0, 0] = 0
+    for _ in range(it):
+        p = 1 / (1 + np.exp(-X @ w))
+        st_ = np.linalg.solve((X * (p * (1 - p))[:, None]).T @ X + R, X.T @ (p - y) + R @ w)
+        w -= st_
+        if np.abs(st_).max() < 1e-9:
+            break
+    return w
+
+
+def ws_grade(df: pd.DataFrame, expiry_day: bool | None = False) -> dict:
+    """Events vs the yardstick: n events / days, raw reach %, the yardstick's expected %,
+    mean per-day excess (pts) and its t over days."""
+    if df.empty or "kind" not in df.columns:
+        return dict(n=0, days=0)
+    d = df[df["kind"].isin(["event", "base"])].dropna(subset=list(WS_FEATS))
+    if expiry_day is not None:
+        d = d[d["expiry_day"].eq(expiry_day)]
+    b, e = d[d["kind"] == "base"], d[d["kind"] == "event"]
+    days = int(df["day"].nunique())
+    if e.empty or len(b) < 30 or b["touch"].nunique() < 2:
+        return dict(n=int(len(e)), days=days)
+    mu, sd = b[list(WS_FEATS)].mean(), b[list(WS_FEATS)].std().replace(0, 1)
+    w = _fit_lr(((b[list(WS_FEATS)] - mu) / sd).to_numpy(float), b["touch"].to_numpy(float))
+    Xe = np.c_[np.ones(len(e)), ((e[list(WS_FEATS)] - mu) / sd).to_numpy(float)]
+    pe = 1 / (1 + np.exp(-Xe @ w))
+    ex = pd.Series(e["touch"].to_numpy(float) - pe, index=e.index).groupby(e["day"]).mean()
+    t = (float(ex.mean() / (ex.std(ddof=1) / np.sqrt(len(ex)))) if len(ex) > 2
+         and ex.std(ddof=1) > 0 else None)
+    return dict(n=int(len(e)), days=days, ev_days=int(len(ex)), reach=float(e["touch"].mean()),
+                expected=float(pe.mean()), excess=float(ex.mean()), t=t)
+
+
+def render_ws(st, code: str) -> None:
+    df = ws_load(code)
+    n_days = int(df["day"].nunique()) if not df.empty else 0
+    n_ev = int((df["kind"] == "event").sum()) if not df.empty else 0
+    with st.expander(f"🔒 Wrong-side strikes — do they get reached? ({n_ev} event(s), "
+                     f"{n_days} of {UNLOCK_DAYS} sessions)"):
+        st.markdown(
+            "Every finished session's **↗ wrong-side strikes** (nearest expiry) are stored with "
+            "whether the index reached them before the close, next to every ordinary strike "
+            "in the same 0.2-1.2% window sampled each 15 min. The ordinary strikes give the "
+            "chance a strike gets reached for its **distance, hours left and the move so far "
+            "toward it** — the move so far is what made the raw rate look double in the "
+            "92-day study. **Excess** = reached − that chance, one number per day.")
+        st.progress(min(1.0, n_days / UNLOCK_DAYS),
+                    text=f"{DISPLAY_OF(code)}: {n_days} session(s) — "
+                         + (f"about {UNLOCK_DAYS - n_days} trading days to go"
+                            if n_days < UNLOCK_DAYS else "unlocked"))
+        if n_ev == 0:
+            return
+        if not (n_days >= UNLOCK_DAYS or st.checkbox(
+                f"Peek anyway (n = {n_days} sessions: noise, shown grey on purpose)",
+                key=f"if_ws_peek_{code}")):
+            return
+        recs = []
+        for lab, ed in (("ordinary days", False), ("expiry days", True)):
+            g = ws_grade(df, ed)
+            recs.append({"days": lab, "events": g.get("n", 0), "on days": g.get("ev_days"),
+                         "reached %": None if g.get("reach") is None else g["reach"] * 100,
+                         "expected %": None if g.get("expected") is None
+                         else g["expected"] * 100,
+                         "excess (pts)": None if g.get("excess") is None else g["excess"] * 100,
+                         "t over days": g.get("t")})
+        cc = st.column_config
+        st.dataframe(pd.DataFrame(recs), hide_index=True, width="stretch", column_config={
+            "reached %": cc.NumberColumn(format="%.0f"),
+            "expected %": cc.NumberColumn(format="%.0f", help="the ordinary strikes' chance "
+                                          "for the same distance, hours left, move so far"),
+            "excess (pts)": cc.NumberColumn(format="%+.1f"),
+            "t over days": cc.NumberColumn(format="%+.2f",
+                                           help="beyond ±2 with 40+ days = worth a look")})
+        if n_days < UNLOCK_DAYS:
+            st.caption(f":grey[n = {n_days}. Nothing here is a finding yet.]")
 
 
 # ── grading ───────────────────────────────────────────────────────────────────────────
