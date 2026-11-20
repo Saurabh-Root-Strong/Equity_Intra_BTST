@@ -3312,14 +3312,25 @@ def _cycle_alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, strik
     step = float(pd.Series(np.diff(ks_)).mode().iloc[0]) if len(ks_) > 1 else 0.0
     cp = cycle_prior(code, day, exp, step, mins)
     pe = cp["prev_exp"]
-    since = (f"the {pe:%d %b} expiry" if pe else
-             f"{cp['logged'][0]:%d %b} (the log's first day — the cycle's start predates it)"
-             if cp["logged"] else "")
+    # WORDING (user, 20 Nov 2026): 'since the 17 Nov expiry' read as the contract itself
+    # while the screen shows the 23 Nov one. Name the CONTRACT ON SCREEN and the cycle's
+    # first session; the previous expiry is only why the count starts there.
+    try:
+        ctr = f"{dt.date.fromisoformat(exp):%d %b}"
+    except ValueError:
+        ctr = exp
+    start = min(cp["logged"] + cp["missing"]) if (cp["logged"] or cp["missing"]) else day
+    why = (f"the first session after the {pe:%d %b} expiry" if pe else
+           "the log's first day — the cycle began earlier")
+    since = f"since {start:%a %d %b}"
     if not cp["logged"]:
-        st.caption(f"🏆 **Biggest since {('the ' + format(pe, '%d %b') + ' expiry') if pe else 'expiry'}**"
-                   " — first logged session of this cycle: there is nothing earlier to beat, so "
-                   "the day alert above is the whole story today. From the next session on, a "
-                   "block bigger than everything since the expiry is flagged here.")
+        first_day = pe and not cp["missing"]
+        st.caption(f"🏆 **Biggest of the cycle — {ctr} contract**: "
+                   + ("today is the first session after the "
+                      f"{pe:%d %b} expiry, so there is nothing earlier to beat"
+                      if first_day else "no earlier session of this cycle is in the log")
+                   + "; the day alert above is the whole story today. From the next session "
+                   "on, a block bigger than every earlier block of the cycle is flagged here.")
         return
     rec = cycle_records(stt_all, cp["max"], mins)
     now = _view_now(st)
@@ -3330,9 +3341,14 @@ def _cycle_alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, strik
             cp["max"][side]["side"] = side
     expiry_day = exp == day.isoformat()
     n_s = len(cp["logged"]) + 1
+    days_ = [f"{d:%a %d}" for d in cp["logged"]] + ["today"]
+    sess = ", ".join(days_) if len(days_) <= 5 else f"{days_[0]} … today"
     with st.container(border=True):
-        st.markdown(f"**🏆 Biggest since {since} — {len(strikes)} strikes, {span} blocks, "
-                    f"{n_s} sessions** ({len(rec)})")
+        st.markdown(f"**🏆 Biggest of the cycle — {ctr} contract, {since}"
+                    + (" (log start)" if not pe else "")
+                    + f" · {n_s} sessions ({sess})** · {len(strikes)} strikes, {span} blocks "
+                    f"({len(rec)})"
+                    + (" · :orange[expiry day — the cycle's last session]" if expiry_day else ""))
         if rec.empty:
             parts = []
             for side, nm in (("CE", "calls"), ("PE", "puts")):
@@ -3356,7 +3372,7 @@ def _cycle_alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, strik
                 notes.append("expiry day: positions settling")
             ln = (f"{dot} **{block_span([r['block']], mins).iloc[0]} · {k} · "
                   f"{_who(r['state'], r['side'])} {r['d_oi']:+,.0f}** — biggest "
-                  f"{'call' if r['side'] == 'CE' else 'put'} block since {since.split(' (')[0]}"
+                  f"{'call' if r['side'] == 'CE' else 'put'} block {since}"
                   f" ({ratio:.1f}× the previous record {b['d_oi']:+,.0f}, {_rec_where(b, day)})"
                   + (f" · {eff}" if eff else "")
                   + (f" · :orange[{' · '.join(notes)}]" if notes else ""))
@@ -3372,9 +3388,11 @@ def _cycle_alerts(st, code: str, stt_all: pd.DataFrame, mins: int, center, strik
                 "a bigger block on a missing day would not be known." if cp["missing"] else "")
         st.caption(
             f"A block is flagged when one strike-side's OI change is bigger than every {span} "
-            f"block on the same side and these {len(strikes)} strikes since {since.split(' (')[0]}: "
-            f"the sessions logged since ({', '.join(format(d, '%a %d') for d in cp['logged'])}) "
-            "and today's earlier blocks. Calls and puts keep separate records; each record is "
+            f"block on the same side and these {len(strikes)} strikes {since} ({why}) "
+            f"of the {ctr} contract: the earlier sessions "
+            f"({', '.join(format(d, '%a %d') for d in cp['logged'])}) and today's earlier "
+            "blocks. The cycle = the sessions since the index's previous expiry, when this "
+            "became the live contract to watch. Calls and puts keep separate records; each record is "
             "judged only on what came before it. Same rules as the day alert: each session's "
             "first block (the overnight change) and a block after a hole in the log are left "
             f"out. Each earlier session is measured on ITS OWN {len(strikes)} strikes around its "
